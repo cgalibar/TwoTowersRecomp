@@ -1,6 +1,7 @@
 // Per-build runtime overrides for The Two Towers, PAL Spain (SLES-51256, VER 1.00).
 // Matched by ELF name, entry point and file CRC32 so they never leak into other builds.
 #include "game/sles_51256.h"
+#include "game/sles_51256_trace.h"
 #include "game_overrides.h"
 #include "ps2_runtime.h"
 
@@ -10,7 +11,7 @@ namespace
     {
         // Address bindings go here as bring-up finds them, e.g.:
         //   ps2_game_overrides::bindAddressHandler(runtime, 0x00123456u, "sceCdRead");
-        (void)runtime;
+        ttr::sles51256::installTracing(runtime);
     }
 }
 

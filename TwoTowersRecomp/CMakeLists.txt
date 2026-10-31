@@ -1,7 +1,9 @@
 add_executable(TwoTowersRecomp
     main.cpp
     bios/bios_rom.cpp
+    debug/frame_dump.cpp
     game/sles_51256_overrides.cpp
+    game/sles_51256_trace.cpp
 )
 
 target_include_directories(TwoTowersRecomp PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")

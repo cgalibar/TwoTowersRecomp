@@ -15,6 +15,8 @@ set(TTR_GENERATED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/TwoTowersRecompLib/generated"
     "Recompiled guest sources produced by tools/recomp_codegen.py")
 
 option(TTR_ENABLE_DEBUG_UI "Build the PS2Recomp ImGui debug panel into the executable" ON)
+option(TTR_VERBOSE_RUNTIME_LOGS
+    "PS2Recomp per-GS-register/per-function logging; slows the game down by an order of magnitude" OFF)
 set(TTR_X64_ARCH "AVX" CACHE STRING "x64 SIMD baseline for game code (AVX or AVX2)")
 set_property(CACHE TTR_X64_ARCH PROPERTY STRINGS AVX AVX2)
 
@@ -38,6 +40,7 @@ set(PS2X_BUILD_TEST OFF CACHE BOOL "" FORCE)
 set(PS2X_BUILD_STUDIO OFF CACHE BOOL "" FORCE)
 set(PS2X_BUILD_RUNTIME ON CACHE BOOL "" FORCE)
 set(PS2X_ENABLE_DEBUG_UI ${TTR_ENABLE_DEBUG_UI} CACHE BOOL "" FORCE)
+set(PS2X_ENABLE_AGRESSIVE_LOGS ${TTR_VERBOSE_RUNTIME_LOGS} CACHE BOOL "" FORCE)
 
 add_subdirectory("${TTR_PS2RECOMP_DIR}" "${CMAKE_BINARY_DIR}/ps2recomp" EXCLUDE_FROM_ALL)
 
