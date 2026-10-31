@@ -49,6 +49,22 @@ Necesitas tu propia copia de **SLES-51256** (PAL España). El repositorio no con
 
 El disco se extrae en `TwoTowersRecompLib/private/disc/`, que Git ignora. La imagen original solo se lee.
 
+### BIOS (recomendada)
+
+El runtime de PS2Recomp es un entorno HLE sin BIOS: no ejecuta la BIOS ni la necesita para arrancar.
+El juego, sin embargo, lee `rom0:ROMVER`, y el runtime responde por defecto con una BIOS **americana**
+v2.00 (`0200AC20040614`). Con un volcado de tu propia consola el ejecutable sirve el `ROMVER` real.
+Lo más fiel para esta edición PAL de 2002 es la europea v1.60 (SCPH-30004, `0160EC20011004`).
+
+```powershell
+.venv\Scripts\python -I tools\bios_info.py "$env:USERPROFILE\Documents\PCSX2\bios"     # lista ROMVER/región
+.venv\Scripts\python -I tools\bios_info.py --install "ruta\a\tu\bios.bin"            # -> private/bios/bios.bin
+```
+
+Al arrancar, el ejecutable busca la BIOS en `--bios <fichero-o-carpeta>`, en `bios\` junto al `.exe` o en
+`TwoTowersRecompLib/private/bios/`. Si no hay ninguna, sigue con el `ROMVER` por defecto del runtime.
+La misma BIOS europea es la recomendada en PCSX2 para comparar con el juego original.
+
 ## Generar el código recompilado
 
 ```powershell
@@ -96,7 +112,7 @@ para comprobar el toolchain, pero el juego no arranca.
 ## Ejecutar
 
 ```powershell
-out\build\win-clang-debug\TwoTowersRecomp\TwoTowersRecomp.exe [--game <carpeta-o-ELF>]
+out\build\win-clang-debug\TwoTowersRecomp\TwoTowersRecomp.exe [--game <carpeta-o-ELF>] [--bios <fichero-o-carpeta>]
 ```
 
 Sin `--game`, el ejecutable busca `SLES_512.56` en `game\` junto al `.exe` y, en builds de desarrollo,

@@ -13,17 +13,18 @@ El código MIPS R5900 del ejecutable original (`SLES_512.56`) se traduce a C++ c
 para x64. Un runtime emula el resto del hardware de PS2 (GS, VU, IOP, DMA...) y lee los datos del juego
 desde tu copia del disco.
 
-**El repositorio no incluye ningún dato del juego.** Necesitas tu propia copia original de la edición
-PAL España (`SLES-51256`). No pidas ni compartas ISOs.
+**El repositorio no incluye ningún dato del juego ni BIOS.** Necesitas tu propia copia original de la
+edición PAL España (`SLES-51256`) y, recomendado, un volcado de la BIOS de tu consola. No pidas ni
+compartas ISOs ni BIOS.
 
 ## Estructura
 
 | Ruta | Contenido |
 | --- | --- |
-| `TwoTowersRecomp/` | Ejecutable: punto de entrada y parches específicos del juego |
+| `TwoTowersRecomp/` | Ejecutable: punto de entrada, lectura de BIOS y parches específicos del juego |
 | `TwoTowersRecompLib/config/` | Configuración de PS2Recomp para `SLES_512.56` |
 | `TwoTowersRecompLib/generated/` | C++ generado (local, ignorado por Git) |
-| `TwoTowersRecompLib/private/` | Disco extraído (local, ignorado por Git) |
+| `TwoTowersRecompLib/private/` | Disco extraído y BIOS (local, ignorado por Git) |
 | `tools/` | Instalación del toolchain, extracción, generación y compilación |
 | `tools/PS2Recomp/` | Submódulo: recompilador y runtime |
 | `docs/` | [Compilación](docs/BUILDING.md), [estado](docs/STATUS.md), [notas técnicas](docs/notes/elf.md) |
@@ -35,7 +36,9 @@ powershell -ExecutionPolicy Bypass -File tools\setup_windows.ps1
 git submodule update --init --recursive
 py -3.12 -m venv .venv; .venv\Scripts\python -m pip install -r tools\requirements.txt
 .venv\Scripts\python -I tools\extract_iso.py "ruta\a\tu\disco.iso"
+.venv\Scripts\python -I tools\bios_info.py --install "ruta\a\tu\bios.bin"
 powershell -ExecutionPolicy Bypass -File tools\build_tools.ps1
+powershell -ExecutionPolicy Bypass -File tools\ghidra\export_functions.ps1
 .venv\Scripts\python -I tools\recomp_codegen.py generate
 powershell -ExecutionPolicy Bypass -File tools\build_runtime.ps1
 ```

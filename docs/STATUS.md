@@ -18,6 +18,8 @@ Fase: **exploración**. Nada es jugable todavía.
 - [x] Ghidra headless + extensión EE: 4719 funciones y 33 807 etiquetas ejecutables exportadas.
 - [x] Generación con el mapa de Ghidra: 38 526 entradas (38 194 recompiladas, 332 stubs), **0 errores**.
 - [x] Build completa `win-clang-debug` con todo el código generado (~6 min en Ryzen 5 3600X, exe de 184 MB).
+- [x] BIOS del usuario: `rom0:ROMVER` europeo real (SCPH-30004, `0160EC20011004`) en lugar del americano
+      que trae el runtime por defecto.
 
 ## Primer arranque (2026-10-31)
 

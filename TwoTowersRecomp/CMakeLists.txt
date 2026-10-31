@@ -1,5 +1,6 @@
 add_executable(TwoTowersRecomp
     main.cpp
+    bios/bios_rom.cpp
     game/sles_51256_overrides.cpp
 )
 

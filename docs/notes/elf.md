@@ -39,6 +39,15 @@ Consecuencias para la recompilación:
 - Los límites de función salen directamente de la tabla de símbolos; Ghidra es opcional para el arranque.
 - Las relocalizaciones permiten que PS2Recomp enlace llamadas `J`/`JAL` a handlers del runtime por nombre.
 
+## Dependencias de `rom0:`
+
+El ELF referencia dos ficheros de la BIOS:
+
+- `rom0:ROMVER` (con el mensaje de error `Can't open rom0:ROMVER`): versión y región de la consola.
+  TwoTowersRecomp lo sirve desde el volcado de BIOS del usuario (ver `TwoTowersRecomp/bios/`).
+- `rom0:UDNL`: el cargador que reinicia el IOP con `cdrom0:\IOP\IOPRP252.IMG`. El runtime lo resuelve
+  en HLE.
+
 ## Contenido del disco
 
 | Carpeta | Ficheros | Contenido |
