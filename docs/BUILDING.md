@@ -109,6 +109,10 @@ Visual Studio con `tools/vsenv.ps1`; para usar CMake a mano, abre antes un *Deve
 Sin código generado el proyecto compila igualmente con una tabla de funciones vacía, lo que sirve
 para comprobar el toolchain, pero el juego no arranca.
 
+Antes de configurar, el script aplica los parches de [`tools/patches/`](../tools/patches/README.md) al
+submódulo. Si estás editando ficheros del submódulo que esos parches también tocan, añade `-SkipPatches`
+y exporta tus cambios con `tools\export_patch.ps1` cuando termines.
+
 ## Ejecutar
 
 ```powershell

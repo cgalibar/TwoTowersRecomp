@@ -11,8 +11,9 @@
 | `recomp_codegen.py` | `verify`, `analyze`, `import-analyzer` y `generate` del código recompilado |
 | `build_runtime.ps1` | Configura y compila `TwoTowersRecomp` con un preset de CMake |
 | `ghidra/export_functions.ps1` | Ghidra headless + `ExportPS2Functions.java` → mapa de funciones en `out/ghidra/` |
-| `apply_patches.ps1` | Aplica `patches/PS2Recomp/*.patch` al submódulo (idempotente; los scripts de build lo llaman) |
-| `disasm.py` | Desensamblado R5900 del ELF por símbolo o dirección |
+| `apply_patches.ps1` | Aplica la pila `patches/PS2Recomp/*.patch` al submódulo (idempotente; los scripts de build lo llaman) |
+| `export_patch.ps1` | Exporta como parche nuevo los cambios del submódulo que la pila todavía no cubre |
+| `disasm.py` | Desensamblado R5900 del ELF por símbolo o dirección; símbolos, referencias a globales de `$gp` |
 | `irx_disasm.py` | Desensamblado R3000 de módulos IOP (IRX) a su dirección de carga |
 
 Ejecuta los scripts de Python con `-I` desde la raíz del repositorio usando el `.venv`.

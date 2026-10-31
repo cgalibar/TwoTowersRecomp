@@ -2,6 +2,7 @@
 //   dma   - ClGfxDmaBuffer / VBlank DMA queue state
 //   sound - ClMStream (EA MultiStream) loads and body-load state machine
 //   rpc   - EE-side sceSifBindRpc / sceSifCallRpc / sceSifCheckStatRpc
+//   fmv   - ClFMV playback flags, nodata callback and FMV audio requests
 // TTR_FRAME_DUMP=<dir> saves the presented frame (and logs the ClGame state) every
 // TTR_FRAME_DUMP_EVERY VBlanks (default 50, one second of PAL).
 // Each traced guest function is wrapped: the wrapper logs, then runs the generated function.
@@ -147,6 +148,8 @@ namespace ttr::sles51256
             QueueDmaChain__18ClVBlankIntHandlerFP1i_0x1064e0(rdram, ctx, runtime);
         }
 
+        void logFmvState(const uint8_t *rdram, const char *event);
+
         void dumpFrameIfDue(uint8_t *rdram, PS2Runtime *runtime)
         {
             static uint32_t vblanks = 0;
@@ -165,6 +168,10 @@ namespace ttr::sles51256
                       << " vtbl=0x" << (current ? ram32(rdram, current) : 0u)
                       << " current.next=" << std::dec << (current ? ram32(rdram, current + 4u) : 0u)
                       << std::endl;
+            if (traceEnabled("fmv"))
+            {
+                logFmvState(rdram, "frame");
+            }
 
             static constexpr const char *kStatus[] = {"run", "ready", "wait", "wait-susp", "susp", "dormant"};
             static constexpr const char *kWait[] = {"-", "sleep", "sema", "evflag", "vsync", "external", "mpeg"};
@@ -175,7 +182,7 @@ namespace ttr::sles51256
                           << ' ' << kStatus[static_cast<int>(thread.status)]
                           << '/' << kWait[static_cast<int>(thread.waitReason)] << ':' << thread.waitId
                           << " prio=" << thread.currentPriority << std::hex
-                          << " pc=0x" << thread.pc << " ra=0x" << thread.ra
+                          << " pc=0x" << thread.pc << " ra=0x" << thread.ra << " sp=0x" << thread.sp
                           << " entry=0x" << thread.entry << std::dec
                           << " depth=" << thread.invocationDepth << std::endl;
             }
@@ -459,6 +466,97 @@ namespace ttr::sles51256
             if (log)
                 logStream(rdram, "tickBodyLoad<", stream);
         }
+
+        // --- fmv: ClFMV (EA "FHDR"/"MPCh" movies fed to libmpeg from its nodata callback) ------
+        constexpr uint32_t kFmvFlags = 0x003821D0u;       // smIsPlaying, smAbortPlayback, ... one byte every 4
+        constexpr uint32_t kFmvFrameCount = 0x00382198u;  // smFrameCount
+        constexpr uint32_t kFmvFileRemaining = 0x003821C4u;
+        constexpr uint32_t kFmvSoundRequests = kGp - 0x70D8u;
+        constexpr uint32_t kFmvMemory = 0x0038219Cu;  // smpFMVMemory, smFMVMemorySize, smpBuffer, ... chunk at +0x10
+        constexpr uint32_t kFmvStreamBuffer = 0x0054C180u;  // ClFMVStreamBuffer {base, size, read, write, used}
+        constexpr uint32_t kFmvSoundBuffer = 0x0054C200u;   // ClFMVSoundBuffer, same layout
+        constexpr uint32_t kFmvMpegBuffer = 0x0054C280u;    // ClFMVStreamBuffer of "MPCh" chunks
+
+        void logFmvBuffer(const uint8_t *rdram, const char *label, uint32_t buffer)
+        {
+            std::cout << ' ' << label << "{used=0x" << std::hex << ram32(rdram, buffer + 0x10u) << "/0x"
+                      << ram32(rdram, buffer + 0x04u) << '}' << std::dec;
+        }
+
+        void logFmvState(const uint8_t *rdram, const char *event)
+        {
+            static constexpr const char *kFlags[] = {"playing", "abort", "finished", "eof", "soundEof", "videoEnd"};
+            std::cout << "[ttr:fmv] " << event;
+            for (uint32_t i = 0; i < 6u; ++i)
+            {
+                std::cout << ' ' << kFlags[i] << '=' << static_cast<int>(rdram[(kFmvFlags + i * 4u) & 0x01FFFFFFu]);
+            }
+            std::cout << " frames=" << ram32(rdram, kFmvFrameCount) << " remaining=" << ram32(rdram, kFmvFileRemaining)
+                      << " soundReq=" << ram32(rdram, kFmvSoundRequests) << std::hex
+                      << " memory=0x" << ram32(rdram, kFmvMemory) << "+0x" << ram32(rdram, kFmvMemory + 4u)
+                      << " chunk=0x" << ram32(rdram, kFmvMemory + 0x10u) << std::dec;
+            logFmvBuffer(rdram, "stream", kFmvStreamBuffer);
+            logFmvBuffer(rdram, "sound", kFmvSoundBuffer);
+            logFmvBuffer(rdram, "mpeg", kFmvMpegBuffer);
+            std::cout << std::endl;
+        }
+
+        void traceFmvPlay(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            std::cout << "[ttr:fmv] play '" << guestString(rdram, GPR_U32(ctx, 4)) << "'" << std::endl;
+            play__5ClFMVFPCc_0x26a5e0(rdram, ctx, runtime);
+            logFmvState(rdram, "after-play");
+        }
+
+        void traceFmvAbort(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            logFmvState(rdram, "abort");
+            abort__5ClFMVFv_0x26b2c0(rdram, ctx, runtime);
+        }
+
+        void traceFmvNoData(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            static uint32_t count = 0;
+            const bool log = shouldLog(count);
+            if (log)
+                logFmvState(rdram, "nodata>");
+            noDataCallback__5ClFMVFP7sceMpegP13sceMpegCbDataPv_0x26a4c0(rdram, ctx, runtime);
+            if (log)
+                std::cout << "[ttr:fmv] nodata #" << count << " -> " << GPR_U32(ctx, 2) << std::endl;
+        }
+
+        void traceFmvSoundRequest(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            static uint32_t count = 0;
+            const bool log = shouldLog(count);
+            const uint32_t target = GPR_U32(ctx, 4);
+            const uint32_t size = GPR_U32(ctx, 5);
+            handleSoundBufferRequest__5ClFMVFii_0x269fb0(rdram, ctx, runtime);
+            if (log)
+            {
+                std::cout << "[ttr:fmv] sound request #" << count << " iop=0x" << std::hex << target << std::dec
+                          << " size=" << size << " -> " << GPR_U32(ctx, 2) << std::endl;
+            }
+        }
+
+        void traceFmvDraw(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            static uint32_t last = 0xFFFFFFFFu;
+            static uint32_t repeats = 0;
+            draw__5ClFMVFb_0x26b150(rdram, ctx, runtime);
+            const uint32_t result = GPR_U32(ctx, 2);
+            if (result != last)
+            {
+                std::cout << "[ttr:fmv] draw -> " << result << " (previous repeated " << repeats << "x)" << std::endl;
+                logFmvState(rdram, "draw");
+                last = result;
+                repeats = 0;
+            }
+            else
+            {
+                ++repeats;
+            }
+        }
 #endif
     }
 
@@ -493,6 +591,15 @@ namespace ttr::sles51256
             runtime.replaceFunction(0x002AE728u, &traceCallRpc);
             runtime.replaceFunction(0x002AE918u, &traceCheckStatRpc);
             std::cout << "[ttr] SIF RPC tracing enabled" << std::endl;
+        }
+        if (traceEnabled("fmv"))
+        {
+            runtime.replaceFunction(0x0026A5E0u, &traceFmvPlay);
+            runtime.replaceFunction(0x0026B2C0u, &traceFmvAbort);
+            runtime.replaceFunction(0x0026A4C0u, &traceFmvNoData);
+            runtime.replaceFunction(0x00269FB0u, &traceFmvSoundRequest);
+            runtime.replaceFunction(0x0026B150u, &traceFmvDraw);
+            std::cout << "[ttr] FMV tracing enabled" << std::endl;
         }
         if (traceEnabled("dma") || frameDumpConfig().enabled)
         {

@@ -14,9 +14,12 @@ lenta. Los logs por registro del GS del runtime están desactivados por defecto
 | `TTR_TRACE=dma` | Cola de cadenas DMA de VBlank y `ClGfxDmaBuffer` |
 | `TTR_TRACE=sound` | Streams de EA MultiStream (ver [notas/ea-sound.md](notes/ea-sound.md)) |
 | `TTR_TRACE=rpc` | `sceSifBindRpc`/`CallRpc`/`CheckStatRpc` cuando se llaman por la tabla de funciones |
+| `TTR_TRACE=fmv` | `ClFMV`: banderas de reproducción, callback "sin datos", peticiones de audio del vídeo y llenado de sus buffers (también en cada volcado de frame) |
 | `TTR_HACK_SKIP_BARD=1` | Hack: `ClGameSound::isBardStreamLoaded()` siempre devuelve true |
 | `PS2X_IOP_TRACE=1` | Trazas del IOP (parche `0001`): `cdvdman`, `ioman`, enlaces entre módulos, RPC |
 | `PS2X_IOP_CALLTRACE=<Mciclos>:<líneas>:<lo>-<hi>` | `jal`/`jalr` ejecutados en `[lo, hi)` a partir de un ciclo IOP |
+| `PS2X_WATCH=<lo>-<hi>` | Avisa (con el origen) cuando el runtime escribe en ese rango de la RAM del EE: stubs de libc, DMA SIF/IOP, lecturas de fichero, copias RPC, `sceMpegGetPicture`. No cubre los `sw`/`sq` del código recompilado |
+| `PS2X_PROFILE_CALLS=<n>` | Cada `n` llamadas entre funciones del juego, imprime las 30 más llamadas (`tools/disasm.py --sym` las traduce) |
 
 Se pueden combinar: `TTR_TRACE=sound,dma`.
 
@@ -24,7 +27,7 @@ Se pueden combinar: `TTR_TRACE=sound,dma`.
 
 | Herramienta | Uso |
 | --- | --- |
-| `tools/disasm.py <símbolo|dirección>` | Desensamblado R5900 del ELF; `--sym <dir>` resuelve a símbolo, `--find <texto>` busca símbolos |
+| `tools/disasm.py <símbolo|dirección>` | Desensamblado R5900 del ELF; `--sym <dir>` resuelve a símbolo, `--find <texto>` busca símbolos, `--gpref=-0x7120` lista los accesos a una global relativa a `$gp` |
 | `tools/irx_disasm.py <IRX> --base <dir> <dir>` | Desensamblado R3000 de un módulo IOP tal como se carga; `--imports`, `--strings` |
 | `TwoTowersRecomp/game/sles_51256_trace.cpp` | Wrappers de funciones del juego: registra y llama a la función generada |
 

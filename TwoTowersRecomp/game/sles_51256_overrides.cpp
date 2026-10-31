@@ -7,10 +7,20 @@
 
 namespace
 {
+    // ClMemory::initialize() hands the game all RAM from _end (0x589280) up to 32 MiB and makes the
+    // permanent allocations (DMA buffers, FMV memory) from the top: exactly where the runtime keeps
+    // its RPC/TLS descriptors and callback stacks by default. The game overwrote a server descriptor
+    // there and sceSifCallRpc then copied 8 KiB of EA sound commands over the small-data globals.
+    // Nothing is loaded between the kernel and the ELF (0x80000-0x100000): the runtime goes there.
+    constexpr uint32_t kRuntimeRegionBase = 0x00080000u;  // descriptors + callback stacks
+    constexpr uint32_t kRuntimeRegionSize = 0x00060000u;
+    constexpr uint32_t kGuestHeapBase = 0x000E0000u;      // libc malloc (stdio, dtoa) and runtime stubs
+    constexpr uint32_t kGuestHeapLimit = 0x00100000u;
+
     void applyTwoTowersSles51256(PS2Runtime &runtime)
     {
-        // Address bindings go here as bring-up finds them, e.g.:
-        //   ps2_game_overrides::bindAddressHandler(runtime, 0x00123456u, "sceCdRead");
+        runtime.setRuntimeGuestRegion(kRuntimeRegionBase, kRuntimeRegionSize);
+        runtime.configureGuestHeap(kGuestHeapBase, kGuestHeapLimit);
         ttr::sles51256::installTracing(runtime);
     }
 }

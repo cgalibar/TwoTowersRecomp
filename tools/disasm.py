@@ -4,6 +4,7 @@
     python -I tools/disasm.py 0x15eb00 --count 40        # N instructions from an address
     python -I tools/disasm.py --sym 0x15eb3c             # which symbol contains an address
     python -I tools/disasm.py --find ClGame              # list symbols matching a substring
+    python -I tools/disasm.py --gpref=-0x7120            # loads/stores of _gp + offset (any width)
 """
 from __future__ import annotations
 
@@ -82,17 +83,41 @@ def disassemble(img: Image, start: int, count: int) -> None:
         print(f"  {addr:08x}: {word:08x}  {text}{note}")
 
 
+GP_BASE = 28
+LOAD_STORE_OPS = {
+    0x20: "lb", 0x21: "lh", 0x23: "lw", 0x24: "lbu", 0x25: "lhu", 0x27: "lwu", 0x37: "ld", 0x1E: "lq",
+    0x28: "sb", 0x29: "sh", 0x2B: "sw", 0x3F: "sd", 0x1F: "sq", 0x31: "lwc1", 0x39: "swc1",
+}
+
+
+def find_gp_refs(img: Image, offset: int) -> None:
+    """Every load/store whose address is $gp + offset, in executable code."""
+    imm = offset & 0xFFFF
+    for base, data in img.segments:
+        for pos in range(0, len(data) - 3, 4):
+            word = struct.unpack_from("<I", data, pos)[0]
+            op = word >> 26
+            if op in LOAD_STORE_OPS and (word >> 21) & 0x1F == GP_BASE and word & 0xFFFF == imm:
+                addr = base + pos
+                instr = rabbitizer.Instruction(word, vram=addr, category=rabbitizer.InstrCategory.R5900)
+                print(f"  {addr:08x}: {instr.disassemble():40s} {img.symbolize(addr)}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("target", nargs="?")
     parser.add_argument("--count", type=int, default=0)
     parser.add_argument("--sym", type=lambda s: int(s, 0))
     parser.add_argument("--find")
+    parser.add_argument("--gpref", type=lambda s: int(s, 0))
     args = parser.parse_args()
 
     img = Image(ELF)
     if args.sym is not None:
         print(img.symbolize(args.sym))
+        return 0
+    if args.gpref is not None:
+        find_gp_refs(img, args.gpref)
         return 0
     if args.find:
         for addr, size, name in img.all_syms:
