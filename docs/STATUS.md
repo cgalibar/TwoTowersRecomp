@@ -1,67 +1,61 @@
 # Estado
 
-[Inicio](../README.md) · [Compilación](BUILDING.md)
+[Inicio](../README.md) · [Compilación](BUILDING.md) · [Depuración](DEBUGGING.md)
 
-Fase: **exploración**. Nada es jugable todavía.
+Fase: **en progreso**. Arranca, muestra la pantalla legal y la de carga, carga el primer nivel y llega
+al primer vídeo FMV. Todavía no es jugable.
 
-## Hecho
+## Progreso del arranque
 
-- [x] Toolchain de Windows y scripts de instalación/compilación.
-- [x] Extracción del disco e identificación de la build (`SLES-51256`, ELF con símbolos).
-- [x] Proyecto CMake que enlaza el runtime de PS2Recomp con el código generado.
-- [x] Prueba de humo sin código generado: el runtime carga los segmentos del ELF, aplica el override de
-      `SLES-51256` y llega al entry point `0x00100008`.
-- [x] Primer análisis (`ps2_analyzer`) importado en `TwoTowersRecompLib/config/sles_51256.toml`.
-- [x] Primera generación (`ps2_recomp`): 5088 funciones (4757 recompiladas, 331 stubs del runtime),
-      64 469 relocalizaciones procesadas, ~5090 ficheros C++ (~167 MB).
+| Hito | Estado |
+| --- | --- |
+| Banner del juego (`v072 PAL`, `Sep 20 2002`) e inicialización de GS/DMA | ✅ |
+| IRX del disco ejecutados en `ps2xIOP` (`LIBSD`, `FUFILECD`, `SDRDRV`, `PADMAN`, `MCMAN`, `FUSTREAM`...) | ✅ |
+| Pantalla legal en español (`ClGameModeStartup`) | ✅ |
+| Pantalla "CARGANDO..." (`ClGameModePlay`) | ✅ |
+| Banco de efectos del nivel subido a la RAM del SPU2 (`00ISUL1.MSB`) | ✅ |
+| Streams de narrador/música (EA MultiStream) y carga del nivel (`ClEnemyDB::load`) | ✅ |
+| Vídeo FMV (`ClFMV::blitMpegToGSBackBuffer`) | ❌ el hilo espera en `wait/mpeg` |
+| Menú principal, mando, partida | pendiente |
 
-- [x] Ghidra headless + extensión EE: 4719 funciones y 33 807 etiquetas ejecutables exportadas.
-- [x] Generación con el mapa de Ghidra: 38 526 entradas (38 194 recompiladas, 332 stubs), **0 errores**.
-- [x] Build completa `win-clang-debug` con todo el código generado (~6 min en Ryzen 5 3600X, exe de 184 MB).
-- [x] BIOS del usuario: `rom0:ROMVER` europeo real (SCPH-30004, `0160EC20011004`) en lugar del americano
-      que trae el runtime por defecto.
+## Problemas resueltos
 
-## Primer arranque (2026-10-31)
+### Puntero nulo en `ClGame::tick()` (mapa de funciones)
 
-El código recompilado arranca y llega bastante lejos:
+El mapa de Ghidra incluye 33 806 etiquetas ejecutables dentro de funciones. PS2Recomp convertía cada una
+en un fragmento que acaba en la siguiente etiqueta, así que `entry_001002e8` contenía el `jal ClGame::tick`
+**sin su delay slot** (`addiu a0, a0, 0x2510`): `tick` recibía `this = 0x380000` en vez de `0x382510`.
+`recomp_codegen.py` construye ahora el mapa con los símbolos del ELF (+ crt0 de Ghidra), descarta las
+etiquetas internas y nunca corta una función entre un salto y su delay slot. 4719 funciones, 0 errores.
 
-1. Imprime el banner del juego: `Version number: v072 PAL`, `Build date: Sep 20 2002`,
-   `Build mode: INTERNAL`, `File media: CD`.
-2. Inicializa el heap, el GS (`sceGsResetGraph`) y envía listas DMA/GIF.
-3. Carga desde `cdrom0:` y ejecuta en `ps2xIOP` los IRX del disco: `SDRDRV`, `SIO2MAN`, `PADMAN`, `MCMAN`,
-   `MCSERV`, `FUSTREAM` (+ `FUFILECD`). El sistema de ficheros del juego construye su árbol de
-   directorios y el streaming de sonido reserva sus buffers.
-4. Presenta frames de 640×512.
-5. **Primer bloqueo:** `ClGame::tick()` (`0x0015EB3C`, `tick__6ClGameFv+0x3c`) hace un `JALR` a un puntero
-   nulo. Después el hilo principal queda en `SfConsoleDrawThread__FPv` (`0x001713FC`), el hilo de la
-   consola de depuración del motor, que probablemente está mostrando el error.
+### Carga infinita (EA MultiStream / SIF RPC)
 
-## Observaciones de la primera generación
+El sonido de EA hace un "ping-pong" EE↔IOP: cada respuesta del IOP (`FUSTREAM.IRX`, RPC `0x12345`) dispara
+el siguiente `SOUND_GetStatus` en `ClSound::tick`, que lee la secuencia de la respuesta **después** de
+`FlushIOPCommand`. El runtime completaba los `sceSifCallRpc` sin espera de forma síncrona, así que la
+secuencia ya era la nueva y el ping-pong se detenía; el IOP quedaba esperando la confirmación de carga del
+stream actual (`0x151B0`) para siempre. Parche `0002`: la función de fin de un RPC sin espera se ejecuta
+~100 µs después. Diagnóstico completo en [notas/ea-sound.md](notes/ea-sound.md).
 
-- Sin el mapa de Ghidra hay **~12 000 instrucciones no reconocidas**, todas en funciones sin nombre
-  (`sub_00303030`, `sub_00344E20`, `sub_0036C598`...) entre `0x00303030` y `0x0037Bxxx`: la sección `main`
-  mezcla código y datos (probablemente también microcódigo de VU1). Con el mapa de Ghidra desaparecen.
+### SPU2
+
+`ps2xIOP` no emulaba el SPU2 (era un almacén de registros). Parche `0001`: RAM de sonido de 2 MiB, DMA
+real, voces ADPCM con bucles, `NAX`/`ENDX`/`ENVX`, ADSR e IRQ. La mezcla se genera pero todavía **no se
+envía al host** (sin sonido).
+
+## Siguiente
+
+1. FMV: el reproductor del juego usa `sceMpeg*` y espera imágenes que el HLE MPEG del runtime no entrega
+   (`wait/mpeg`). Revisar el formato de los `.FMV` (PSS) y la ruta IPU/FFmpeg del runtime.
+2. Salida de audio: llevar la mezcla del SPU2 al backend de audio del runtime (raylib).
+3. VBlank a 50 Hz: el runtime programa VBlanks NTSC (60 Hz) aunque el juego es PAL (`VMODE = PAL`).
+4. Rendimiento: unos 15 VBlanks/s durante la carga en `RelWithDebInfo` (el resto del tiempo, tiempo real).
+5. Confirmar qué hay en `0x00303030–0x0037Bxxx` (¿microcódigo VU1?) y si el runtime lo necesita.
+
+## Observaciones
+
 - ~1000 avisos de `JR`/`JALR` sin resolver (vtables de C++ y jump tables); el runtime los resuelve por
   búsqueda en tiempo de ejecución.
 - 29 parches de instrucción propuestos por el analizador como "posible código automodificable"; están
   aplicados (sustituidos por `nop`) pero sin revisar.
 - El juego lleva un intérprete **Lua** embebido (`luaV_execute`, `lua_State`) y clases `CYo*` / `Cl*`.
-
-## Siguiente
-
-1. Depurar el puntero nulo de `ClGame::tick()`: averiguar qué estado/callback no se inicializó
-   (¿carga de fichero o RPC del IOP sin completar?) y leer el texto de `SfConsoleDrawThread`.
-2. Confirmar qué hay en `0x00303030–0x0037Bxxx` (¿microcódigo VU1?) y si el runtime lo necesita.
-3. Módulos IOP propios del juego: `FUSTREAM.IRX` (streaming), `SDRDRV.IRX` / `LIBSD.IRX` (audio).
-4. Vídeos `FMV/` (MPEG-2 vía IPU + FFmpeg).
-5. Renderizado: ruta GS/VIF1/VU1 del runtime.
-6. Mover los parches específicos a `TwoTowersRecomp/game/sles_51256_overrides.cpp`.
-
-## Bucle de trabajo recomendado (de PS2Recomp)
-
-1. Ejecutar con la configuración mínima, sin `skip` agresivos.
-2. Arreglar primero los bloqueos duros.
-3. Usar stubs temporales (`ret0`, `ret1`, `reta0`) solo para clasificar llamadas.
-4. Convertir los arreglos temporales en implementaciones reales.
-5. Los hacks de este juego van en *game overrides*, no en el runtime global.
-6. Volver a probar desde arranque en frío tras cada tanda.

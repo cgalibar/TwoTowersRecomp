@@ -9,6 +9,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'vsenv.ps1')
+& (Join-Path $PSScriptRoot 'apply_patches.ps1')
 
 Push-Location $repo
 try {

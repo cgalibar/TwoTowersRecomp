@@ -17,6 +17,8 @@
 *.cmd   text eol=crlf
 *.ps1   text eol=crlf
 
+*.patch -text
+
 *.png   binary
 *.ico   binary
 *.zip   binary

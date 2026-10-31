@@ -1,0 +1,139 @@
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index f247ff9..81a1162 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -236,6 +236,7 @@ enum class EeEventType : uint8_t
+     Dmac,
+     ExternalWake,
+     Alarm,
++    DeferredInvocation,
+ };
+ 
+ struct EeEvent
+@@ -316,6 +317,8 @@ public:
+     int setAlarm(uint16_t ticks, uint32_t handler, uint32_t argument, uint32_t gp, uint32_t sp);
+     int cancelAlarm(int id);
+     void queueInvocation(GuestInvocation invocation);
++    // Queues `invocation` like an interrupt once `delayCycles` EE cycles have elapsed.
++    void queueInvocationAfter(uint64_t delayCycles, GuestInvocation invocation);
+     [[noreturn]] void invokeCurrent(GuestInvocation invocation);
+     [[noreturn]] void invokeCurrentSequence(std::vector<GuestInvocation> invocations);
+     [[nodiscard]] bool hasInvocation(GuestInvocationKind kind, uint64_t tag) const;
+@@ -405,6 +408,8 @@ private:
+     std::unordered_map<int, EeSemaphore> m_semaphores;
+     std::unordered_map<int, EeEventFlag> m_eventFlags;
+     std::unordered_map<int, EeAlarm> m_alarms;
++    std::unordered_map<uint32_t, GuestInvocation> m_deferredInvocations;
++    uint32_t m_nextDeferredInvocationId = 1;
+     std::unordered_map<int, EeIrqHandler> m_intcHandlers;
+     std::unordered_map<int, EeIrqHandler> m_dmacHandlers;
+     int m_nextThreadId = kFirstThreadId;
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index c5e31c4..086d0e2 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -91,6 +91,8 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+     m_semaphores.clear();
+     m_eventFlags.clear();
+     m_alarms.clear();
++    m_deferredInvocations.clear();
++    m_nextDeferredInvocationId = 1;
+     m_intcHandlers.clear();
+     m_dmacHandlers.clear();
+     m_nextThreadId = kFirstThreadId;
+@@ -1106,6 +1108,20 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
+     m_checkpointPending.store(true, std::memory_order_release);
+ }
+ 
++void EeScheduler::queueInvocationAfter(uint64_t delayCycles, GuestInvocation invocation)
++{
++    assertExecutor();
++    uint32_t id = m_nextDeferredInvocationId++;
++    if (id == 0u)
++    {
++        id = m_nextDeferredInvocationId++;
++    }
++    m_deferredInvocations.emplace(id, std::move(invocation));
++    scheduleEvent(m_eeCycle + delayCycles,
++                  std::chrono::steady_clock::now() + eeCyclesToHostDuration(delayCycles),
++                  EeEvent{EeEventType::DeferredInvocation, id, 0});
++}
++
+ [[noreturn]] void EeScheduler::invokeCurrent(GuestInvocation invocation)
+ {
+     assertExecutor();
+@@ -1931,6 +1947,18 @@ void EeScheduler::processEvent(const EeEvent &event)
+         queueInvocation(std::move(invocation));
+         break;
+     }
++    case EeEventType::DeferredInvocation:
++    {
++        auto it = m_deferredInvocations.find(event.id);
++        if (it == m_deferredInvocations.end())
++        {
++            break;
++        }
++        GuestInvocation invocation = std::move(it->second);
++        m_deferredInvocations.erase(it);
++        queueInvocation(std::move(invocation));
++        break;
++    }
+     }
+ }
+ 
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+index 07fcd29..f3a7aea 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+@@ -2,10 +2,18 @@
+ #include "RPC.h"
+ #include "../../ps2_iop_transport.h"
+ 
++#include <cstdio>
++#include <cstdlib>
++#include <unordered_map>
++#include <utility>
++
+ namespace ps2_syscalls
+ {
+     namespace
+     {
++        // ~100 us of EE time between a no-wait sceSifCallRpc returning and its end function running.
++        constexpr uint64_t kNowaitRpcCompletionCycles = 294912u * 100u / 1000u;
++
+         SifRpcDebugEvent makeRpcDebugEvent(const char *op, R5900Context *ctx, PS2Runtime *runtime)
+         {
+             SifRpcDebugEvent event{};
+@@ -678,6 +686,15 @@ namespace ps2_syscalls
+             {
+                 completeClient(base, true);
+             };
++            if ((mode & kSifRpcModeNowait) != 0u)
++            {
++                // A no-wait call returns to the caller first; the end function runs later from the
++                // SIF interrupt, once the IOP has served the request and DMAed the reply back.
++                // Games rely on that ordering (e.g. sampling a reply sequence right after the call).
++                SET_GPR_U32(&callback.context, 29, 0u);
++                runtime->eeScheduler().queueInvocationAfter(kNowaitRpcCompletionCycles, std::move(callback));
++                return;
++            }
+             runtime->eeScheduler().invokeCurrent(std::move(callback));
+         };
+ 
+@@ -824,6 +841,16 @@ namespace ps2_syscalls
+             setReturnS32(ctx, 0);
+             return;
+         }
++        if (std::getenv("PS2X_IOP_TRACE"))
++        {
++            static std::unordered_map<uint32_t, std::pair<bool, uint32_t>> last;
++            auto &[wasBusy, repeats] = last[clientPtr];
++            if (wasBusy != it->second.busy || repeats == 0u || (repeats % 600u) == 0u)
++                std::printf("[ee:rpc] checkstat client=0x%x busy=%d (same for %u calls)\n", clientPtr,
++                            it->second.busy ? 1 : 0, repeats);
++            repeats = (wasBusy == it->second.busy) ? repeats + 1u : 1u;
++            wasBusy = it->second.busy;
++        }
+         setReturnS32(ctx, it->second.busy ? 1 : 0);
+     }
+ 
