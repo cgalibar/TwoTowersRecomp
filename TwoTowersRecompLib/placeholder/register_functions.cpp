@@ -1,0 +1,10 @@
+// Empty function table used before guest code has been generated.
+// Mirrors ps2xRuntime/src/runner/register_functions.cpp from PS2Recomp (GPL-3.0).
+// tools/recomp_codegen.py writes the real register_functions.cpp into TwoTowersRecompLib/generated/.
+#include "ps2_runtime.h"
+#include "runtime/ps2_memory.h"
+
+extern const uint32_t g_ps2RecompiledFunctionTableBase = 0x00000000u;
+extern const uint32_t g_ps2RecompiledFunctionTableEnd = 0x01000000u;
+extern const uint32_t g_ps2RecompiledFunctionTableSlotCount = (g_ps2RecompiledFunctionTableEnd - g_ps2RecompiledFunctionTableBase) >> 2;
+PS2Runtime::RecompiledFunction g_ps2RecompiledFunctionTable[g_ps2RecompiledFunctionTableSlotCount] = {};

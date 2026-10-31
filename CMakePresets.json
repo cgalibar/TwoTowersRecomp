@@ -1,0 +1,69 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 28, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "windows-base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/out/build/${presetName}",
+      "architecture": { "value": "x64", "strategy": "external" },
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+    },
+    {
+      "name": "clang-base",
+      "hidden": true,
+      "inherits": "windows-base",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang-cl",
+        "CMAKE_CXX_COMPILER": "clang-cl"
+      }
+    },
+    {
+      "name": "msvc-base",
+      "hidden": true,
+      "inherits": "windows-base",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "cl",
+        "CMAKE_CXX_COMPILER": "cl"
+      }
+    },
+    {
+      "name": "win-clang-debug",
+      "displayName": "Windows x64 clang-cl Debug",
+      "inherits": "clang-base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    },
+    {
+      "name": "win-clang-relwithdebinfo",
+      "displayName": "Windows x64 clang-cl RelWithDebInfo",
+      "inherits": "clang-base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
+    },
+    {
+      "name": "win-clang-release",
+      "displayName": "Windows x64 clang-cl Release",
+      "inherits": "clang-base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "TTR_ENABLE_DEBUG_UI": "OFF" }
+    },
+    {
+      "name": "win-msvc-debug",
+      "displayName": "Windows x64 MSVC Debug",
+      "inherits": "msvc-base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    },
+    {
+      "name": "win-msvc-release",
+      "displayName": "Windows x64 MSVC Release",
+      "inherits": "msvc-base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "TTR_ENABLE_DEBUG_UI": "OFF" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "win-clang-debug", "configurePreset": "win-clang-debug" },
+    { "name": "win-clang-relwithdebinfo", "configurePreset": "win-clang-relwithdebinfo" },
+    { "name": "win-clang-release", "configurePreset": "win-clang-release" },
+    { "name": "win-msvc-debug", "configurePreset": "win-msvc-debug" },
+    { "name": "win-msvc-release", "configurePreset": "win-msvc-release" }
+  ]
+}

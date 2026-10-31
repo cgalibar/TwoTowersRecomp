@@ -1,0 +1,32 @@
+add_executable(TwoTowersRecomp
+    main.cpp
+    game/sles_51256_overrides.cpp
+)
+
+target_include_directories(TwoTowersRecomp PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(TwoTowersRecomp PRIVATE TwoTowersRecompLib ps2_runtime)
+
+target_compile_definitions(TwoTowersRecomp PRIVATE
+    TTR_VERSION="${PROJECT_VERSION}"
+    TTR_BOOT_ELF_NAME="SLES_512.56"
+)
+
+if(TTR_ENABLE_DEBUG_UI)
+    target_sources(TwoTowersRecomp PRIVATE "${TTR_PS2RECOMP_DIR}/ps2xRuntime/src/lib/ps2_debug_panel.cpp")
+    target_link_libraries(TwoTowersRecomp PRIVATE rlImGui imgui)
+    target_compile_definitions(TwoTowersRecomp PRIVATE PS2X_ENABLE_DEBUG_UI=1)
+endif()
+
+if(MSVC)
+    # raylib's CloseWindow clashes with the WinAPI symbol on x64 (same workaround as ps2EntryRunner).
+    target_link_options(TwoTowersRecomp PRIVATE "/FORCE:MULTIPLE")
+    target_compile_options(TwoTowersRecomp PRIVATE /utf-8)
+endif()
+
+# FFmpeg DLLs for the runtime's MPEG/IPU path.
+if(COMMAND ps2x_stage_ffmpeg_runtime_dlls)
+    ps2x_stage_ffmpeg_runtime_dlls(TwoTowersRecomp)
+endif()
+
+set_target_properties(TwoTowersRecomp PROPERTIES
+    VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_DIR:TwoTowersRecomp>")
