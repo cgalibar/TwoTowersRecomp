@@ -2,6 +2,7 @@ add_executable(TwoTowersRecomp
     main.cpp
     bios/bios_rom.cpp
     debug/frame_dump.cpp
+    debug/pad_script.cpp
     debug/sampling_profiler.cpp
     game/sles_51256_overrides.cpp
     game/sles_51256_trace.cpp

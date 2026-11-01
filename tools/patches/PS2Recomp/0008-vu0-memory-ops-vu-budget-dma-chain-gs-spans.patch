@@ -1,0 +1,687 @@
+diff --git a/ps2xRecomp/src/lib/vu_translation_helpers.cpp b/ps2xRecomp/src/lib/vu_translation_helpers.cpp
+index 509fd07..0fa8d9f 100644
+--- a/ps2xRecomp/src/lib/vu_translation_helpers.cpp
++++ b/ps2xRecomp/src/lib/vu_translation_helpers.cpp
+@@ -8,6 +8,34 @@
+ 
+ namespace ps2recomp
+ {
++    namespace
++    {
++        // In macro mode the EE reaches VU0 data memory, 4 KiB at 0x11004000 addressed in quadwords.
++        std::string vu0DataAddress(uint8_t vi)
++        {
++            return fmt::format("0x11004000u + (((uint32_t)ctx->vi[{}] & 0xFFu) << 4)", vi);
++        }
++
++        // vi0 is hard-wired to zero: its post-increments and pre-decrements are dropped.
++        std::string vu0StepIndex(uint8_t vi, int step)
++        {
++            if (vi == 0)
++                return {};
++            return fmt::format("ctx->vi[{}] = static_cast<uint16_t>(ctx->vi[{}] {} 1); ", vi, vi, step > 0 ? '+' : '-');
++        }
++
++        // Byte offset of the single field a VILWR/VISWR dest mask selects (bit 3 = x ... bit 0 = w).
++        uint32_t vu0FieldOffset(uint8_t destMask)
++        {
++            for (uint32_t field = 0; field < 4u; ++field)
++            {
++                if (destMask & (0x8u >> field))
++                    return field * 4u;
++            }
++            return 0u;
++        }
++    }
++
+     std::string CodeGenerator::translateVU_VADD_Field(const Instruction &inst)
+     {
+         uint8_t vfd = inst.sa;
+@@ -70,26 +98,37 @@ namespace ps2recomp
+ 
+     std::string CodeGenerator::translateVU_VDIV(const Instruction &inst)
+     {
++        // VDIV Q, vfs.fsf, vft.ftf. Dividing by zero gives +/-MAX with the sign of fs xor ft, as on the VU.
+         uint8_t fsf = inst.vectorInfo.fsf;
+         uint8_t ftf = inst.vectorInfo.ftf;
+         uint8_t fs_reg = inst.rd;
+         uint8_t ft_reg = inst.rt;
+ 
+-        return fmt::format("{{ float fs = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = (ft != 0.0f) ? (fs / ft) : 0.0f; }}", fs_reg, fs_reg, fsf, ft_reg, ft_reg, ftf);
++        return fmt::format("{{ float fs = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); "
++                           "float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); "
++                           "ctx->vu0_q = (ft != 0.0f) ? (fs / ft) : (std::signbit(fs) != std::signbit(ft) ? -3.40282347e+38f : 3.40282347e+38f); }}",
++                           fs_reg, fs_reg, fsf, ft_reg, ft_reg, ftf);
+     }
+ 
+     std::string CodeGenerator::translateVU_VSQRT(const Instruction &inst)
+     {
++        // VSQRT Q, vft.ftf: the VU takes the square root of |ft|.
+         uint8_t ftf = inst.vectorInfo.ftf;
+         uint8_t ft_reg = inst.rt;
+-        return fmt::format("{{ float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = sqrtf(std::max(0.0f, ft)); }}", ft_reg, ft_reg, ftf);
++        return fmt::format("{{ float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = sqrtf(fabsf(ft)); }}", ft_reg, ft_reg, ftf);
+     }
+ 
+     std::string CodeGenerator::translateVU_VRSQRT(const Instruction &inst)
+     {
++        // VRSQRT Q, vfs.fsf, vft.ftf: fs / sqrt(|ft|); a zero ft gives +/-MAX with the sign of fs.
++        uint8_t fsf = inst.vectorInfo.fsf;
+         uint8_t ftf = inst.vectorInfo.ftf;
++        uint8_t fs_reg = inst.rd;
+         uint8_t ft_reg = inst.rt;
+-        return fmt::format("{{ float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = (ft > 0.0f) ? (1.0f / sqrtf(ft)) : 0.0f; }}", ft_reg, ft_reg, ftf);
++        return fmt::format("{{ float fs = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); "
++                           "float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); "
++                           "ctx->vu0_q = (ft != 0.0f) ? (fs / sqrtf(fabsf(ft))) : (std::signbit(fs) ? -3.40282347e+38f : 3.40282347e+38f); }}",
++                           fs_reg, fs_reg, fsf, ft_reg, ft_reg, ftf);
+     }
+ 
+     std::string CodeGenerator::translateVU_VMTIR(const Instruction &inst)
+@@ -113,12 +152,18 @@ namespace ps2recomp
+ 
+     std::string CodeGenerator::translateVU_VILWR(const Instruction &inst)
+     {
+-        return fmt::format("{{ uint32_t addr = (uint32_t)(ctx->vi[{}] << 2) & 0x3FFC; ctx->vi[{}] = static_cast<uint16_t>(READ32(addr)); }}", inst.rd, inst.rt); // VILWR.<f> vit, (vis)
++        // VILWR.<f> vit, (vis): the low 16 bits of field f of quadword vis.
++        if (inst.rt == 0)
++            return "// VILWR to vi0 (ignored)";
++        return fmt::format("{{ uint32_t addr = {} + {}u; ctx->vi[{}] = static_cast<uint16_t>(READ32(addr)); }}",
++                           vu0DataAddress(inst.rd), vu0FieldOffset(inst.vectorInfo.vectorField), inst.rt);
+     }
+ 
+     std::string CodeGenerator::translateVU_VISWR(const Instruction &inst)
+     {
+-        return fmt::format("{{ uint32_t addr = (uint32_t)(ctx->vi[{}] << 2) & 0x3FFC; WRITE32(addr, (uint32_t)ctx->vi[{}]); }}", inst.rd, inst.rt); // VISWR.<f> vit, (vis)
++        // VISWR.<f> vit, (vis): vit, zero-extended, into field f of quadword vis.
++        return fmt::format("{{ uint32_t addr = {} + {}u; WRITE32(addr, (uint32_t)ctx->vi[{}]); }}",
++                           vu0DataAddress(inst.rd), vu0FieldOffset(inst.vectorInfo.vectorField), inst.rt);
+     }
+ 
+     std::string CodeGenerator::translateVU_VIADD(const Instruction &inst)
+@@ -767,66 +812,52 @@ namespace ps2recomp
+ 
+     std::string CodeGenerator::translateVU_VLQI(const Instruction &inst)
+     {
+-        uint8_t vis = inst.rd;
+-        uint8_t dest_mask = inst.vectorInfo.vectorField;
+-        return fmt::format("{{ uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4; "
+-                           "__m128 res = _mm_castsi128_ps(READ128(addr)); "
+-                           "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
+-                           "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); "
+-                           "ctx->vi[{}] = (ctx->vi[{}] + 1) & 0x3FF; }}",
+-                           vis,
+-                           (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
+-                           (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0,
+-                           inst.rt, inst.rt,
+-                           vis, vis);
++        // VLQI.dest vft, (vis++)
++        const uint8_t vis = inst.rd;
++        const uint8_t vft = inst.rt;
++        const uint8_t dest_mask = inst.vectorInfo.vectorField;
++        const std::string load = vft == 0 ? std::string() : fmt::format(
++            "__m128 res = _mm_castsi128_ps(READ128(addr)); __m128i mask = _mm_set_epi32({}, {}, {}, {}); "
++            "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); ",
++            (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0, (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0, vft, vft);
++        return fmt::format("{{ uint32_t addr = {}; {}{}}}", vu0DataAddress(vis), load, vu0StepIndex(vis, 1));
+     }
+ 
+     std::string CodeGenerator::translateVU_VSQI(const Instruction &inst)
+     {
+-        uint8_t vis = inst.rd;
+-        uint8_t dest_mask = inst.vectorInfo.vectorField;
+-        return fmt::format("{{ uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4; "
+-                           "__m128i old_val = READ128(addr); "
++        // VSQI.dest vfs, (vit++)
++        const uint8_t vfs = inst.rd;
++        const uint8_t vit = inst.rt;
++        const uint8_t dest_mask = inst.vectorInfo.vectorField;
++        return fmt::format("{{ uint32_t addr = {}; __m128i old_val = READ128(addr); "
+                            "__m128 res = _mm_blendv_ps(_mm_castsi128_ps(old_val), ctx->vu0_vf[{}], _mm_castsi128_ps(_mm_set_epi32({}, {}, {}, {}))); "
+-                           "WRITE128(addr, _mm_castps_si128(res)); "
+-                           "ctx->vi[{}] = (ctx->vi[{}] + 1) & 0x3FF; }}",
+-                           vis,
+-                           inst.rt,
+-                           (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
+-                           (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0,
+-                           vis, vis);
++                           "WRITE128(addr, _mm_castps_si128(res)); {}}}",
++                           vu0DataAddress(vit), vfs, (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0, (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0, vu0StepIndex(vit, 1));
+     }
+ 
+     std::string CodeGenerator::translateVU_VLQD(const Instruction &inst)
+     {
+-        uint8_t vis = inst.rd;
+-        uint8_t dest_mask = inst.vectorInfo.vectorField;
+-        return fmt::format("{{ ctx->vi[{}] = (ctx->vi[{}] - 1) & 0x3FF; "
+-                           "uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4; "
+-                           "__m128 res = _mm_castsi128_ps(READ128(addr)); "
+-                           "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
+-                           "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
+-                           vis, vis,
+-                           vis,
+-                           (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
+-                           (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0,
+-                           inst.rt, inst.rt);
++        // VLQD.dest vft, (--vis)
++        const uint8_t vis = inst.rd;
++        const uint8_t vft = inst.rt;
++        const uint8_t dest_mask = inst.vectorInfo.vectorField;
++        const std::string load = vft == 0 ? std::string() : fmt::format(
++            "__m128 res = _mm_castsi128_ps(READ128(addr)); __m128i mask = _mm_set_epi32({}, {}, {}, {}); "
++            "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); ",
++            (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0, (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0, vft, vft);
++        return fmt::format("{{ {}uint32_t addr = {}; {}}}", vu0StepIndex(vis, -1), vu0DataAddress(vis), load);
+     }
+ 
+     std::string CodeGenerator::translateVU_VSQD(const Instruction &inst)
+     {
+-        uint8_t vis = inst.rd;
+-        uint8_t dest_mask = inst.vectorInfo.vectorField;
+-        return fmt::format("{{ ctx->vi[{}] = (ctx->vi[{}] - 1) & 0x3FF; "
+-                           "uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4; "
+-                           "__m128i old_val = READ128(addr); "
++        // VSQD.dest vfs, (--vit)
++        const uint8_t vfs = inst.rd;
++        const uint8_t vit = inst.rt;
++        const uint8_t dest_mask = inst.vectorInfo.vectorField;
++        return fmt::format("{{ {}uint32_t addr = {}; __m128i old_val = READ128(addr); "
+                            "__m128 res = _mm_blendv_ps(_mm_castsi128_ps(old_val), ctx->vu0_vf[{}], _mm_castsi128_ps(_mm_set_epi32({}, {}, {}, {}))); "
+                            "WRITE128(addr, _mm_castps_si128(res)); }}",
+-                           vis, vis,
+-                           vis,
+-                           inst.rt,
+-                           (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
+-                           (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0);
++                           vu0StepIndex(vit, -1), vu0DataAddress(vit), vfs, (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0, (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0);
+     }
+ 
+     std::string CodeGenerator::translateVU_VRGET(const Instruction &inst)
+diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+index eb6fd28..de38805 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+@@ -83,6 +83,10 @@ private:
+     std::array<uint32_t, 2> m_clutCbp{};
+     GSMem::TexturePageCache m_texturePageCache;
+     std::vector<GSMem::TexturePageCache> m_workerTextureCaches;
++    // Bumped whenever m_texturePageCache is invalidated (TEXFLUSH, reset); a worker drops its page copy
++    // when its epoch is older, so all caches follow the same rule.
++    uint32_t m_textureCacheEpoch = 0;
++    std::vector<uint32_t> m_workerTextureCacheEpochs;
+     std::unique_ptr<GSRasterWorkers> m_rasterWorkers;
+ 
+     GSTransferCommand m_transfer{};
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
+index 67c8184..7061521 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1.h
+@@ -61,6 +61,8 @@ public:
+ 
+     VU1State &state() { return m_state; }
+     const VU1State &state() const { return m_state; }
++    // False when the last run stopped at its cycle budget instead of an E or halt bit.
++    bool lastRunFinished() const { return m_lastRunFinished; }
+ 
+ private:
+     enum Pipeline : uint8_t
+@@ -216,6 +218,9 @@ private:
+     std::array<PendingVfWrite, kMaxPendingVfWrites> m_vfWritePipeline{};
+     std::array<PendingViWrite, kMaxPendingViWrites> m_viWritePipeline{};
+     std::array<PendingAccWrite, kMaxPendingAccWrites> m_accWritePipeline{};
++    // Earliest readyCycle among the queued pipeline entries: commitReadyPipelines() returns at once before it.
++    uint64_t m_nextCommitCycle = ~0ull;
++    bool m_lastRunFinished = true;
+     XgkickPipeline m_xgkick{};
+     std::array<std::array<uint64_t, 4>, 32> m_vfReady{};
+     std::array<uint64_t, 16> m_viReady{};
+@@ -278,6 +283,12 @@ private:
+ 
+     void resetScheduler();
+     void commitReadyPipelines();
++    // Records that a queued pipeline result becomes visible at readyCycle.
++    void scheduleCommit(uint64_t readyCycle)
++    {
++        if (readyCycle < m_nextCommitCycle)
++            m_nextCommitCycle = readyCycle;
++    }
+     void advanceOneCycle();
+     void advanceTo(uint64_t targetCycle);
+     void flushPipelines();
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 1e95cab..579bb49 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -648,6 +648,7 @@ GSCpuBackend::GSCpuBackend()
+     if (workers != 0u)
+     {
+         m_workerTextureCaches.resize(workers);
++        m_workerTextureCacheEpochs.assign(workers, ~0u);
+         m_rasterWorkers = std::make_unique<GSRasterWorkers>(workers);
+     }
+ }
+@@ -676,6 +677,7 @@ void GSCpuBackend::ResetUnlocked()
+     m_clut.fill(0u);
+     m_clutCbp.fill(0u);
+     m_texturePageCache.Invalidate();
++    ++m_textureCacheEpoch;
+     m_transfer = {};
+     m_transfer.direction = 3u;
+     m_transferState = {};
+@@ -786,6 +788,7 @@ void GSCpuBackend::TextureFlush()
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
+     m_texturePageCache.Invalidate();
++    ++m_textureCacheEpoch;
+ }
+ 
+ void GSCpuBackend::Sync(GSSyncReason)
+@@ -1325,9 +1328,13 @@ void GSCpuBackend::ForEachRowBand(int firstRow, int lastRow, uint64_t area, Rows
+             rows(first, last, m_texturePageCache);
+             return;
+         }
+-        // A worker's page copy may predate what the previous primitives drew.
+         GSMem::TexturePageCache &cache = m_workerTextureCaches[slot - 1u];
+-        cache.Invalidate();
++        uint32_t &epoch = m_workerTextureCacheEpochs[slot - 1u];
++        if (epoch != m_textureCacheEpoch)
++        {
++            cache.Invalidate();
++            epoch = m_textureCacheEpoch;
++        }
+         rows(first, last, cache);
+     };
+     m_rasterWorkers->run(bands, band);
+@@ -1494,13 +1501,54 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+     const float invAbsDenom = 1.0f / std::fabs(denom);
+     constexpr float kEdgeEpsilon = 1.0e-4f;
+ 
+-    const uint64_t area = static_cast<uint64_t>(maxX - minX + 1) * static_cast<uint64_t>(maxY - minY + 1);
++    // Along a row each weight is linear in px, so only the span where all three can reach
++    // -kEdgeEpsilon is visited. The per-pixel test below still decides; the span (with two pixels of
++    // margin for rounding) only skips pixels it would reject, which for long thin or partly off-screen
++    // triangles is most of the bounding box.
++    const float w0Slope = (fy1 - fy2) * winding * invAbsDenom;
++    const float w1Slope = (fy2 - fy0) * winding * invAbsDenom;
++    const float w2Slope = -w0Slope - w1Slope;
++    auto rowSpan = [&](float py, int &firstX, int &lastX)
++    {
++        const float w0Offset = ((fy1 - fy2) * -fx2 + (fx2 - fx1) * (py - fy2)) * winding * invAbsDenom;
++        const float w1Offset = ((fy2 - fy0) * -fx2 + (fx0 - fx2) * (py - fy2)) * winding * invAbsDenom;
++        const float w2Offset = 1.0f - w0Offset - w1Offset;
++        float lo = static_cast<float>(minX) - 1.0f;
++        float hi = static_cast<float>(maxX) + 2.0f;
++        auto clip = [&](float slope, float offset)
++        {
++            // Nearly constant along the row: left to the per-pixel test.
++            if (std::fabs(slope) < 1.0e-5f)
++                return;
++            const float crossing = (-kEdgeEpsilon - offset) / slope;
++            if (slope > 0.0f)
++                lo = std::max(lo, crossing);
++            else
++                hi = std::min(hi, crossing);
++        };
++        clip(w0Slope, w0Offset);
++        clip(w1Slope, w1Offset);
++        clip(w2Slope, w2Offset);
++        // Keep both ends near the box before converting; lo > hi leaves the row empty.
++        lo = std::min(lo, static_cast<float>(maxX) + 2.0f);
++        hi = std::max(hi, static_cast<float>(minX) - 1.0f);
++        // Pixel x is sampled at px = x + 0.5.
++        firstX = std::max(minX, static_cast<int>(std::floor(lo - 0.5f)) - 2);
++        lastX = std::min(maxX, static_cast<int>(std::ceil(hi - 0.5f)) + 2);
++    };
++
++    // Work estimate for spreading rows over the raster threads: the covered area, not the bounding box.
++    const double boxArea = static_cast<double>(maxX - minX + 1) * static_cast<double>(maxY - minY + 1);
++    const uint64_t area = static_cast<uint64_t>(std::min(boxArea, 0.5 * std::fabs(denom)));
+     auto drawRows = [&](int firstRow, int lastRow, GSMem::TexturePageCache &cache)
+     {
+         for (int y = firstRow; y <= lastRow; ++y)
+         {
+             float py = static_cast<float>(y) + 0.5f;
+-            for (int x = minX; x <= maxX; ++x)
++            int firstX = minX;
++            int lastX = maxX;
++            rowSpan(py, firstX, lastX);
++            for (int x = firstX; x <= lastX; ++x)
+             {
+                 float px = static_cast<float>(x) + 0.5f;
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 37b6a4d..5f89768 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1344,7 +1344,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
+                     uint32_t asp = (chcr >> 4) & 0x3u;
+                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
+-                    const int kMaxChainTags = 4096;
++                    // Guards against cyclic chains only: a frame's display list can hold tens of thousands
++                    // of tags (CALL/RET per mesh) and reference the same data many times.
++                    const int kMaxChainTags = 1 << 20;
++                    const size_t kMaxChainBytes = 64u << 20;
+                     std::vector<uint8_t> chainBuf;
+ 
+                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
+@@ -1519,6 +1522,21 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                             endChain = true;
+                         if (endChain)
+                             break;
++                        if (chainBuf.size() > kMaxChainBytes)
++                        {
++                            tagsProcessed = kMaxChainTags;
++                            break;
++                        }
++                    }
++                    if (tagsProcessed >= kMaxChainTags)
++                    {
++                        static bool warned = false;
++                        if (!warned)
++                        {
++                            warned = true;
++                            std::cerr << "[dma] chain on channel 0x" << std::hex << channelBase << " cut at tag 0x" << tagAddr
++                                      << std::dec << " after " << tagsProcessed << " tags / " << chainBuf.size() << " bytes" << std::endl;
++                        }
+                     }
+ 
+                     m_ioRegisters[channelBase + 0x30] = tagAddr;
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index a2254ec..b277608 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -294,6 +294,21 @@ namespace
+         state.vi[0] = 0;
+     }
+ 
++    // A microprogram runs until its E bit, as on the hardware (VIF MSCAL/MSCNT/FLUSH and the EE's
++    // interlocked COP2 moves wait for it); the limit only catches runaway programs.
++    constexpr uint32_t kMicroCycleLimit = 1u << 22;
++
++    void warnUnfinishedMicroProgram(const VU1Interpreter &vu, const char *unit, uint32_t startPC)
++    {
++        static bool warned[2] = {};
++        bool &unitWarned = warned[unit[2] == '1' ? 1 : 0];
++        if (vu.lastRunFinished() || unitWarned)
++            return;
++        unitWarned = true;
++        std::cerr << '[' << unit << "] microprogram at 0x" << std::hex << startPC << " still running after " << std::dec
++                  << kMicroCycleLimit << " cycles" << std::endl;
++    }
++
+     void copyVu0StateToContext(const VU1State &state, R5900Context *ctx)
+     {
+         for (uint32_t i = 0; i < 32u; ++i)
+@@ -728,7 +743,8 @@ bool PS2Runtime::syncCoreSubsystems()
+                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+-                                                   m_gs, &m_memory, startPC, top, itop, 65536);
++                                                   m_gs, &m_memory, startPC, top, itop, kMicroCycleLimit);
++                                     warnUnfinishedMicroProgram(m_vu1, "vu1", startPC);
+                                      cpuContext->vu0_vpu_stat =
+                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
+                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+@@ -746,7 +762,8 @@ bool PS2Runtime::syncCoreSubsystems()
+                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+-                                                  m_gs, &m_memory, top, itop, 65536);
++                                                  m_gs, &m_memory, top, itop, kMicroCycleLimit);
++                                     warnUnfinishedMicroProgram(m_vu1, "vu1", m_vu1.state().pc);
+                                      cpuContext->vu0_vpu_stat =
+                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
+                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+@@ -770,7 +787,8 @@ bool PS2Runtime::syncCoreSubsystems()
+                                      m_vu0.reset();
+                                      copyVu0ContextToState(cpuContext, m_vu0.state());
+                                      m_vu0.execute(vu0Code, PS2_VU0_CODE_SIZE, vu0Data, PS2_VU0_DATA_SIZE,
+-                                                   m_gs, &m_memory, pc, 0u, itop, 65536);
++                                                   m_gs, &m_memory, pc, 0u, itop, kMicroCycleLimit);
++                                     warnUnfinishedMicroProgram(m_vu0, "vu0", pc);
+                                      copyVu0StateToContext(m_vu0.state(), cpuContext); });
+     resetIop();
+     m_vu0.reset();
+@@ -1537,7 +1555,8 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
+     m_vu0.execute(vu0Code, PS2_VU0_CODE_SIZE,
+                   vu0Data, PS2_VU0_DATA_SIZE,
+                   m_gs, &m_memory,
+-                  startPC, 0u, ctx->vu0_itop, 4096);
++                  startPC, 0u, ctx->vu0_itop, kMicroCycleLimit);
++    warnUnfinishedMicroProgram(m_vu0, "vu0", startPC);
+     copyVu0StateToContext(m_vu0.state(), ctx);
+ }
+ 
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index f19e281..bd70224 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -73,6 +73,7 @@ void VU1Interpreter::resetScheduler()
+     m_vfWritePipeline = {};
+     m_viWritePipeline = {};
+     m_accWritePipeline = {};
++    m_nextCommitCycle = ~0ull;
+     m_xgkick = {};
+     m_vfReady = {};
+     m_viReady = {};
+@@ -533,6 +534,7 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
+     entry->valid = true;
+     entry->issueCycle = m_cycle;
+     entry->readyCycle = m_cycle + kFmacLatency;
++    scheduleCommit(entry->readyCycle);
+     entry->mac = mac;
+     entry->status = status;
+     entry->extraSticky = extraSticky;
+@@ -572,6 +574,7 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
+             entry.valid = true;
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
++            scheduleCommit(entry.readyCycle);
+             entry.status = static_cast<uint32_t>(immediate) & 0xFC0u;
+             entry.writesSticky = true;
+             return;
+@@ -591,6 +594,7 @@ void VU1Interpreter::queueClip(uint32_t clip)
+             entry.valid = true;
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
++            scheduleCommit(entry.readyCycle);
+             entry.clip = m_workingClip;
+             entry.writesClip = true;
+             return;
+@@ -615,6 +619,7 @@ void VU1Interpreter::queueFcset(uint32_t clip)
+             entry.valid = true;
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
++            scheduleCommit(entry.readyCycle);
+             entry.clip = m_workingClip;
+             entry.writesClip = true;
+             return;
+@@ -629,6 +634,7 @@ void VU1Interpreter::queueQ(float value, uint32_t latency, uint32_t statusDi)
+     value = normalizeResult(value, ignoredFlags);
+     m_fdiv.valid = true;
+     m_fdiv.readyCycle = m_cycle + latency;
++    scheduleCommit(m_fdiv.readyCycle);
+     m_fdiv.value = value;
+     m_fdiv.statusDi = statusDi & 0x30u;
+ }
+@@ -643,6 +649,7 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
+         {
+             entry.valid = true;
+             entry.readyCycle = m_cycle + latency;
++            scheduleCommit(entry.readyCycle);
+             entry.value = value;
+             // EFU throughput is one cycle shorter than result visibility.
+             m_efuResourceReady = m_cycle + (latency > 0u ? latency - 1u : 0u);
+@@ -660,6 +667,7 @@ void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8
+         {
+             store.valid = true;
+             store.readyCycle = m_cycle + 1u;
++            scheduleCommit(store.readyCycle);
+             store.address = address;
+             store.laneMask = laneMask;
+             std::copy(words, words + 4, store.words.begin());
+@@ -681,6 +689,7 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
+             write = {};
+             write.valid = true;
+             write.readyCycle = m_cycle + latency;
++            scheduleCommit(write.readyCycle);
+             write.sequence = ++m_nextWriteSequence;
+             write.reg = reg;
+             write.laneMask = laneMask;
+@@ -707,6 +716,7 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
+             write = {};
+             write.valid = true;
+             write.readyCycle = m_cycle + latency;
++            scheduleCommit(write.readyCycle);
+             write.sequence = ++m_nextWriteSequence;
+             write.reg = reg;
+             write.value = value;
+@@ -728,6 +738,7 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
+             write = {};
+             write.valid = true;
+             write.readyCycle = m_cycle + latency;
++            scheduleCommit(write.readyCycle);
+             write.sequence = ++m_nextWriteSequence;
+             write.laneMask = laneMask;
+             std::copy(value, value + 4, write.value.begin());
+@@ -744,10 +755,20 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
+ 
+ void VU1Interpreter::commitReadyPipelines()
+ {
++    // Most cycles have nothing to commit.
++    if (m_cycle < m_nextCommitCycle)
++        return;
++    uint64_t next = ~0ull;
++
+     for (FlagPipelineEntry &entry : m_flagPipeline)
+     {
+-        if (!entry.valid || entry.readyCycle > m_cycle)
++        if (!entry.valid)
+             continue;
++        if (entry.readyCycle > m_cycle)
++        {
++            next = std::min(next, entry.readyCycle);
++            continue;
++        }
+ 
+         if (entry.writesMac)
+             m_state.mac = entry.mac;
+@@ -765,7 +786,9 @@ void VU1Interpreter::commitReadyPipelines()
+         entry = {};
+     }
+ 
+-    if (m_fdiv.valid && m_fdiv.readyCycle <= m_cycle)
++    if (m_fdiv.valid && m_fdiv.readyCycle > m_cycle)
++        next = std::min(next, m_fdiv.readyCycle);
++    else if (m_fdiv.valid)
+     {
+         m_state.q = m_fdiv.value;
+         const uint32_t currentDi = m_fdiv.statusDi & 0x30u;
+@@ -780,12 +803,19 @@ void VU1Interpreter::commitReadyPipelines()
+             m_state.p = entry.value;
+             entry = {};
+         }
++        else if (entry.valid)
++            next = std::min(next, entry.readyCycle);
+     }
+ 
+     for (PendingStore &store : m_storePipeline)
+     {
+-        if (!store.valid || store.readyCycle > m_cycle)
++        if (!store.valid)
++            continue;
++        if (store.readyCycle > m_cycle)
++        {
++            next = std::min(next, store.readyCycle);
+             continue;
++        }
+         if (m_activeVuData && store.address + 16u <= m_activeVuDataSize)
+         {
+             uint32_t oldWords[4]{};
+@@ -802,8 +832,13 @@ void VU1Interpreter::commitReadyPipelines()
+ 
+     for (PendingVfWrite &write : m_vfWritePipeline)
+     {
+-        if (!write.valid || write.readyCycle > m_cycle)
++        if (!write.valid)
+             continue;
++        if (write.readyCycle > m_cycle)
++        {
++            next = std::min(next, write.readyCycle);
++            continue;
++        }
+         for (uint32_t component = 0; component < 4u; ++component)
+         {
+             if ((write.laneMask & laneForComponent(component)) != 0u &&
+@@ -817,8 +852,13 @@ void VU1Interpreter::commitReadyPipelines()
+ 
+     for (PendingViWrite &write : m_viWritePipeline)
+     {
+-        if (!write.valid || write.readyCycle > m_cycle)
++        if (!write.valid)
++            continue;
++        if (write.readyCycle > m_cycle)
++        {
++            next = std::min(next, write.readyCycle);
+             continue;
++        }
+         if (m_viLatestWrite[write.reg] == write.sequence)
+             m_state.vi[write.reg] = static_cast<int16_t>(write.value);
+         write = {};
+@@ -826,8 +866,13 @@ void VU1Interpreter::commitReadyPipelines()
+ 
+     for (PendingAccWrite &write : m_accWritePipeline)
+     {
+-        if (!write.valid || write.readyCycle > m_cycle)
++        if (!write.valid)
+             continue;
++        if (write.readyCycle > m_cycle)
++        {
++            next = std::min(next, write.readyCycle);
++            continue;
++        }
+         for (uint32_t component = 0; component < 4u; ++component)
+         {
+             if ((write.laneMask & laneForComponent(component)) != 0u &&
+@@ -838,6 +883,7 @@ void VU1Interpreter::commitReadyPipelines()
+         }
+         write = {};
+     }
++    m_nextCommitCycle = next;
+ }
+ 
+ void VU1Interpreter::progressXgkick()
+@@ -1824,6 +1870,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+             break;
+     }
+ 
++    m_lastRunFinished = programEnded;
+     if (programEnded)
+     {
+         flushPipelines();
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp
+index 94be789..2a58075 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp
+@@ -283,8 +283,10 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
+     }
+     case 0x24: // JR
+     {
++        // Jumps read the current VI value: the previous-value quirk of readBranchVi() applies to the
++        // conditional branches only, and jump tables (IADDIU vi1, vi0, n; JR vi1) rely on that.
+         uint8_t is = VIS(instr);
+-        uint32_t target = ((uint32_t)(uint16_t)readBranchVi(is) * 8u) & pcMask;
++        uint32_t target = ((uint32_t)(uint16_t)(is != 0u ? m_state.vi[is] : 0) * 8u) & pcMask;
+         m_state.branchPending = true;
+         m_state.branchTarget = target;
+         m_state.branchDelay = 1;
+@@ -294,7 +296,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
+     {
+         uint8_t it = VIT(instr);
+         uint8_t is = VIS(instr);
+-        uint32_t target = ((uint32_t)(uint16_t)readBranchVi(is) * 8u) & pcMask;
++        uint32_t target = ((uint32_t)(uint16_t)(is != 0u ? m_state.vi[is] : 0) * 8u) & pcMask;
+         if (it != 0)
+             m_state.vi[it] = (int32_t)((m_state.pc + 16) / 8);
+         m_state.branchPending = true;

@@ -19,7 +19,11 @@ runtime están desactivados por defecto (`-DTTR_VERBOSE_RUNTIME_LOGS=ON` los act
 | `TTR_TRACE=rpc` | `sceSifBindRpc`/`CallRpc`/`CheckStatRpc` cuando se llaman por la tabla de funciones |
 | `TTR_TRACE=fmv` | `ClFMV`: banderas de reproducción, callback "sin datos", peticiones de audio del vídeo y llenado de sus buffers (también en cada volcado de frame) |
 | `TTR_TRACE=camera` | Cámara y mundo: `ClCamera::projection`, `tanf`, `getZBufferValue`, `ClearScreen`, `ClPbi::clear`, matrices de `ClWorldDrawData::beginDraw` (avisa si la de dibujo no tiene X/Y), contadores de nodos del mundo y comprobación de `SfMatrixMultiplyVu0` contra C++ |
+| `TTR_TRACE=pad` | `ClPad` (puerto 0): estado de libpad, modo del mando (0x73 = analógico), botones y sticks tal como los ve el juego, en cada cambio |
+| `TTR_TRACE=anims` | Personajes y visibilidad, con cada volcado de frame: llamadas a los pases de `ClDisplayList`, a `AddToDisplayList` de cada clase (actores, props, partículas...), frustums registrados y consultados por sector, y las primeras pruebas de `ClFrustum::isBoundingBoxVisible` con la prueba de planos recalculada en C++ |
 | `TTR_GS_DUMP=<vblank>` | Activa el historial de depuración del GS durante 10 VBlanks y lista sus registros y primitivas |
+| `TTR_PAD_SCRIPT=<paso>;<paso>...` | Mueve el mando según el número de VBlank, para pruebas reproducibles. Un paso es `<desde>[-<hasta>]:<entrada>[+<entrada>...]` (sin `hasta`, 6 VBlanks); entradas: `start`, `select`, `cross`, `circle`, `square`, `triangle`, `l1`, `r1`, `l2`, `r2`, `l3`, `r3`, `up`, `down`, `left`, `right` y ejes `lx=`, `ly=`, `rx=`, `ry=` (0-255, 128 = centro). Ej.: `700:cross;1500-1800:ly=0` |
+| `TTR_HACK_SKIPPABLE_FMV=1` | Hack: cualquier botón salta los vídeos, como cuando ya se han visto (sin partida guardada, la introducción no se puede saltar) |
 | `TTR_HACK_SKIP_BARD=1` | Hack: `ClGameSound::isBardStreamLoaded()` siempre devuelve true |
 | `PS2X_IOP_TRACE=1` | Trazas del IOP (parche `0001`): `cdvdman`, `ioman`, enlaces entre módulos, RPC |
 | `PS2X_IOP_CALLTRACE=<Mciclos>:<líneas>:<lo>-<hi>` | `jal`/`jalr` ejecutados en `[lo, hi)` a partir de un ciclo IOP |

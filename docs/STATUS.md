@@ -66,6 +66,19 @@ del servidor de sonido, y `sceSifCallRpc` copió el buffer de comandos de EA a l
 que había quedado allí. Ahora el ejecutable mueve todo eso a `0x80000–0x100000`, que nadie usa
 (`setRuntimeGuestRegion` + `configureGuestHeap` en `sles_51256_overrides.cpp`).
 
+### Mundo y personajes invisibles (`VSQI` de VU0, recompilador)
+
+`ClFrustum::isBoundingBoxVisible`, la prueba de visibilidad de todo (nodos del mundo, árbol de colisión y
+objetos del juego), guarda las 8 esquinas de la caja en la memoria de datos de VU0 con `VSQI.xyzw vfs,
+(vit++)` y vuelve a leerlas con `VLQI` según el índice que lleva cada plano. El recompilador intercambiaba
+los campos de `VSQI`/`VSQD`: usaba fs como registro de dirección y it como dato, así que guardaba siempre
+`vf1` en direcciones de otros registros. Con esquinas basura, el primer plano descartaba cualquier caja:
+no se dibujaba ningún nodo del mundo (solo el cielo, las nubes y el posproceso) y ningún objeto llegaba a
+`AddToDisplayList`, de ahí que no hubiera personajes. Además, esas instrucciones accedían a la RAM del EE
+(`vi·16`) en vez de a la memoria de VU0 (0x11004000), y `VDIV`/`VRSQRT` entre cero daban 0 en vez de ±MAX.
+Diagnóstico con `TTR_TRACE=anims`: contadores de los pases de personajes, de `AddToDisplayList` por clase y
+de los frustums por sector, y la prueba de planos recalculada en C++ junto al resultado del código generado.
+
 ### Vídeo cortado a los ~14 s (VBlank NTSC en un juego PAL)
 
 El runtime generaba siempre VBlanks a 60 Hz. El reproductor de `ClFMV` avanza el vídeo con el VBlank y

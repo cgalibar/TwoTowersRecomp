@@ -4,6 +4,8 @@
 //   rpc   - EE-side sceSifBindRpc / sceSifCallRpc / sceSifCheckStatRpc
 //   fmv   - ClFMV playback flags, nodata callback and FMV audio requests
 //   camera - ClCamera projection/Z values, world draw passes and a C++ check of SfMatrixMultiplyVu0
+//   pad    - ClPad slot 0: libpad status, terminal mode, buttons and sticks as the game sees them
+//   anims  - calls of the animated-character passes (ClDisplayList) and Noam figures, with each frame dump
 // TTR_GS_DUMP=<vblank> prints the GS debug history (registers and primitives) for 10 VBlanks.
 // TTR_FRAME_DUMP=<dir> saves the presented frame (and logs the ClGame state) every
 // TTR_FRAME_DUMP_EVERY VBlanks (default 50, one second of PAL).
@@ -11,6 +13,7 @@
 #include "game/sles_51256_trace.h"
 
 #include "debug/frame_dump.h"
+#include "debug/pad_script.h"
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/ee_scheduler.h"
@@ -25,6 +28,7 @@
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <iterator>
 #include <string>
 #include <string_view>
 
@@ -154,6 +158,8 @@ namespace ttr::sles51256
 
         void logFmvState(const uint8_t *rdram, const char *event);
 
+        void logAnimPasses();
+
         void dumpFrameIfDue(uint8_t *rdram, PS2Runtime *runtime)
         {
             static uint32_t vblanks = 0;
@@ -177,6 +183,8 @@ namespace ttr::sles51256
                       << " drawFlags=" << static_cast<int>(rdram[0x381400u]) << static_cast<int>(rdram[0x381404u])
                       << static_cast<int>(rdram[0x381408u]) << static_cast<int>(rdram[0x38140Cu])
                       << static_cast<int>(rdram[0x381410u]) << std::endl;
+            if (traceEnabled("anims"))
+                logAnimPasses();
             if (traceEnabled("fmv"))
             {
                 logFmvState(rdram, "frame");
@@ -262,6 +270,8 @@ namespace ttr::sles51256
 
         void traceVBlank(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
         {
+            static uint32_t vblank = 0;
+            ttr::debug::applyPadScript(++vblank);
             dumpGsHistoryIfDue(runtime);
             static uint32_t count = 0;
             static uint32_t pendingCount = 0;
@@ -457,6 +467,20 @@ namespace ttr::sles51256
             ctx->pc = GPR_U32(ctx, 31);
         }
 
+        // Debug hack: any button skips the movies, as once they have been seen. Without a save the game makes
+        // the intro unskippable (ClGameModePlay::enter passes skip mode 1; 0 = any button, 2 = Start).
+        void hackSkippableFmv(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            SET_GPR_U32(ctx, 5, 0u);
+            playModal__5ClFMVFPCcibP15ClSubtitleAsset_0x26a7a0(rdram, ctx, runtime);
+        }
+
+        // Debug hack: skips ClDisplayList::drawShadowAnims, the characters' shadow volumes.
+        void hackSkipShadowVolumes(uint8_t *, R5900Context *ctx, PS2Runtime *)
+        {
+            ctx->pc = GPR_U32(ctx, 31);
+        }
+
         // EE side of the EA sound handshake: the IOP reply trailer and the globals it feeds.
         void logSoundHandshake(const uint8_t *rdram)
         {
@@ -600,6 +624,150 @@ namespace ttr::sles51256
                 std::cout << "[ttr:fmv] sound request #" << count << " iop=0x" << std::hex << target << std::dec
                           << " size=" << size << " -> " << GPR_U32(ctx, 2) << std::endl;
             }
+        }
+
+        // --- anims: animated characters (ClDisplayList passes and Noam figure instances) ---------------
+        constexpr const char *kAnimPassNames[] = {"shadow", "specular", "alpha", "instanced", "diffuseSpecular",
+                                                 "diffuse", "figure", "addAnimation", "renderDiffuse",
+                                                 "renderDiffuseSpecular", "ucodeRender", "ucodeLowQuality",
+                                                 "actorAdd", "noamAdd", "propAdd", "particleAdd", "collAdd",
+                                                 "animObjAdd", "scriptAdd", "pickupAdd"};
+        uint32_t g_animCallers[std::size(kAnimPassNames)] = {};
+        uint64_t g_animCalls[std::size(kAnimPassNames)] = {};
+
+        template <int Index, void (*Function)(uint8_t *, R5900Context *, PS2Runtime *)>
+        void countAnimPass(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            ++g_animCalls[Index];
+            if (g_animCallers[Index] == 0u)
+                g_animCallers[Index] = GPR_U32(ctx, 31);
+            Function(rdram, ctx, runtime);
+        }
+
+        // Per-sector frustum registration (ClWorld draw) and lookups (ClSceneRegistration::renderObjects).
+        uint64_t g_frustumAdds[64] = {};
+        uint64_t g_frustumLookups[64] = {};
+        uint64_t g_frustumHits[64] = {};
+        uint64_t g_renderObjectNodes = 0;
+
+        void traceFrustumToAdd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            ++g_frustumAdds[GPR_U32(ctx, 4) & 63u];
+            getFrustumToAdd__13ClFrustumListFi_0x26f880(rdram, ctx, runtime);
+        }
+
+        void traceFrustumListForSector(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            const uint32_t sector = GPR_U32(ctx, 4) & 63u;
+            getFrustumListForSector__13ClFrustumListFi_0x26f860(rdram, ctx, runtime);
+            ++g_frustumLookups[sector];
+            if (GPR_U32(ctx, 2) != 0u)
+                ++g_frustumHits[sector];
+        }
+
+        void traceRenderObjectsRecursive(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            ++g_renderObjectNodes;
+            renderObjectsRecursive__19ClSceneRegistrationFP20ClWorldCollisionNodeUiPC8ClCamerabb_0x240e70(rdram, ctx, runtime);
+        }
+
+        // ClFrustum::isBoundingBoxVisible(min, max, &clip): logs the first calls from the object renderer
+        // (ClSceneRegistration::renderObjectsRecursive) and from the world (ClWorldNode::drawRecursive).
+        void traceBoxVisible(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            const uint32_t ra = GPR_U32(ctx, 31);
+            const uint32_t frustum = GPR_U32(ctx, 4), minAddr = GPR_U32(ctx, 5), maxAddr = GPR_U32(ctx, 6);
+            const uint32_t clipAddr = GPR_U32(ctx, 7);
+            float box[8], aabb[8];
+            std::memcpy(box, rdram + (minAddr & 0x1FFFFFFu), 16);
+            std::memcpy(box + 4, rdram + (maxAddr & 0x1FFFFFFu), 16);
+            std::memcpy(aabb, rdram + ((frustum + 0x90u) & 0x1FFFFFFu), 32);
+            isBoundingBoxVisible__9ClFrustumCFRC8ClVectorRC8ClVectorRi_0x19cc60(rdram, ctx, runtime);
+            const bool objects = ra >= 0x00240E70u && ra < 0x00241200u;
+            const bool world = ra >= 0x00239840u && ra < 0x0023A000u;
+            static int objectLogs = 0, worldLogs = 0;
+            int &logs = objects ? objectLogs : worldLogs;
+            if ((!objects && !world) || logs >= 12)
+                return;
+            ++logs;
+            std::cout << "[ttr:box] " << (objects ? "objects" : "world") << " ra=0x" << std::hex << ra << std::dec
+                      << " min=(" << box[0] << ',' << box[1] << ',' << box[2] << ") max=(" << box[4] << ',' << box[5] << ','
+                      << box[6] << ") frustumAabb=(" << aabb[0] << ',' << aabb[1] << ',' << aabb[2] << ")-(" << aabb[4] << ','
+                      << aabb[5] << ',' << aabb[6] << ") -> " << GPR_U32(ctx, 2) << " clip=0x" << std::hex
+                      << ram32(rdram, clipAddr & 0x1FFFFFFu) << std::dec << std::endl;
+            // The same plane test in C++: corners in the order the VU0 code stores them, then for each plane
+            // d = normal . corner[index] + distance for the two corner indices the plane carries.
+            const float corners[8][3] = {{box[0], box[1], box[2]}, {box[4], box[1], box[2]}, {box[0], box[5], box[2]},
+                                         {box[4], box[5], box[2]}, {box[0], box[1], box[6]}, {box[4], box[1], box[6]},
+                                         {box[0], box[5], box[6]}, {box[4], box[5], box[6]}};
+            std::cout << "[ttr:box]   planes";
+            for (uint32_t plane = 0; plane < 6u; ++plane)
+            {
+                const uint32_t base = (frustum + 0x140u + plane * 0x20u) & 0x1FFFFFFu;
+                float normal[4], distance;
+                std::memcpy(normal, rdram + base, 16);
+                std::memcpy(&distance, rdram + base + 0x10u, 4);
+                const uint32_t near = ram32(rdram, base + 0x14u), far = ram32(rdram, base + 0x18u);
+                auto dot = [&](uint32_t index)
+                {
+                    const float *c = corners[index & 7u];
+                    return normal[0] * c[0] + normal[1] * c[1] + normal[2] * c[2] + distance;
+                };
+                std::cout << " n=(" << normal[0] << ',' << normal[1] << ',' << normal[2] << ") d=" << distance << " idx="
+                          << near << '/' << far << " -> " << dot(near) << '/' << dot(far);
+            }
+            std::cout << std::endl;
+        }
+
+        void logAnimPasses()
+        {
+            std::cout << "[ttr:anims]";
+            for (size_t i = 0; i < std::size(g_animCalls); ++i)
+            {
+                std::cout << ' ' << kAnimPassNames[i] << '=' << g_animCalls[i];
+                if (g_animCallers[i] != 0u)
+                    std::cout << "(ra=0x" << std::hex << g_animCallers[i] << std::dec << ')';
+            }
+            std::cout << std::endl;
+            std::cout << "[ttr:anims] objectNodes=" << g_renderObjectNodes << " frustums(sector:added/lookups/hits)";
+            for (int sector = 0; sector < 64; ++sector)
+            {
+                if (g_frustumAdds[sector] || g_frustumLookups[sector])
+                    std::cout << ' ' << sector << ':' << g_frustumAdds[sector] << '/' << g_frustumLookups[sector] << '/'
+                              << g_frustumHits[sector];
+            }
+            std::cout << std::endl;
+        }
+
+        // --- pad: ClPad slots (ClData::tickSlot reads libpad once per frame per port/slot) ----------
+        // Slot state: +0x100 the scePadRead buffer, +0x120 status (3 = read), +0x128 buttons (active high),
+        // +0x160/+0x164 left stick and +0x184/+0x188 right stick in [-1, 1].
+        void tracePadSlot(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            const uint32_t port = GPR_U32(ctx, 5);
+            const uint32_t slot = GPR_U32(ctx, 6);
+            const uint32_t state = GPR_U32(ctx, 4) + port * 0x900u + slot * 0x240u;
+            tickSlot__6ClDataFii_0x17e140(rdram, ctx, runtime);
+            if (port != 0u || slot != 0u)
+                return;
+            static uint32_t lastStatus = ~0u, lastButtons = ~0u, lastMode = ~0u;
+            static float lastStick[4] = {};
+            const uint32_t status = ram32(rdram, state + 0x120u);
+            const uint32_t buttons = ram32(rdram, state + 0x128u);
+            const uint32_t mode = rdram[state + 0x101u];
+            float stick[4];
+            std::memcpy(&stick[0], rdram + state + 0x160u, 8);
+            std::memcpy(&stick[2], rdram + state + 0x184u, 8);
+            const bool stickChanged = std::memcmp(stick, lastStick, sizeof(stick)) != 0;
+            if (status == lastStatus && buttons == lastButtons && mode == lastMode && !stickChanged)
+                return;
+            lastStatus = status;
+            lastButtons = buttons;
+            lastMode = mode;
+            std::memcpy(lastStick, stick, sizeof(stick));
+            std::cout << "[ttr:pad] slot status=" << status << " mode=0x" << std::hex << mode << " buttons=0x" << buttons
+                      << std::dec << " left=(" << stick[0] << ',' << stick[1] << ") right=(" << stick[2] << ',' << stick[3]
+                      << ')' << std::endl;
         }
 
         // --- camera: projection matrix inputs and the libm tanf it relies on ---------------------
@@ -827,12 +995,55 @@ namespace ttr::sles51256
             runtime.replaceFunction(0x001F14B0u, &hackBardStreamLoaded);
             std::cout << "[ttr] hack: isBardStreamLoaded() always true" << std::endl;
         }
+        if (const char *hack = std::getenv("TTR_HACK_NO_SHADOW_VOLUMES"); hack && hack[0] == '1')
+        {
+            runtime.replaceFunction(0x00254350u, &hackSkipShadowVolumes);
+            std::cout << "[ttr] hack: no character shadow volumes" << std::endl;
+        }
+        if (const char *hack = std::getenv("TTR_HACK_SKIPPABLE_FMV"); hack && hack[0] == '1')
+        {
+            runtime.replaceFunction(0x0026A7A0u, &hackSkippableFmv);
+            std::cout << "[ttr] hack: any button skips the movies" << std::endl;
+        }
         if (traceEnabled("rpc"))
         {
             runtime.replaceFunction(0x002AE558u, &traceBindRpc);
             runtime.replaceFunction(0x002AE728u, &traceCallRpc);
             runtime.replaceFunction(0x002AE918u, &traceCheckStatRpc);
             std::cout << "[ttr] SIF RPC tracing enabled" << std::endl;
+        }
+        if (traceEnabled("anims"))
+        {
+            runtime.replaceFunction(0x00254350u, &countAnimPass<0, drawShadowAnims__13ClDisplayListFRC8ClCamera_0x254350>);
+            runtime.replaceFunction(0x002547B0u, &countAnimPass<1, drawSpecularAnims__13ClDisplayListFRC8ClCamera_0x2547b0>);
+            runtime.replaceFunction(0x00254960u, &countAnimPass<2, drawAlphaAnims__13ClDisplayListFRC8ClCamera_0x254960>);
+            runtime.replaceFunction(0x00254B50u, &countAnimPass<3, drawInstancedAnims__13ClDisplayListFRC8ClCamera_0x254b50>);
+            runtime.replaceFunction(0x00254D70u, &countAnimPass<4, drawDiffuseAndSpecularAnims__13ClDisplayListFRC8ClCamerab_0x254d70>);
+            runtime.replaceFunction(0x00255250u, &countAnimPass<5, drawDiffuseAnims__13ClDisplayListFRC8ClCamerab_0x255250>);
+            runtime.replaceFunction(0x001A2290u, &countAnimPass<6, drawAnimationInstance__15ClNoamFigurePs2FR8ClMatrixRC8ClCamera_0x1a2290>);
+            runtime.replaceFunction(0x00256560u, &countAnimPass<7, addAnimation__13ClDisplayListFP15ClNoamFigurePs2RC8ClMatrixP17ClPS2TextureAssetP17ClPS2TextureAssetUiPQ221ClDynamicLightManager17ClEngineLightList_0x256560>);
+            runtime.replaceFunction(0x001A2AF0u, &countAnimPass<8, RenderDiffuse__15ClNoamFigurePs2FRC8ClCameraR8ClMatrixP5ClPbi_0x1a2af0>);
+            runtime.replaceFunction(0x001A26E0u, &countAnimPass<9, RenderDiffuseAndSpecular__15ClNoamFigurePs2FRC8ClCameraR8ClMatrixP5ClPbiP5ClPbi_0x1a26e0>);
+            runtime.replaceFunction(0x00285E80u, &countAnimPass<10, render__23ClNoamPs2UcodeInterfaceFP9CModelBinP8ClMatrixUi_0x285e80>);
+            runtime.replaceFunction(0x00285CC0u, &countAnimPass<11, renderLowQuality__23ClNoamPs2UcodeInterfaceFP9CModelBin_0x285cc0>);
+            runtime.replaceFunction(0x00125E90u, &countAnimPass<12, AddToDisplayList__6CActorFUiii_0x125e90>);
+            runtime.replaceFunction(0x001BEE30u, &countAnimPass<13, AddToDisplayList__16ClNoamControllerFUib_0x1bee30>);
+            runtime.replaceFunction(0x00226B90u, &countAnimPass<14, AddToDisplayList__6ClPropFUiii_0x226b90>);
+            runtime.replaceFunction(0x002004F0u, &countAnimPass<15, AddToDisplayList__13ClParticleObjFUiii_0x2004f0>);
+            runtime.replaceFunction(0x00134110u, &countAnimPass<16, AddToDisplayList__8CCollObjFUiii_0x134110>);
+            runtime.replaceFunction(0x001284D0u, &countAnimPass<17, AddToDisplayList__8CAnimObjFUiii_0x1284d0>);
+            runtime.replaceFunction(0x0011C030u, &countAnimPass<18, AddToDisplayList__11ClScriptObjFUiii_0x11c030>);
+            runtime.replaceFunction(0x0022FB70u, &countAnimPass<19, AddToDisplayList__11ClPickupObjFUiii_0x22fb70>);
+            runtime.replaceFunction(0x0026F880u, &traceFrustumToAdd);
+            runtime.replaceFunction(0x0026F860u, &traceFrustumListForSector);
+            runtime.replaceFunction(0x00240E70u, &traceRenderObjectsRecursive);
+            runtime.replaceFunction(0x0019CC60u, &traceBoxVisible);
+            std::cout << "[ttr] anim pass counting enabled" << std::endl;
+        }
+        if (traceEnabled("pad"))
+        {
+            runtime.replaceFunction(0x0017E140u, &tracePadSlot);
+            std::cout << "[ttr] pad tracing enabled" << std::endl;
         }
         if (traceEnabled("camera"))
         {
@@ -860,7 +1071,8 @@ namespace ttr::sles51256
             runtime.replaceFunction(0x0026B150u, &traceFmvDraw);
             std::cout << "[ttr] FMV tracing enabled" << std::endl;
         }
-        if (traceEnabled("dma") || frameDumpConfig().enabled || std::getenv("TTR_GS_DUMP"))
+        if (traceEnabled("dma") || frameDumpConfig().enabled || std::getenv("TTR_GS_DUMP") ||
+            ttr::debug::padScriptEnabled())
         {
             runtime.replaceFunction(0x00106290u, &traceVBlank);
         }
