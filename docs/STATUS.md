@@ -98,6 +98,8 @@ Medido en el nivel del prólogo con un Ryzen 5 3600X (`TTR_FRAME_DUMP` + `t=`, b
 | Punto de partida (todo en el hilo del EE) | 5,8 |
 | IOP y temporizadores del EE por lotes de 4096 ciclos (parche `0005`) | 6,7 |
 | Rasterizador del GS en 6 hilos (parche `0005`) | 17,4 |
+| GS en su propio hilo (parche `0006`) | 23 |
+| 9 hilos de rasterizado (CPU de 12 hilos, parche `0006`) | 30 |
 
 El VBlank exige a la vez 16,7 ms de reloj real y ~4,9 M ciclos del EE cobrados por el código generado, así
 que la velocidad del juego depende del tiempo de CPU por frame. El perfilador (`TTR_PROFILE`) mostraba un
@@ -106,11 +108,15 @@ pantalla completa del posproceso: ~45 % del total). El código generado cobra 8 
 arista de bucle, y cada cobro ejecutaba el planificador completo del IOP (hilos, DMA, SPU2, temporizadores)
 para 1-4 ciclos del IOP. La build `Release` añade un 15-25 %.
 
+Ahora el límite es el GS: el nivel dibuja unos 3,2 M píxeles por VBlank (unas 22 pasadas de pantalla
+completa por frame: posproceso en franjas de sprites, triángulos aditivos gigantes y la cúpula del cielo con
+filtrado bilineal) a ~100 ns por píxel y hilo.
+
 ## Siguiente
 
-1. Rendimiento: el hilo del EE sigue al 98 % (intérprete de VU1 ~13 %, su parte del GS y las primitivas
-   pequeñas). Faltan unas 3 veces para ir a velocidad real: GS asíncrono en su propio hilo, intérprete de VU1
-   más barato.
+1. Rendimiento: el rasterizador del GS es el cuello de botella (coste por píxel: direcciones de VRAM por
+   puntero a función, estado del GS decodificado en cada píxel). Después, el intérprete de VU1 (~25 % del
+   hilo del EE).
 2. Jugar el prólogo con mando/teclado: comprobar movimiento (stick izquierdo), personajes y cámara.
 3. Audio del vídeo: el IOP deja de pedir bloques de sonido (`handleSoundBufferRequest`) tras ~36
    peticiones, el buffer de audio se llena y corta el vídeo a los ~14 s.

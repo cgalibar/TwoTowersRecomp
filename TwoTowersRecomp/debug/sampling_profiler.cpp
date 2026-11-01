@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -85,7 +86,7 @@ namespace ttr::debug
         using ThreadSamples = std::unordered_map<DWORD, std::unordered_map<DWORD64, uint64_t>>;
 
         void report(std::unordered_map<DWORD64, uint64_t> &samples, ThreadSamples &threadSamples,
-                    std::unordered_map<DWORD64, std::string> &symbols, uint64_t total)
+                    std::unordered_map<DWORD64, std::string> &symbols, uint64_t total, size_t threadFunctions)
         {
             std::unordered_map<std::string, uint64_t> byFunction;
             for (const auto &[address, count] : samples)
@@ -118,7 +119,7 @@ namespace ttr::debug
                 std::vector<std::pair<std::string, uint64_t>> ranked(functions.begin(), functions.end());
                 std::sort(ranked.begin(), ranked.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
                 std::cout << "[profile] thread " << thread << " busy " << (100 * busy / threadTotal) << "%:";
-                for (size_t i = 0; i < std::min<size_t>(ranked.size(), 8u); ++i)
+                for (size_t i = 0; i < std::min(ranked.size(), threadFunctions); ++i)
                     std::cout << ' ' << ranked[i].first << '=' << (100 * ranked[i].second / threadTotal) << '%';
                 std::cout << std::endl;
             }
@@ -126,7 +127,7 @@ namespace ttr::debug
             threadSamples.clear();
         }
 
-        void profilerThread(int seconds)
+        void profilerThread(int seconds, size_t threadFunctions)
         {
             SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
             SymInitialize(GetCurrentProcess(), nullptr, TRUE);
@@ -161,7 +162,7 @@ namespace ttr::debug
                 }
                 if (now >= nextReport)
                 {
-                    report(samples, threadSamples, symbols, total);
+                    report(samples, threadSamples, symbols, total, threadFunctions);
                     total = 0;
                     nextReport = now + std::chrono::seconds(seconds);
                 }
@@ -176,7 +177,9 @@ namespace ttr::debug
         if (!env)
             return;
         const int seconds = std::max(1, std::atoi(env));
-        std::thread(profilerThread, seconds).detach();
+        const char *comma = std::strchr(env, ',');
+        const size_t threadFunctions = comma ? static_cast<size_t>(std::max(1, std::atoi(comma + 1))) : 8u;
+        std::thread(profilerThread, seconds, threadFunctions).detach();
         std::cout << "[profile] sampling every 1 ms, report every " << seconds << " s" << std::endl;
     }
 }
