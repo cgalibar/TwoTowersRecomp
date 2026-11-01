@@ -16,7 +16,7 @@ mando y el sonido; todavía no se ha jugado una partida.
 | Pantalla "CARGANDO..." (`ClGameModePlay`) | ✅ |
 | Banco de efectos del nivel subido a la RAM del SPU2 (`00ISUL1.MSB`, el prólogo de Isildur) | ✅ |
 | Streams de narrador/música (EA MultiStream) y carga del nivel (`ClEnemyDB::load`) | ✅ |
-| Vídeo de introducción `MONT.FMV` (`ClFMV::playModal`) | ✅ imagen; ⚠️ se corta a los ~14 s porque su audio no se consume |
+| Vídeo de introducción `MONT.FMV` (`ClFMV::playModal`), completo (~3 min) | ✅ imagen (sin sonido en el host) |
 | Nivel: actores, colisiones, partículas, guiones; microprogramas VU0 por VIF0 | ✅ |
 | Nivel: cielo y HUD (espada, "Defender", luna) | ✅ |
 | Nivel: terreno, campo de batalla y cielo (plano de apertura del prólogo) | ✅ |
@@ -66,6 +66,14 @@ del servidor de sonido, y `sceSifCallRpc` copió el buffer de comandos de EA a l
 que había quedado allí. Ahora el ejecutable mueve todo eso a `0x80000–0x100000`, que nadie usa
 (`setRuntimeGuestRegion` + `configureGuestHeap` en `sles_51256_overrides.cpp`).
 
+### Vídeo cortado a los ~14 s (VBlank NTSC en un juego PAL)
+
+El runtime generaba siempre VBlanks a 60 Hz. El reproductor de `ClFMV` avanza el vídeo con el VBlank y
+entrega el audio al IOP al mismo ritmo, pero el IOP lo consume a 48 kHz reales: a 60 Hz el buffer de audio
+se llenaba, el IOP dejaba de pedir bloques tras ~36 y el vídeo terminaba antes de tiempo. Parche `0007`:
+el VBlank sigue el modo que el juego pasa a `sceGsResetGraph` (PAL = 50 Hz). Ahora el vídeo llega al final
+(605 peticiones de audio).
+
 ### Microprogramas VU0 por VIF0
 
 El juego envía a VIF0, sin parar, `UNPACK` + `MSCNT`/`MSCAL` + `FLUSHE` (física y colisiones del nivel).
@@ -99,7 +107,8 @@ Medido en el nivel del prólogo con un Ryzen 5 3600X (`TTR_FRAME_DUMP` + `t=`, b
 | IOP y temporizadores del EE por lotes de 4096 ciclos (parche `0005`) | 6,7 |
 | Rasterizador del GS en 6 hilos (parche `0005`) | 17,4 |
 | GS en su propio hilo (parche `0006`) | 23 |
-| 9 hilos de rasterizado (CPU de 12 hilos, parche `0006`) | 30 |
+| 9 hilos de rasterizado (CPU de 12 hilos, parche `0006`) | 30 (de 60) |
+| VBlank PAL a 50 Hz (parche `0007`) | 28,8 de 50: un 58 % de la velocidad real |
 
 El VBlank exige a la vez 16,7 ms de reloj real y ~4,9 M ciclos del EE cobrados por el código generado, así
 que la velocidad del juego depende del tiempo de CPU por frame. El perfilador (`TTR_PROFILE`) mostraba un
@@ -117,11 +126,9 @@ filtrado bilineal) a ~100 ns por píxel y hilo.
 1. Rendimiento: el rasterizador del GS es el cuello de botella (coste por píxel: direcciones de VRAM por
    puntero a función, estado del GS decodificado en cada píxel). Después, el intérprete de VU1 (~25 % del
    hilo del EE).
-2. Jugar el prólogo con mando/teclado: comprobar movimiento (stick izquierdo), personajes y cámara.
-3. Audio del vídeo: el IOP deja de pedir bloques de sonido (`handleSoundBufferRequest`) tras ~36
-   peticiones, el buffer de audio se llena y corta el vídeo a los ~14 s.
-4. Salida de audio: llevar la mezcla del SPU2 al backend de audio del runtime (raylib).
-5. VBlank a 50 Hz: el runtime programa VBlanks NTSC (60 Hz) aunque el juego es PAL (`VMODE = PAL`).
+2. Jugar el prólogo con mando/teclado: comprobar movimiento (stick izquierdo), personajes y cámara. En los
+   frames volcados del nivel no se ve ningún personaje.
+3. Salida de audio: llevar la mezcla del SPU2 al backend de audio del runtime (raylib).
 
 ## Observaciones
 
