@@ -10,6 +10,8 @@ Forman una pila: cada parche se aplica sobre los anteriores y puede tocar los mi
 | `0002-ps2xRuntime-defer-nowait-rpc-completion.patch` | Un `sceSifCallRpc` sin espera devuelve primero y su función de fin se ejecuta ~100 µs después, como en el hardware. Antes se completaba de forma síncrona y el ping-pong de estado del sonido de EA (`ClSound::tick`) se detenía, dejando la carga colgada. |
 | `0003-ps2xRuntime-fmv-guest-memory-vu0-micro.patch` | Vídeo: modelo `sceMpegCbNodata` de libmpeg (el decodificador pide datos al callback del juego; si devuelve 0, el vídeo termina y `sceMpegIsEnd` lo indica). Memoria: `PS2Runtime::setRuntimeGuestRegion()` mueve los descriptores RPC/TLS y las pilas de callbacks que el runtime guarda en la RAM del invitado. VIF0: `MSCAL`/`MSCALF`/`MSCNT` ejecutan el microprograma de VU0 y `UNPACK` comparte la implementación completa de VIF1 (formatos, máscaras, modos). Ayudas de depuración: `PS2X_WATCH` y `PS2X_PROFILE_CALLS`. |
 
+| `0004-ps2xRecomp-vu0-mac-flags-ee-sqrt-pad-sticks.patch` | Recompilador: las instrucciones FMAC de VU0 en modo macro (ADD/SUB/MUL/MADD/MSUB, variantes ACC, OPMULA/OPMSUB) actualizan los flags MAC/STATUS y descartan las escrituras a `vf0`; `SQRT.S` toma el operando del campo ft, como en el EE. Runtime: en el teclado, WASD e IJKL mueven los sticks analógicos y las flechas la cruceta. Hace falta regenerar el código (`recomp_codegen.py generate`) tras aplicarlo. |
+
 ## Añadir un parche
 
 Edita el submódulo, compila con `tools\build_runtime.ps1 -SkipPatches` mientras iteras y, cuando esté

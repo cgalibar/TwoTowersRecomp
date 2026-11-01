@@ -14,7 +14,7 @@ if (-not $PS2RecompDir) { $PS2RecompDir = Join-Path $repo 'tools\PS2Recomp' }
 if (-not (Test-Path (Join-Path $PS2RecompDir 'CMakeLists.txt'))) {
     throw "PS2Recomp not found at $PS2RecompDir. Run: git submodule update --init --recursive"
 }
-& (Join-Path $PSScriptRoot 'apply_patches.ps1') -PS2RecompDir $PS2RecompDir
+if (-not $SkipPatches) { & (Join-Path $PSScriptRoot 'apply_patches.ps1') -PS2RecompDir $PS2RecompDir }
 
 $cc = if ($Compiler -eq 'clang') { 'clang-cl' } else { 'cl' }
 $buildDir = Join-Path $repo 'out\build\tools'

@@ -3,6 +3,8 @@
 //   sound - ClMStream (EA MultiStream) loads and body-load state machine
 //   rpc   - EE-side sceSifBindRpc / sceSifCallRpc / sceSifCheckStatRpc
 //   fmv   - ClFMV playback flags, nodata callback and FMV audio requests
+//   camera - ClCamera projection/Z values, world draw passes and a C++ check of SfMatrixMultiplyVu0
+// TTR_GS_DUMP=<vblank> prints the GS debug history (registers and primitives) for 10 VBlanks.
 // TTR_FRAME_DUMP=<dir> saves the presented frame (and logs the ClGame state) every
 // TTR_FRAME_DUMP_EVERY VBlanks (default 50, one second of PAL).
 // Each traced guest function is wrapped: the wrapper logs, then runs the generated function.
@@ -15,6 +17,7 @@
 #include "runtime/ps2_memory.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -167,7 +170,9 @@ namespace ttr::sles51256
                       << " game.current=0x" << current
                       << " vtbl=0x" << (current ? ram32(rdram, current) : 0u)
                       << " current.next=" << std::dec << (current ? ram32(rdram, current + 4u) : 0u)
-                      << std::endl;
+                      << " drawFlags=" << static_cast<int>(rdram[0x381400u]) << static_cast<int>(rdram[0x381404u])
+                      << static_cast<int>(rdram[0x381408u]) << static_cast<int>(rdram[0x38140Cu])
+                      << static_cast<int>(rdram[0x381410u]) << std::endl;
             if (traceEnabled("fmv"))
             {
                 logFmvState(rdram, "frame");
@@ -198,8 +203,62 @@ namespace ttr::sles51256
             }
         }
 
+        // TTR_GS_DUMP=<vblank>: records the GS debug history for 10 VBlanks and prints its last events.
+        void dumpGsHistoryIfDue(PS2Runtime *runtime)
+        {
+            static const uint32_t dumpAt = []
+            {
+                const char *env = std::getenv("TTR_GS_DUMP");
+                return env ? static_cast<uint32_t>(std::strtoul(env, nullptr, 0)) : 0u;
+            }();
+            static uint32_t vblanks = 0;
+            if (dumpAt == 0u)
+                return;
+            ++vblanks;
+            GS &gs = runtime->gs();
+            if (vblanks == dumpAt)
+            {
+                gs.clearDebugHistory();
+                gs.setDebugHistoryPaused(false);
+                return;
+            }
+            if (vblanks != dumpAt + 10u) // the game builds a frame over several VBlanks
+                return;
+            gs.setDebugHistoryPaused(true);
+            uint32_t draws = 0;
+            uint32_t kinds[5] = {};
+            const std::vector<GSDebugHistoryEntry> history = gs.getDebugHistory();
+            for (const GSDebugHistoryEntry &e : history)
+            {
+                ++kinds[static_cast<int>(e.kind) % 5];
+                if (e.kind == GSDebugEventKind::Register)
+                {
+                    std::cout << "[ttr:gs] reg 0x" << std::hex << static_cast<int>(e.reg) << " = 0x" << e.regValue
+                              << std::dec << '\n';
+                    continue;
+                }
+                if (e.kind != GSDebugEventKind::Draw)
+                    continue;
+                ++draws;
+                std::cout << "[ttr:gs] draw prim=" << static_cast<int>(e.prim.type) << " tme=" << e.prim.tme
+                          << " abe=" << e.prim.abe << " fst=" << e.prim.fst << " ctxt=" << e.prim.ctxt
+                          << " n=" << e.vertexCount << " x=" << e.xMin << ".." << e.xMax << " y=" << e.yMin << ".."
+                          << e.yMax << " z=" << e.zMin << ".." << e.zMax << " a=" << static_cast<int>(e.aMin) << ".."
+                          << static_cast<int>(e.aMax) << std::hex << " fbp=0x" << e.frame.fbp << " fbw="
+                          << e.frame.fbw << " psm=0x" << static_cast<int>(e.frame.psm) << " fbmsk=0x"
+                          << e.frame.fbmsk << " zbp=0x" << e.zbuf.zbp << " zpsm=0x" << static_cast<int>(e.zbuf.psm)
+                          << " zmsk=" << e.zbuf.zmask << " test=0x" << e.test << " alpha=0x" << e.alpha
+                          << " tbp=0x" << e.tex0.tbp0 << " tpsm=0x" << static_cast<int>(e.tex0.psm) << std::dec
+                          << " scissor=" << e.scissor.x0 << ".." << e.scissor.x1 << ',' << e.scissor.y0 << ".."
+                          << e.scissor.y1 << '\n';
+            }
+            std::cout << "[ttr:gs] " << history.size() << " events: tags=" << kinds[0] << " regs=" << kinds[1]
+                      << " draws=" << kinds[2] << " transfers=" << kinds[3] << " presents=" << kinds[4] << std::endl;
+        }
+
         void traceVBlank(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
         {
+            dumpGsHistoryIfDue(runtime);
             static uint32_t count = 0;
             static uint32_t pendingCount = 0;
             const bool dma = traceEnabled("dma");
@@ -539,6 +598,185 @@ namespace ttr::sles51256
             }
         }
 
+        // --- camera: projection matrix inputs and the libm tanf it relies on ---------------------
+        // World draw-node passes: how often each runs (they build the VU1 MSCALs for the world).
+        uint64_t g_worldPassCalls[8] = {};
+
+        void traceCameraProjection(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            static uint32_t count = 0;
+            const bool log = shouldLog(count);
+            const uint32_t camera = GPR_U32(ctx, 4);
+            const float fov = ctx->f[12], aspect = ctx->f[13], nearPlane = ctx->f[14], farPlane = ctx->f[15];
+            projection__8ClCameraFffff_0x17b200(rdram, ctx, runtime);
+            if (log)
+            {
+                float m[16];
+                std::memcpy(m, rdram + ((camera + 0x5E0u) & 0x01FFFFFFu), sizeof(m));
+                std::cout << "[ttr:camera] cam=0x" << std::hex << camera << std::dec << " projection(fov=" << fov << " aspect=" << aspect << " near=" << nearPlane
+                          << " far=" << farPlane << ") -> [" << m[0] << ' ' << m[5] << ' ' << m[10] << ' ' << m[11]
+                          << ' ' << m[14] << ' ' << m[15] << ']' << std::endl;
+            }
+        }
+
+        // SfMatrixMultiplyVu0(out, a, b) is VU0 macro code (VMULAx/VMADDAy/VMADDAz/VMADDw):
+        // out[i] = a[i].x*b[0] + a[i].y*b[1] + a[i].z*b[2] + a[i].w*b[3]. Compare with plain C++.
+        void checkMatrixMultiply(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            static uint32_t checked = 0, mismatches = 0;
+            const uint32_t out = GPR_U32(ctx, 4), aAddr = GPR_U32(ctx, 5), bAddr = GPR_U32(ctx, 6);
+            float a[16], b[16], expected[16], actual[16];
+            std::memcpy(a, rdram + (aAddr & 0x01FFFFFFu), sizeof(a));
+            std::memcpy(b, rdram + (bAddr & 0x01FFFFFFu), sizeof(b));
+            for (int i = 0; i < 4; ++i)
+                for (int j = 0; j < 4; ++j)
+                    expected[i * 4 + j] = a[i * 4 + 0] * b[0 + j] + a[i * 4 + 1] * b[4 + j] + a[i * 4 + 2] * b[8 + j] +
+                                          a[i * 4 + 3] * b[12 + j];
+            SfMatrixMultiplyVu0__FR8ClMatrixRC8ClMatrixRC8ClMatrix_0x100210(rdram, ctx, runtime);
+            std::memcpy(actual, rdram + (out & 0x01FFFFFFu), sizeof(actual));
+            ++checked;
+            bool same = true;
+            for (int k = 0; k < 16; ++k)
+            {
+                const float tolerance = 1e-3f * std::max(1.0f, std::fabs(expected[k]));
+                if (!(std::fabs(actual[k] - expected[k]) <= tolerance))
+                    same = false;
+            }
+            if (!same && mismatches++ < 5u)
+            {
+                std::cout << "[ttr:vu0] SfMatrixMultiplyVu0 mismatch #" << mismatches << " (of " << checked << ")\n";
+                for (int i = 0; i < 4; ++i)
+                {
+                    std::cout << "  a=" << a[i * 4] << ',' << a[i * 4 + 1] << ',' << a[i * 4 + 2] << ',' << a[i * 4 + 3]
+                              << "  b=" << b[i * 4] << ',' << b[i * 4 + 1] << ',' << b[i * 4 + 2] << ',' << b[i * 4 + 3]
+                              << "  want=" << expected[i * 4] << ',' << expected[i * 4 + 1] << ','
+                              << expected[i * 4 + 2] << ',' << expected[i * 4 + 3] << "  got=" << actual[i * 4] << ','
+                              << actual[i * 4 + 1] << ',' << actual[i * 4 + 2] << ',' << actual[i * 4 + 3] << '\n';
+                }
+                std::cout << std::flush;
+            }
+            if ((checked % 20000u) == 0u)
+                std::cout << "[ttr:vu0] SfMatrixMultiplyVu0 checked=" << checked << " mismatches=" << mismatches << std::endl;
+        }
+
+        void logMatrix(const uint8_t *rdram, const char *label, uint32_t address)
+        {
+            float m[16];
+            std::memcpy(m, rdram + (address & 0x01FFFFFFu), sizeof(m));
+            std::cout << "  " << label << " @0x" << std::hex << address << std::dec << ':';
+            for (int i = 0; i < 16; ++i)
+                std::cout << (i % 4 == 0 ? " |" : " ") << m[i];
+            std::cout << std::endl;
+        }
+
+        void traceWorldBeginDraw(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            static uint32_t count = 0;
+            const uint32_t camera = GPR_U32(ctx, 6);
+            if (count % 200u == 0u)
+                std::cout << "[ttr:world] beginDraw=" << count << " single=" << g_worldPassCalls[0]
+                          << " split=" << g_worldPassCalls[1] << " foliage=" << g_worldPassCalls[2]
+                          << " decal=" << g_worldPassCalls[3] << " endDraw=" << g_worldPassCalls[4] << std::endl;
+            {
+                float draw[16];
+                std::memcpy(draw, rdram + ((camera + 0x5A0u) & 0x01FFFFFFu), sizeof(draw));
+                const bool zeroXY = draw[0] == 0.0f && draw[4] == 0.0f && draw[8] == 0.0f && draw[1] == 0.0f &&
+                                    draw[5] == 0.0f && draw[9] == 0.0f;
+                static uint32_t zeroLogs = 0;
+                if (zeroXY && zeroLogs++ < 6u)
+                {
+                    std::cout << "[ttr:camera] beginDraw #" << count << " draw matrix has no X/Y" << std::endl;
+                    logMatrix(rdram, "proj", camera + 0x5E0u);
+                    logMatrix(rdram, "view", camera + 0x6A0u);
+                    logMatrix(rdram, "clip", camera + 0x4E0u);
+                    logMatrix(rdram, "draw", camera + 0x5A0u);
+                }
+            }
+            if (shouldLog(count) && count % 4u == 1u)
+            {
+                std::cout << "[ttr:camera] ClWorldDrawData::beginDraw(" << GPR_U32(ctx, 5) << ", cam=0x" << std::hex
+                          << camera << std::dec << ')' << std::endl;
+                logMatrix(rdram, "proj", camera + 0x5E0u);
+                logMatrix(rdram, "view", camera + 0x6A0u);
+                logMatrix(rdram, "clip", camera + 0x4E0u);
+                logMatrix(rdram, "draw", camera + 0x5A0u);
+                std::cout << std::flush;
+            }
+            beginDraw__15ClWorldDrawDataFiRC8ClCamera_0x176800(rdram, ctx, runtime);
+        }
+
+        template <int Index, void (*Generated)(uint8_t *, R5900Context *, PS2Runtime *)>
+        void countWorldPass(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            ++g_worldPassCalls[Index];
+            Generated(rdram, ctx, runtime);
+        }
+
+        void traceWorldDraw(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            static uint32_t count = 0;
+            if ((++count % 50u) == 1u)
+            {
+                std::cout << "[ttr:world] draw=" << count << " single=" << g_worldPassCalls[0]
+                          << " split=" << g_worldPassCalls[1] << " foliage=" << g_worldPassCalls[2]
+                          << " decal=" << g_worldPassCalls[3] << " endDraw=" << g_worldPassCalls[4] << std::endl;
+            }
+            draw__15ClWorldDrawDataFP11ClWorldNodeRC8ClCamerabiPQ221ClDynamicLightManager17ClEngineLightList_0x1763d0(rdram, ctx, runtime);
+        }
+
+        void traceZBufferValue(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            static uint32_t count = 0;
+            const bool log = shouldLog(count);
+            const uint32_t camera = GPR_U32(ctx, 4);
+            const float depth = ctx->f[12];
+            getZBufferValue__8ClCameraCFf_0x17c1b0(rdram, ctx, runtime);
+            if (log)
+            {
+                std::cout << "[ttr:camera] getZBufferValue(cam=0x" << std::hex << camera << std::dec << ", " << depth
+                          << ") = 0x" << std::hex << GPR_U32(ctx, 2) << std::dec << std::endl;
+                if (count < 3u)
+                {
+                    logMatrix(rdram, "m660", camera + 0x660u);
+                    logMatrix(rdram, "m560", camera + 0x560u);
+                }
+            }
+        }
+
+        void traceClearScreen(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            static uint32_t count = 0;
+            if (shouldLog(count))
+            {
+                std::cout << "[ttr:camera] ClearScreen(" << (GPR_U32(ctx, 4) & 0xFF) << ',' << (GPR_U32(ctx, 5) & 0xFF) << ','
+                          << (GPR_U32(ctx, 6) & 0xFF) << ", cam=0x" << std::hex << GPR_U32(ctx, 7) << std::dec << ") #" << count
+                          << " ra=0x" << std::hex << GPR_U32(ctx, 31) << std::dec << std::endl;
+            }
+            ClearScreen__9ClDisplayFUcUcUcPC8ClCamera_0x17ca20(rdram, ctx, runtime);
+        }
+
+        void tracePbiClear(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            static uint32_t count = 0;
+            if (++count > 2000u && count < 2060u)
+            {
+                std::cout << "[ttr:camera] ClPbi::clear(pbi=0x" << std::hex << GPR_U32(ctx, 4) << ", mask=0x" << GPR_U32(ctx, 5)
+                          << ", " << (GPR_U32(ctx, 6) & 0xFF) << ',' << (GPR_U32(ctx, 7) & 0xFF) << ',' << (GPR_U32(ctx, 8) & 0xFF)
+                          << ',' << (GPR_U32(ctx, 9) & 0xFF) << ") ra=0x" << GPR_U32(ctx, 31) << std::dec << std::endl;
+            }
+            clear__5ClPbiFUiUiUiUiUi_0x16d860(rdram, ctx, runtime);
+        }
+
+        void traceTanf(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            static uint32_t count = 0;
+            const bool log = shouldLog(count);
+            const float x = ctx->f[12];
+            tanf_0x2b8ee0(rdram, ctx, runtime);
+            if (log)
+                std::cout << "[ttr:camera] tanf(" << x << ") = " << ctx->f[0] << std::endl;
+        }
+
         void traceFmvDraw(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
         {
             static uint32_t last = 0xFFFFFFFFu;
@@ -592,6 +830,23 @@ namespace ttr::sles51256
             runtime.replaceFunction(0x002AE918u, &traceCheckStatRpc);
             std::cout << "[ttr] SIF RPC tracing enabled" << std::endl;
         }
+        if (traceEnabled("camera"))
+        {
+            runtime.replaceFunction(0x0017B200u, &traceCameraProjection);
+            runtime.replaceFunction(0x002B8EE0u, &traceTanf);
+            runtime.replaceFunction(0x00100210u, &checkMatrixMultiply);
+            runtime.replaceFunction(0x00176800u, &traceWorldBeginDraw);
+            runtime.replaceFunction(0x00174470u, &countWorldPass<0, drawSingleTexture__10ClDrawNodeFP20ClDrawNodeListHeaderP5ClPbi_0x174470>);
+            runtime.replaceFunction(0x00174010u, &countWorldPass<1, drawSplitTexture__10ClDrawNodeFP20ClDrawNodeListHeaderQ28ClTexEnv16eTextureFunctionP5ClPbiP5ClPbiP5ClPbi_0x174010>);
+            runtime.replaceFunction(0x00172770u, &countWorldPass<2, drawFoliage__10ClDrawNodeFP20ClDrawNodeListHeaderP5ClPbi_0x172770>);
+            runtime.replaceFunction(0x00173900u, &countWorldPass<3, drawDecal__10ClDrawNodeFP20ClDrawNodeListHeaderP5ClPbi_0x173900>);
+            runtime.replaceFunction(0x001750D0u, &countWorldPass<4, endDraw__15ClWorldDrawDataFPQ27ClWorld18ClTextureContainer_0x1750d0>);
+            runtime.replaceFunction(0x001763D0u, &traceWorldDraw);
+            runtime.replaceFunction(0x0017C1B0u, &traceZBufferValue);
+            runtime.replaceFunction(0x0017CA20u, &traceClearScreen);
+            runtime.replaceFunction(0x0016D860u, &tracePbiClear);
+            std::cout << "[ttr] camera tracing enabled" << std::endl;
+        }
         if (traceEnabled("fmv"))
         {
             runtime.replaceFunction(0x0026A5E0u, &traceFmvPlay);
@@ -601,7 +856,7 @@ namespace ttr::sles51256
             runtime.replaceFunction(0x0026B150u, &traceFmvDraw);
             std::cout << "[ttr] FMV tracing enabled" << std::endl;
         }
-        if (traceEnabled("dma") || frameDumpConfig().enabled)
+        if (traceEnabled("dma") || frameDumpConfig().enabled || std::getenv("TTR_GS_DUMP"))
         {
             runtime.replaceFunction(0x00106290u, &traceVBlank);
         }

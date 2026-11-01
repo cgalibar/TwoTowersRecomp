@@ -14,6 +14,7 @@
 | `apply_patches.ps1` | Aplica la pila `patches/PS2Recomp/*.patch` al submódulo (idempotente; los scripts de build lo llaman) |
 | `export_patch.ps1` | Exporta como parche nuevo los cambios del submódulo que la pila todavía no cubre |
 | `disasm.py` | Desensamblado R5900 del ELF por símbolo o dirección; símbolos, referencias a globales de `$gp` |
+| `vu_disasm.py` | Desensamblado de microcódigo VU0/VU1 desde un volcado binario |
 | `irx_disasm.py` | Desensamblado R3000 de módulos IOP (IRX) a su dirección de carga |
 
 Ejecuta los scripts de Python con `-I` desde la raíz del repositorio usando el `.venv`.

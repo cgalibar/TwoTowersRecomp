@@ -121,3 +121,20 @@ out\build\win-clang-debug\TwoTowersRecomp\TwoTowersRecomp.exe [--game <carpeta-o
 
 Sin `--game`, el ejecutable busca `SLES_512.56` en `game\` junto al `.exe` y, en builds de desarrollo,
 en `TwoTowersRecompLib/private/disc/` subiendo desde la carpeta del ejecutable.
+
+### Controles
+
+Con un mando conectado (XInput/SDL a través de raylib) se usan sus sticks y botones. Con teclado:
+
+| Teclado | PS2 |
+| --- | --- |
+| W A S D | Stick izquierdo (movimiento) |
+| I J K L | Stick derecho (cámara) |
+| Flechas | Cruceta |
+| X / Espacio | Cruz |
+| C / Esc | Círculo |
+| Z | Cuadrado |
+| V | Triángulo |
+| Q / E | L1 / R1 |
+| Mayús izq. / Mayús der. | L2 / R2 |
+| Intro / Tab | Start / Select |

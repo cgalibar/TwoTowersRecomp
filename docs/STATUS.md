@@ -3,7 +3,8 @@
 [Inicio](../README.md) · [Compilación](BUILDING.md) · [Depuración](DEBUGGING.md)
 
 Fase: **en progreso**. Arranca, carga el prólogo, reproduce el vídeo de introducción y entra en el
-nivel: la simulación corre y se dibujan el cielo y el HUD, pero todavía no el mundo 3D. No es jugable.
+nivel: la simulación corre y se dibujan el mundo 3D, el cielo y el HUD. Falta comprobar el control con el
+mando y el sonido; todavía no se ha jugado una partida.
 
 ## Progreso del arranque
 
@@ -18,7 +19,8 @@ nivel: la simulación corre y se dibujan el cielo y el HUD, pero todavía no el 
 | Vídeo de introducción `MONT.FMV` (`ClFMV::playModal`) | ✅ imagen; ⚠️ se corta a los ~14 s porque su audio no se consume |
 | Nivel: actores, colisiones, partículas, guiones; microprogramas VU0 por VIF0 | ✅ |
 | Nivel: cielo y HUD (espada, "Defender", luna) | ✅ |
-| Nivel: terreno y personajes | ❌ no se dibujan |
+| Nivel: terreno, campo de batalla y cielo (plano de apertura del prólogo) | ✅ |
+| Nivel: personajes y control con el mando | pendiente de comprobar |
 | Mando, menú principal, sonido | pendiente |
 
 ## Problemas resueltos
@@ -71,11 +73,27 @@ El intérprete de VIF0 del runtime abandonaba el paquete en el primer `MSCAL` y 
 formato V4-32 sin máscaras. Parche `0003`: VIF0 ejecuta el microprograma con el intérprete VU0 del
 runtime (el mismo de `VCALLMS`) y comparte el `UNPACK` completo de VIF1. Con ello aparece el HUD.
 
+### Flags MAC de VU0 en modo macro (recompilador)
+
+El mundo no se dibujaba porque `ClWorldNode::drawRecursive` descartaba todos los nodos: la prueba
+`ClFrustum::isBoundingBoxVisible` hace `vsub.xyz $vf0, ...` y lee los bits de signo con
+`cfc2 $t0, $vi17` (flags MAC). El recompilador de PS2Recomp no actualizaba los flags MAC/STATUS en las
+instrucciones FMAC de modo macro y, además, escribía en `vf0` (en el hardware es constante y descarta
+las escrituras). Ahora `vu_translator.cpp` añade `PS2_VU0_SET_MAC` a ADD/SUB/MUL/MADD/MSUB, a sus
+variantes ACC y a OPMULA/OPMSUB, y descarta las escrituras a `vf0`. Lo mismo afectaba a
+`SfIsLineIntersection` (colisiones con líneas) y a `SfObjFullyContainedByNode`.
+
+### `sqrt.s` usaba el registro equivocado (recompilador)
+
+En el EE, `SQRT.S fd, ft` toma el operando del campo **ft** (fs vale 0); el recompilador usaba fs. Las
+452 raíces cuadradas del juego calculaban `sqrt($f0)`, así que `ClVector::normalize3d`, las distancias, la
+cámara y la física trabajaban con vectores sin normalizar. Corregido en `fpu_translator.cpp`.
+
 ## Siguiente
 
-1. Mundo 3D: averiguar por qué el terreno y los personajes no llegan al GS (ruta VIF1/VU1 y `XGKICK`).
+1. Jugar el prólogo con mando/teclado: comprobar movimiento (stick izquierdo), personajes y cámara.
 2. Audio del vídeo: el IOP deja de pedir bloques de sonido (`handleSoundBufferRequest`) tras ~36
-   peticiones, el buffer de audio se llena y bloquea el flujo de vídeo.
+   peticiones, el buffer de audio se llena y corta el vídeo a los ~14 s.
 3. Rendimiento: el intérprete VU0 ejecuta ~1 600 microprogramas por segundo (~2 000 ciclos cada uno).
 4. Salida de audio: llevar la mezcla del SPU2 al backend de audio del runtime (raylib).
 5. VBlank a 50 Hz: el runtime programa VBlanks NTSC (60 Hz) aunque el juego es PAL (`VMODE = PAL`).
@@ -87,3 +105,5 @@ runtime (el mismo de `VCALLMS`) y comparte el `UNPACK` completo de VIF1. Con ell
 - 29 parches de instrucción propuestos por el analizador como "posible código automodificable"; están
   aplicados (sustituidos por `nop`) pero sin revisar.
 - El juego lleva un intérprete **Lua** embebido (`luaV_execute`, `lua_State`) y clases `CYo*` / `Cl*`.
+- La cúpula del cielo es la que borra el Z-buffer cada frame (`ZTST ALWAYS`, `Z = sSkyDomeData+0x28`);
+  si no se dibuja, el mundo falla la prueba de profundidad (`GEQUAL`) y desaparece.

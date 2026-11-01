@@ -15,6 +15,8 @@ lenta. Los logs por registro del GS del runtime están desactivados por defecto
 | `TTR_TRACE=sound` | Streams de EA MultiStream (ver [notas/ea-sound.md](notes/ea-sound.md)) |
 | `TTR_TRACE=rpc` | `sceSifBindRpc`/`CallRpc`/`CheckStatRpc` cuando se llaman por la tabla de funciones |
 | `TTR_TRACE=fmv` | `ClFMV`: banderas de reproducción, callback "sin datos", peticiones de audio del vídeo y llenado de sus buffers (también en cada volcado de frame) |
+| `TTR_TRACE=camera` | Cámara y mundo: `ClCamera::projection`, `tanf`, `getZBufferValue`, `ClearScreen`, `ClPbi::clear`, matrices de `ClWorldDrawData::beginDraw` (avisa si la de dibujo no tiene X/Y), contadores de nodos del mundo y comprobación de `SfMatrixMultiplyVu0` contra C++ |
+| `TTR_GS_DUMP=<vblank>` | Activa el historial de depuración del GS durante 10 VBlanks y lista sus registros y primitivas |
 | `TTR_HACK_SKIP_BARD=1` | Hack: `ClGameSound::isBardStreamLoaded()` siempre devuelve true |
 | `PS2X_IOP_TRACE=1` | Trazas del IOP (parche `0001`): `cdvdman`, `ioman`, enlaces entre módulos, RPC |
 | `PS2X_IOP_CALLTRACE=<Mciclos>:<líneas>:<lo>-<hi>` | `jal`/`jalr` ejecutados en `[lo, hi)` a partir de un ciclo IOP |
@@ -28,6 +30,7 @@ Se pueden combinar: `TTR_TRACE=sound,dma`.
 | Herramienta | Uso |
 | --- | --- |
 | `tools/disasm.py <símbolo|dirección>` | Desensamblado R5900 del ELF; `--sym <dir>` resuelve a símbolo, `--find <texto>` busca símbolos, `--gpref=-0x7120` lista los accesos a una global relativa a `$gp` |
+| `tools/vu_disasm.py <volcado> [--start <dir>] [--count <n>]` | Desensamblado de microcódigo VU0/VU1 (pares upper/lower) de un volcado de memoria de código |
 | `tools/irx_disasm.py <IRX> --base <dir> <dir>` | Desensamblado R3000 de un módulo IOP tal como se carga; `--imports`, `--strings` |
 | `TwoTowersRecomp/game/sles_51256_trace.cpp` | Wrappers de funciones del juego: registra y llama a la función generada |
 
