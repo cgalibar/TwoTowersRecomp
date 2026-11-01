@@ -1,6 +1,7 @@
 // TwoTowersRecomp entry point.
 // Based on ps2xRuntime/src/main.cpp from PS2Recomp (GPL-3.0).
 #include "bios/bios_rom.h"
+#include "debug/sampling_profiler.h"
 #include "ps2_runtime.h"
 #if defined(PS2X_ENABLE_DEBUG_UI)
 #include "ps2_debug_panel.h"
@@ -188,6 +189,7 @@ int main(int argc, char *argv[])
         std::cout << "Warning: built without generated guest code; the function table is empty." << std::endl;
 #endif
         configureBios(argc, argv);
+        ttr::debug::startSamplingProfilerFromEnvironment();
 
         PS2Runtime runtime;
 #if defined(PS2X_ENABLE_DEBUG_UI)

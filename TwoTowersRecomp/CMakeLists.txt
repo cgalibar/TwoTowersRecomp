@@ -2,12 +2,16 @@ add_executable(TwoTowersRecomp
     main.cpp
     bios/bios_rom.cpp
     debug/frame_dump.cpp
+    debug/sampling_profiler.cpp
     game/sles_51256_overrides.cpp
     game/sles_51256_trace.cpp
 )
 
 target_include_directories(TwoTowersRecomp PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(TwoTowersRecomp PRIVATE TwoTowersRecompLib ps2_runtime)
+if(WIN32)
+    target_link_libraries(TwoTowersRecomp PRIVATE dbghelp)
+endif()
 
 target_compile_definitions(TwoTowersRecomp PRIVATE
     TTR_VERSION="${PROJECT_VERSION}"
@@ -24,6 +28,8 @@ if(MSVC)
     # raylib's CloseWindow clashes with the WinAPI symbol on x64 (same workaround as ps2EntryRunner).
     target_link_options(TwoTowersRecomp PRIVATE "/FORCE:MULTIPLE")
     target_compile_options(TwoTowersRecomp PRIVATE /utf-8)
+    # The debug switches are read with std::getenv on purpose.
+    target_compile_definitions(TwoTowersRecomp PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
 # FFmpeg DLLs for the runtime's MPEG/IPU path.

@@ -89,12 +89,31 @@ En el EE, `SQRT.S fd, ft` toma el operando del campo **ft** (fs vale 0); el reco
 452 raíces cuadradas del juego calculaban `sqrt($f0)`, así que `ClVector::normalize3d`, las distancias, la
 cámara y la física trabajaban con vectores sin normalizar. Corregido en `fpu_translator.cpp`.
 
+## Rendimiento
+
+Medido en el nivel del prólogo con un Ryzen 5 3600X (`TTR_FRAME_DUMP` + `t=`, build `RelWithDebInfo`):
+
+| Cambio | VBlanks/s |
+| --- | --- |
+| Punto de partida (todo en el hilo del EE) | 5,8 |
+| IOP y temporizadores del EE por lotes de 4096 ciclos (parche `0005`) | 6,7 |
+| Rasterizador del GS en 6 hilos (parche `0005`) | 17,4 |
+
+El VBlank exige a la vez 16,7 ms de reloj real y ~4,9 M ciclos del EE cobrados por el código generado, así
+que la velocidad del juego depende del tiempo de CPU por frame. El perfilador (`TTR_PROFILE`) mostraba un
+único hilo al 99 %: el código del juego, el intérprete de VU1, el IOP y el rasterizador del GS (sprites de
+pantalla completa del posproceso: ~45 % del total). El código generado cobra 8 ciclos por llamada y 32 por
+arista de bucle, y cada cobro ejecutaba el planificador completo del IOP (hilos, DMA, SPU2, temporizadores)
+para 1-4 ciclos del IOP. La build `Release` añade un 15-25 %.
+
 ## Siguiente
 
-1. Jugar el prólogo con mando/teclado: comprobar movimiento (stick izquierdo), personajes y cámara.
-2. Audio del vídeo: el IOP deja de pedir bloques de sonido (`handleSoundBufferRequest`) tras ~36
+1. Rendimiento: el hilo del EE sigue al 98 % (intérprete de VU1 ~13 %, su parte del GS y las primitivas
+   pequeñas). Faltan unas 3 veces para ir a velocidad real: GS asíncrono en su propio hilo, intérprete de VU1
+   más barato.
+2. Jugar el prólogo con mando/teclado: comprobar movimiento (stick izquierdo), personajes y cámara.
+3. Audio del vídeo: el IOP deja de pedir bloques de sonido (`handleSoundBufferRequest`) tras ~36
    peticiones, el buffer de audio se llena y corta el vídeo a los ~14 s.
-3. Rendimiento: el intérprete VU0 ejecuta ~1 600 microprogramas por segundo (~2 000 ciclos cada uno).
 4. Salida de audio: llevar la mezcla del SPU2 al backend de audio del runtime (raylib).
 5. VBlank a 50 Hz: el runtime programa VBlanks NTSC (60 Hz) aunque el juego es PAL (`VMODE = PAL`).
 

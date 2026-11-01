@@ -25,6 +25,8 @@ set_property(CACHE TTR_X64_ARCH PROPERTY STRINGS AVX AVX2)
 if(MSVC)
     add_compile_options("/arch:${TTR_X64_ARCH}")
 endif()
+# PS2Recomp's Release mode would otherwise build the runtime with AVX2.
+set(PS2X_RELEASE_ARCH "${TTR_X64_ARCH}" CACHE STRING "" FORCE)
 
 if(NOT EXISTS "${TTR_PS2RECOMP_DIR}/ps2xRuntime/CMakeLists.txt")
     message(FATAL_ERROR

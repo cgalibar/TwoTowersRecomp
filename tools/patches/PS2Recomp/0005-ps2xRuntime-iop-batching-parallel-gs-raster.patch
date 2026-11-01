@@ -1,0 +1,673 @@
+diff --git a/ps2xRuntime/cmake/ReleaseMode.cmake b/ps2xRuntime/cmake/ReleaseMode.cmake
+index 92ef0d5..9b4dd18 100644
+--- a/ps2xRuntime/cmake/ReleaseMode.cmake
++++ b/ps2xRuntime/cmake/ReleaseMode.cmake
+@@ -2,6 +2,8 @@ include(CheckIPOSupported)
+ 
+ check_ipo_supported(RESULT IPO_SUPPORTED OUTPUT IPO_ERROR)
+ 
++set(PS2X_RELEASE_ARCH "AVX2" CACHE STRING "x64 /arch baseline of the optimized Release targets")
++
+ function(EnableFastReleaseMode TargetName)
+     message("> Enabling optimization for: ${TargetName}")
+     if(MSVC)
+@@ -15,14 +17,23 @@ function(EnableFastReleaseMode TargetName)
+                 /Gw # global data in COMDAT
+                 /GF # string pooling
+                 /Zc:inline # remove unreferenced inline
+-                /fp:fast # fast math (graphics friendly)
+                 /DNDEBUG
+-                /arch:AVX2 # Advanced Vector Extensions 2
++                /arch:${PS2X_RELEASE_ARCH} # Advanced Vector Extensions
+                 /GS- # Disable Buffer Security Check (faster)
+-                /Qspectre- # Disable Spectre mitigations (faster)
+             >
+         )
+ 
++        # clang-cl has no /Qspectre-, and its /fp:fast is -ffast-math, which assumes no NaN/Inf
++        # and folds away the checks of the FPU/VU macros.
++        if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
++            target_compile_options(${TargetName} PRIVATE
++                $<$<CONFIG:Release>:
++                    /fp:fast # fast math (graphics friendly)
++                    /Qspectre- # Disable Spectre mitigations (faster)
++                >
++            )
++        endif()
++
+         if(TARGET ${TargetName})
+             target_link_options(${TargetName} PRIVATE
+                 $<$<CONFIG:Release>:
+@@ -39,4 +50,4 @@ function(EnableFastReleaseMode TargetName)
+     else()
+         message(WARNING "Interprocedural optimization not supported: ${ipo_error}")
+     endif()
+-endfunction()
+\ No newline at end of file
++endfunction()
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index 81a1162..479961c 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -268,6 +268,9 @@ public:
+     static constexpr uint32_t kGeneratedCheckpointCycles = 32u;
+     static constexpr uint32_t kGuestDispatchCycles = 8u;
+     static constexpr uint64_t kDefaultTimeSliceCycles = 65536ull;
++    // The EE timers and the IOP catch up with the EE clock in batches of this many cycles (~14 us):
++    // generated code charges 8-32 cycles per call or loop edge, far too little to run the IOP scheduler for.
++    static constexpr uint64_t kDeviceCatchUpCycles = 4096ull;
+ 
+     explicit EeScheduler(PS2Runtime &runtime);
+     ~EeScheduler();
+@@ -281,6 +284,8 @@ public:
+     void postEvent(EeEvent event);
+     [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept;
+     void accountCycles(uint32_t cycles) noexcept;
++    // Applies the cycles accountCycles() has not yet passed to the EE timers and the IOP.
++    void catchUpDevices() noexcept;
+     [[nodiscard]] bool isExecutingGuest() const noexcept;
+ 
+     // Kernel object API. All calls except postEvent/requestStop execute on the
+@@ -431,6 +436,7 @@ private:
+     bool m_insideInterrupt = false;
+     uint32_t m_pendingEeTimerInterrupts = 0;
+     uint64_t m_eeCycle = 0;
++    uint64_t m_deviceCyclesPending = 0;
+     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
+     std::thread::id m_executorThread{};
+     std::atomic<bool> m_running{false};
+diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+index 2421f9e..eb6fd28 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+@@ -4,13 +4,18 @@
+ #include "runtime/gs/gs_texture_page_cache.h"
+ 
+ #include <array>
++#include <cstdint>
++#include <memory>
+ #include <mutex>
+ #include <vector>
+ 
++class GSRasterWorkers;
++
+ class GSCpuBackend final : public GSRasterBackend
+ {
+ public:
+     GSCpuBackend();
++    ~GSCpuBackend() override;
+ 
+     void Initialize(uint8_t *vram, uint32_t vramSize) override;
+     void Reset() override;
+@@ -37,15 +42,19 @@ private:
+     void ResetUnlocked();
+     void LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut);
+     uint32_t ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
+-    uint32_t ReadTextureVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y);
++    uint32_t ReadTextureVramUnlocked(GSMem::TexturePageCache &cache, uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y);
+     void WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
+ 
+     void DrawPrimitive(const GSPrimitiveBatch &batch);
+     void DrawSprite(const GSPrimitiveBatch &batch);
+     void DrawTriangle(const GSPrimitiveBatch &batch);
+     void DrawLine(const GSPrimitiveBatch &batch);
++    // Calls rows(first, last, textureCache) over [firstRow, lastRow]: in one go for small primitives, or in bands
++    // spread over the raster workers. Every pixel is still written by one thread, in primitive order.
++    template <typename RowsFn>
++    void ForEachRowBand(int firstRow, int lastRow, uint64_t area, RowsFn &&rows);
+     void WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog);
+-    uint32_t SampleTexture(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v);
++    uint32_t SampleTexture(const GSDrawState &state, GSMem::TexturePageCache &cache, float s, float t, float q, uint16_t u, uint16_t v);
+     uint32_t LookupCLUT(const GSDrawState &state, uint8_t index, uint8_t cpsm, uint8_t csm, uint8_t csa, uint8_t sourcePsm);
+ 
+     void PerformLocalToLocalTransfer();
+@@ -73,6 +82,8 @@ private:
+     std::array<uint16_t, 512> m_clut{};
+     std::array<uint32_t, 2> m_clutCbp{};
+     GSMem::TexturePageCache m_texturePageCache;
++    std::vector<GSMem::TexturePageCache> m_workerTextureCaches;
++    std::unique_ptr<GSRasterWorkers> m_rasterWorkers;
+ 
+     GSTransferCommand m_transfer{};
+     GSTransferSnapshot m_transferState{};
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 086d0e2..85761f3 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -114,6 +114,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+     m_insideInterrupt = false;
+     m_pendingEeTimerInterrupts = 0u;
+     m_eeCycle = 0u;
++    m_deviceCyclesPending = 0u;
+     m_sliceEndCycle = kDefaultTimeSliceCycles;
+     m_stopRequested.store(false, std::memory_order_release);
+     m_checkpointPending.store(false, std::memory_order_release);
+@@ -394,6 +395,21 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+ {
+     const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
+     m_eeCycle += elapsed;
++    m_deviceCyclesPending += elapsed;
++    if (m_deviceCyclesPending >= kDeviceCatchUpCycles)
++    {
++        catchUpDevices();
++    }
++}
++
++void EeScheduler::catchUpDevices() noexcept
++{
++    const uint64_t elapsed = m_deviceCyclesPending;
++    if (elapsed == 0u)
++    {
++        return;
++    }
++    m_deviceCyclesPending = 0u;
+     m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
+     m_runtime.advanceIopEeCycles(elapsed);
+     if (m_pendingEeTimerInterrupts != 0u)
+@@ -2024,6 +2040,8 @@ void EeScheduler::writeGuestU32(uint32_t address, uint32_t value)
+ 
+ void EeScheduler::waitForEvent()
+ {
++    // Before idling, bring the timers and the IOP up to date (outside the lock: the IOP posts events).
++    catchUpDevices();
+     std::unique_lock lock(m_eventMutex);
+     if (!m_events.empty() || m_stopRequested.load(std::memory_order_acquire))
+     {
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index f0ad507..7382c47 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -10,13 +10,145 @@
+ #include <algorithm>
+ #include <cmath>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <fstream>
+ #include <iostream>
+ #include <stdexcept>
++#include <thread>
++#if defined(_M_X64) || defined(__x86_64__)
++#include <immintrin.h>
++#endif
+ 
+ using namespace GSInternal;
+ 
++namespace
++{
++    void cpuRelax()
++    {
++#if defined(_M_X64) || defined(__x86_64__)
++        _mm_pause();
++#else
++        std::this_thread::yield();
++#endif
++    }
++
++    // PS2X_GS_THREADS overrides the number of extra rasterizer threads (0 draws everything on the GS caller).
++    unsigned rasterWorkerCount()
++    {
++        if (const char *env = std::getenv("PS2X_GS_THREADS"))
++            return static_cast<unsigned>(std::clamp(std::atoi(env), 0, 15));
++        // Leave cores for the EE thread, the host window and audio.
++        const unsigned hardware = std::thread::hardware_concurrency();
++        return hardware >= 4u ? std::min(7u, hardware / 2u - 1u) : 0u;
++    }
++}
++
++// Fork-join workers for large primitives. run() hands bands out to the calling thread (slot 0) and to the
++// workers (slots 1..workerCount()) and returns once every band is drawn.
++class GSRasterWorkers
++{
++public:
++    explicit GSRasterWorkers(unsigned workerCount)
++    {
++        m_threads.reserve(workerCount);
++        for (unsigned slot = 1u; slot <= workerCount; ++slot)
++            m_threads.emplace_back([this, slot]()
++                                   { workerLoop(slot); });
++    }
++
++    ~GSRasterWorkers()
++    {
++        m_stop.store(true, std::memory_order_release);
++        m_work.fetch_add(kGenerationOne, std::memory_order_acq_rel);
++        m_work.notify_all();
++        for (std::thread &thread : m_threads)
++            thread.join();
++    }
++
++    unsigned workerCount() const
++    {
++        return static_cast<unsigned>(m_threads.size());
++    }
++
++    template <typename Job>
++    void run(unsigned bands, Job &job)
++    {
++        m_context = &job;
++        m_invoke = [](void *context, unsigned band, unsigned slot)
++        { (*static_cast<Job *>(context))(band, slot); };
++        m_remaining.store(bands, std::memory_order_relaxed);
++        const uint64_t generation = (m_work.load(std::memory_order_relaxed) & kGenerationMask) + kGenerationOne;
++        m_work.store(generation | (static_cast<uint64_t>(bands) << kCountShift), std::memory_order_release);
++        m_work.notify_all();
++
++        claimBands(0u);
++
++        uint32_t remaining = m_remaining.load(std::memory_order_acquire);
++        for (uint32_t spin = 0u; remaining != 0u && spin < kSpinIterations; ++spin)
++        {
++            cpuRelax();
++            remaining = m_remaining.load(std::memory_order_acquire);
++        }
++        while (remaining != 0u)
++        {
++            m_remaining.wait(remaining, std::memory_order_acquire);
++            remaining = m_remaining.load(std::memory_order_acquire);
++        }
++    }
++
++private:
++    // m_work packs the generation (bits 32-63), the band count (16-31) and the next unclaimed band (0-15).
++    // A band is claimed with a CAS on the whole word, so a late worker can never claim one of an older run.
++    static constexpr uint64_t kGenerationOne = 1ull << 32u;
++    static constexpr uint64_t kGenerationMask = ~(kGenerationOne - 1ull);
++    static constexpr unsigned kCountShift = 16u;
++    // Roughly 50 us of spinning before a thread sleeps: primitives come in bursts.
++    static constexpr uint32_t kSpinIterations = 4096u;
++
++    static bool hasUnclaimedBand(uint64_t work)
++    {
++        return (work & 0xFFFFu) < ((work >> kCountShift) & 0xFFFFu);
++    }
++
++    void claimBands(unsigned slot)
++    {
++        uint64_t work = m_work.load(std::memory_order_acquire);
++        while (hasUnclaimedBand(work))
++        {
++            if (!m_work.compare_exchange_weak(work, work + 1u, std::memory_order_acq_rel, std::memory_order_acquire))
++                continue;
++            m_invoke(m_context, static_cast<unsigned>(work & 0xFFFFu), slot);
++            if (m_remaining.fetch_sub(1u, std::memory_order_acq_rel) == 1u)
++                m_remaining.notify_all();
++            work = m_work.load(std::memory_order_acquire);
++        }
++    }
++
++    void workerLoop(unsigned slot)
++    {
++        for (;;)
++        {
++            claimBands(slot);
++            const uint64_t seen = m_work.load(std::memory_order_acquire);
++            if (m_stop.load(std::memory_order_acquire))
++                return;
++            if (hasUnclaimedBand(seen))
++                continue;
++            for (uint32_t spin = 0u; spin < kSpinIterations && m_work.load(std::memory_order_relaxed) == seen; ++spin)
++                cpuRelax();
++            m_work.wait(seen, std::memory_order_acquire);
++        }
++    }
++
++    std::vector<std::thread> m_threads;
++    std::atomic<uint64_t> m_work{0u};
++    std::atomic<uint32_t> m_remaining{0u};
++    std::atomic<bool> m_stop{false};
++    void (*m_invoke)(void *, unsigned, unsigned) = nullptr;
++    void *m_context = nullptr;
++};
++
+ namespace
+ {
+     float fabsQ(float q)
+@@ -511,8 +643,17 @@ GSCpuBackend::GSCpuBackend()
+         }
+     }
+     Reset();
++
++    const unsigned workers = rasterWorkerCount();
++    if (workers != 0u)
++    {
++        m_workerTextureCaches.resize(workers);
++        m_rasterWorkers = std::make_unique<GSRasterWorkers>(workers);
++    }
+ }
+ 
++GSCpuBackend::~GSCpuBackend() = default;
++
+ void GSCpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
+ {
+     if (vram && vramSize < GSMem::MEMORY_SIZE)
+@@ -622,7 +763,7 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
+             sourceY = static_cast<uint32_t>(texclut.cov);
+         }
+ 
+-        const uint32_t raw = ReadTextureVramUnlocked(tex0.cpsm, tex0.cbp, sourceWidth, sourceX, sourceY); 
++        const uint32_t raw = ReadTextureVramUnlocked(m_texturePageCache, tex0.cpsm, tex0.cbp, sourceWidth, sourceX, sourceY);
+         const uint32_t destination = (loadCsm1Suffix ? entry : destinationBase + entry) & (sixteenBit ? 0x1FFu : 0x0FFu);
+         if (sixteenBit)
+         {
+@@ -665,12 +806,12 @@ uint32_t GSCpuBackend::ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw
+     return m_readVramFuncs[psm & 0x3Fu](m_vram, base, bw, x, y);
+ }
+ 
+-uint32_t GSCpuBackend::ReadTextureVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y)
++uint32_t GSCpuBackend::ReadTextureVramUnlocked(GSMem::TexturePageCache &cache, uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y)
+ {
+     if (!m_vram)
+         return 0u;
+ 
+-    return GSMem::ReadTexture(m_texturePageCache, m_vram, psm, base, bw, x, y);
++    return GSMem::ReadTexture(cache, m_vram, psm, base, bw, x, y);
+ }
+ 
+ void GSCpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
+@@ -1055,7 +1196,7 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
+     return 0xFFFF00FFu;
+ }
+ 
+-uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v)
++uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, GSMem::TexturePageCache &cache, float s, float t, float q, uint16_t u, uint16_t v)
+ {
+     const auto &ctx = state.context;
+     const auto &tex = ctx.tex0;
+@@ -1088,7 +1229,7 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+         sampleU = wrapTextureCoordinate(sampleU, texW, wrapU, minU, maxU);
+         sampleV = wrapTextureCoordinate(sampleV, texH, wrapV, minV, maxV);
+ 
+-        u32 out = ReadTextureVramUnlocked(tex.psm, tex.tbp0, tex.tbw, sampleU, sampleV);
++        u32 out = ReadTextureVramUnlocked(cache, tex.psm, tex.tbp0, tex.tbw, sampleU, sampleV);
+ 
+         switch (tex.psm)
+         {
+@@ -1159,6 +1300,39 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+            (static_cast<uint32_t>(a) << 24);
+ }
+ 
++template <typename RowsFn>
++void GSCpuBackend::ForEachRowBand(int firstRow, int lastRow, uint64_t area, RowsFn &&rows)
++{
++    constexpr uint64_t kMinParallelPixels = 4096u;
++    constexpr int kMinBandRows = 4;
++    const int rowCount = lastRow - firstRow + 1;
++    if (!m_rasterWorkers || area < kMinParallelPixels || rowCount < 2 * kMinBandRows)
++    {
++        rows(firstRow, lastRow, m_texturePageCache);
++        return;
++    }
++
++    // About four bands per thread, so the threads that finish early pick up the rest.
++    const int threads = static_cast<int>(m_rasterWorkers->workerCount()) + 1;
++    const int bandRows = std::max(kMinBandRows, (rowCount + threads * 4 - 1) / (threads * 4));
++    const unsigned bands = static_cast<unsigned>((rowCount + bandRows - 1) / bandRows);
++    auto band = [&](unsigned index, unsigned slot)
++    {
++        const int first = firstRow + static_cast<int>(index) * bandRows;
++        const int last = std::min(lastRow, first + bandRows - 1);
++        if (slot == 0u)
++        {
++            rows(first, last, m_texturePageCache);
++            return;
++        }
++        // A worker's page copy may predate what the previous primitives drew.
++        GSMem::TexturePageCache &cache = m_workerTextureCaches[slot - 1u];
++        cache.Invalidate();
++        rows(first, last, cache);
++    };
++    m_rasterWorkers->run(bands, band);
++}
++
+ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+ {
+     const GSDrawState &state = batch.state;
+@@ -1202,6 +1376,7 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+     const uint8_t alphaFix = static_cast<uint8_t>((alphaReg >> 32) & 0xFFu);
+ 
+     uint8_t r = v1.r, g = v1.g, b = v1.b, a = v1.a;
++    const uint64_t area = static_cast<uint64_t>(drawX1 - drawX0 + 1) * static_cast<uint64_t>(drawY1 - drawY0 + 1);
+ 
+     if (state.prim.tme)
+     {
+@@ -1234,44 +1409,52 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+         if (spriteH < 1.0f)
+             spriteH = 1.0f;
+ 
+-        for (int y = drawY0; y <= drawY1; ++y)
++        auto drawRows = [&](int firstRow, int lastRow, GSMem::TexturePageCache &cache)
+         {
+-            float ty = (static_cast<float>(y - unclippedY0) + 0.5f) / spriteH;
+-            float texVf = v0f + (v1f - v0f) * ty;
+-
+-            for (int x = drawX0; x <= drawX1; ++x)
++            for (int y = firstRow; y <= lastRow; ++y)
+             {
+-                float tx = (static_cast<float>(x - unclippedX0) + 0.5f) / spriteW;
+-                float texUf = u0f + (u1f - u0f) * tx;
+-                uint32_t texel = 0xFFFF00FFu;
+-                if (state.prim.fst)
+-                {
+-                    const int fixedU = static_cast<int>((texUf * 16.0f) + 0.5f);
+-                    const int fixedV = static_cast<int>((texVf * 16.0f) + 0.5f);
+-                    const uint16_t sampleU = static_cast<uint16_t>(clampInt(fixedU, 0, 0xFFFF));
+-                    const uint16_t sampleV = static_cast<uint16_t>(clampInt(fixedV, 0, 0xFFFF));
+-                    texel = SampleTexture(state, 0.0f, 0.0f, 1.0f, sampleU, sampleV);
+-                }
+-                else
++                float ty = (static_cast<float>(y - unclippedY0) + 0.5f) / spriteH;
++                float texVf = v0f + (v1f - v0f) * ty;
++
++                for (int x = drawX0; x <= drawX1; ++x)
+                 {
+-                    texel = SampleTexture(state, texUf / static_cast<float>(texW), texVf / static_cast<float>(texH), 1.0f, 0u, 0u);
++                    float tx = (static_cast<float>(x - unclippedX0) + 0.5f) / spriteW;
++                    float texUf = u0f + (u1f - u0f) * tx;
++                    uint32_t texel = 0xFFFF00FFu;
++                    if (state.prim.fst)
++                    {
++                        const int fixedU = static_cast<int>((texUf * 16.0f) + 0.5f);
++                        const int fixedV = static_cast<int>((texVf * 16.0f) + 0.5f);
++                        const uint16_t sampleU = static_cast<uint16_t>(clampInt(fixedU, 0, 0xFFFF));
++                        const uint16_t sampleV = static_cast<uint16_t>(clampInt(fixedV, 0, 0xFFFF));
++                        texel = SampleTexture(state, cache, 0.0f, 0.0f, 1.0f, sampleU, sampleV);
++                    }
++                    else
++                    {
++                        texel = SampleTexture(state, cache, texUf / static_cast<float>(texW), texVf / static_cast<float>(texH), 1.0f, 0u, 0u);
++                    }
++
++                    uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
++                    uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
++                    uint8_t tb = static_cast<uint8_t>((texel >> 16) & 0xFF);
++                    uint8_t ta = static_cast<uint8_t>((texel >> 24) & 0xFF);
++
++                    const TextureCombineResult color = combineTexture(tex, r, g, b, a, tr, tg, tb, ta);
++                    WritePixel(state, x, y, z1, color.r, color.g, color.b, color.a, v1.fog);
+                 }
+-
+-                uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
+-                uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
+-                uint8_t tb = static_cast<uint8_t>((texel >> 16) & 0xFF);
+-                uint8_t ta = static_cast<uint8_t>((texel >> 24) & 0xFF);
+-
+-                const TextureCombineResult color = combineTexture(tex, r, g, b, a, tr, tg, tb, ta);
+-                WritePixel(state, x, y, z1, color.r, color.g, color.b, color.a, v1.fog);
+             }
+-        }
++        };
++        ForEachRowBand(drawY0, drawY1, area, drawRows);
+     }
+     else
+     {
+-        for (int y = drawY0; y <= drawY1; ++y)
+-            for (int x = drawX0; x <= drawX1; ++x)
+-                WritePixel(state, x, y, z1, r, g, b, a, v1.fog);
++        auto drawRows = [&](int firstRow, int lastRow, GSMem::TexturePageCache &)
++        {
++            for (int y = firstRow; y <= lastRow; ++y)
++                for (int x = drawX0; x <= drawX1; ++x)
++                    WritePixel(state, x, y, z1, r, g, b, a, v1.fog);
++        };
++        ForEachRowBand(drawY0, drawY1, area, drawRows);
+     }
+ }
+ 
+@@ -1311,86 +1494,91 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+     const float invAbsDenom = 1.0f / std::fabs(denom);
+     constexpr float kEdgeEpsilon = 1.0e-4f;
+ 
+-    for (int y = minY; y <= maxY; ++y)
++    const uint64_t area = static_cast<uint64_t>(maxX - minX + 1) * static_cast<uint64_t>(maxY - minY + 1);
++    auto drawRows = [&](int firstRow, int lastRow, GSMem::TexturePageCache &cache)
+     {
+-        float py = static_cast<float>(y) + 0.5f;
+-        for (int x = minX; x <= maxX; ++x)
++        for (int y = firstRow; y <= lastRow; ++y)
+         {
+-            float px = static_cast<float>(x) + 0.5f;
+-
+-            float w0 = (((fy1 - fy2) * (px - fx2) + (fx2 - fx1) * (py - fy2)) * winding) * invAbsDenom;
+-            float w1 = (((fy2 - fy0) * (px - fx2) + (fx0 - fx2) * (py - fy2)) * winding) * invAbsDenom;
+-            float w2 = 1.0f - w0 - w1;
++            float py = static_cast<float>(y) + 0.5f;
++            for (int x = minX; x <= maxX; ++x)
++            {
++                float px = static_cast<float>(x) + 0.5f;
+ 
+-            if (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon)
+-                continue;
++                float w0 = (((fy1 - fy2) * (px - fx2) + (fx2 - fx1) * (py - fy2)) * winding) * invAbsDenom;
++                float w1 = (((fy2 - fy0) * (px - fx2) + (fx0 - fx2) * (py - fy2)) * winding) * invAbsDenom;
++                float w2 = 1.0f - w0 - w1;
+ 
+-            double z = v0.z * w0 + v1.z * w1 + v2.z * w2;
++                if (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon)
++                    continue;
+ 
+-            uint8_t r, g, b, a;
+-            if (state.prim.iip)
+-            {
+-                r = clampU8(static_cast<int>(v0.r * w0 + v1.r * w1 + v2.r * w2));
+-                g = clampU8(static_cast<int>(v0.g * w0 + v1.g * w1 + v2.g * w2));
+-                b = clampU8(static_cast<int>(v0.b * w0 + v1.b * w1 + v2.b * w2));
+-                a = clampU8(static_cast<int>(v0.a * w0 + v1.a * w1 + v2.a * w2));
+-            }
+-            else
+-            {
+-                r = v2.r;
+-                g = v2.g;
+-                b = v2.b;
+-                a = v2.a;
+-            }
++                double z = v0.z * w0 + v1.z * w1 + v2.z * w2;
+ 
+-            if (state.prim.tme)
+-            {
+-                float is, it, iq;
+-                uint16_t iu, iv;
+-                if (state.prim.fst)
++                uint8_t r, g, b, a;
++                if (state.prim.iip)
+                 {
+-                    iu = static_cast<uint16_t>(v0.u * w0 + v1.u * w1 + v2.u * w2);
+-                    iv = static_cast<uint16_t>(v0.v * w0 + v1.v * w1 + v2.v * w2);
+-                    is = 0.0f;
+-                    it = 0.0f;
+-                    iq = 1.0f;
++                    r = clampU8(static_cast<int>(v0.r * w0 + v1.r * w1 + v2.r * w2));
++                    g = clampU8(static_cast<int>(v0.g * w0 + v1.g * w1 + v2.g * w2));
++                    b = clampU8(static_cast<int>(v0.b * w0 + v1.b * w1 + v2.b * w2));
++                    a = clampU8(static_cast<int>(v0.a * w0 + v1.a * w1 + v2.a * w2));
+                 }
+                 else
+                 {
+-                    // The GS DDA interpolates the homogeneous S, T and Q
+-                    // values. Texel coordinates are calculated from S/Q and
+-                    // T/Q only after interpolation.
+-                    is = v0.s * w0 + v1.s * w1 + v2.s * w2;
+-                    it = v0.t * w0 + v1.t * w1 + v2.t * w2;
+-                    iq = v0.q * w0 + v1.q * w1 + v2.q * w2;
+-                    iu = 0;
+-                    iv = 0;
++                    r = v2.r;
++                    g = v2.g;
++                    b = v2.b;
++                    a = v2.a;
+                 }
+ 
+-                uint32_t texel = SampleTexture(state, is, it, iq, iu, iv);
+-
+-                uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
+-                uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
+-                uint8_t tb = static_cast<uint8_t>((texel >> 16) & 0xFF);
+-                uint8_t ta = static_cast<uint8_t>((texel >> 24) & 0xFF);
+-
+-                const auto &tex = ctx.tex0;
+-                const uint8_t shadeR = r;
+-                const uint8_t shadeG = g;
+-                const uint8_t shadeB = b;
+-                const uint8_t shadeA = a;
+-                const TextureCombineResult color = combineTexture(tex, shadeR, shadeG, shadeB, shadeA, tr, tg, tb, ta);
++                if (state.prim.tme)
++                {
++                    float is, it, iq;
++                    uint16_t iu, iv;
++                    if (state.prim.fst)
++                    {
++                        iu = static_cast<uint16_t>(v0.u * w0 + v1.u * w1 + v2.u * w2);
++                        iv = static_cast<uint16_t>(v0.v * w0 + v1.v * w1 + v2.v * w2);
++                        is = 0.0f;
++                        it = 0.0f;
++                        iq = 1.0f;
++                    }
++                    else
++                    {
++                        // The GS DDA interpolates the homogeneous S, T and Q
++                        // values. Texel coordinates are calculated from S/Q and
++                        // T/Q only after interpolation.
++                        is = v0.s * w0 + v1.s * w1 + v2.s * w2;
++                        it = v0.t * w0 + v1.t * w1 + v2.t * w2;
++                        iq = v0.q * w0 + v1.q * w1 + v2.q * w2;
++                        iu = 0;
++                        iv = 0;
++                    }
++
++                    uint32_t texel = SampleTexture(state, cache, is, it, iq, iu, iv);
++
++                    uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
++                    uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
++                    uint8_t tb = static_cast<uint8_t>((texel >> 16) & 0xFF);
++                    uint8_t ta = static_cast<uint8_t>((texel >> 24) & 0xFF);
++
++                    const auto &tex = ctx.tex0;
++                    const uint8_t shadeR = r;
++                    const uint8_t shadeG = g;
++                    const uint8_t shadeB = b;
++                    const uint8_t shadeA = a;
++                    const TextureCombineResult color = combineTexture(tex, shadeR, shadeG, shadeB, shadeA, tr, tg, tb, ta);
++
++                    r = color.r;
++                    g = color.g;
++                    b = color.b;
++                    a = color.a;
++                }
+ 
+-                r = color.r;
+-                g = color.g;
+-                b = color.b;
+-                a = color.a;
++                const uint8_t fog = clampU8(static_cast<int>(v0.fog * w0 + v1.fog * w1 + v2.fog * w2));
++                WritePixel(state, x, y, static_cast<u32>(z + 0.5), r, g, b, a, fog);
+             }
+-
+-            const uint8_t fog = clampU8(static_cast<int>(v0.fog * w0 + v1.fog * w1 + v2.fog * w2));
+-            WritePixel(state, x, y, static_cast<u32>(z + 0.5), r, g, b, a, fog);
+         }
+-    }
++    };
++    ForEachRowBand(minY, maxY, area, drawRows);
+ }
+ 
+ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)

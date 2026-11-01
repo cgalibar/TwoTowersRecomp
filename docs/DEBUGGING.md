@@ -2,15 +2,17 @@
 
 [Inicio](../README.md) · [Compilación](BUILDING.md) · [Estado](STATUS.md)
 
-Usa la build `win-clang-relwithdebinfo` para ejecutar a velocidad razonable; la `Debug` es unas 10 veces más
-lenta. Los logs por registro del GS del runtime están desactivados por defecto
-(`-DTTR_VERBOSE_RUNTIME_LOGS=ON` los activa).
+Usa la build `win-clang-relwithdebinfo` para depurar y perfilar: tiene símbolos y va casi tan rápida como la
+`Release` (un 15-25 % más lenta); la `Debug` es unas 10 veces más lenta. Los logs por registro del GS del
+runtime están desactivados por defecto (`-DTTR_VERBOSE_RUNTIME_LOGS=ON` los activa).
 
 ## Variables de entorno
 
 | Variable | Efecto |
 | --- | --- |
-| `TTR_FRAME_DUMP=<carpeta>` | Guarda el frame presentado como PNG cada `TTR_FRAME_DUMP_EVERY` VBlanks (50 por defecto) y registra el modo de `ClGame` y los hilos del EE y del IOP |
+| `TTR_FRAME_DUMP=<carpeta>` | Guarda el frame presentado como PNG cada `TTR_FRAME_DUMP_EVERY` VBlanks (50 por defecto) y registra el tiempo real transcurrido (`t=`, sirve para medir VBlanks por segundo), el modo de `ClGame` y los hilos del EE y del IOP |
+| `TTR_PROFILE=<segundos>` | Perfilador por muestreo (Windows): toma el puntero de instrucción de todos los hilos cada milisegundo y, cada `<segundos>`, imprime las funciones más calientes y, por hilo, su ocupación y sus funciones principales. Necesita los símbolos de la build `RelWithDebInfo` o `Debug` |
+| `PS2X_GS_THREADS=<n>` | Hilos extra del rasterizador del GS (parche `0005`); `0` lo dibuja todo en el hilo del EE |
 | `TTR_TRACE=dma` | Cola de cadenas DMA de VBlank y `ClGfxDmaBuffer` |
 | `TTR_TRACE=sound` | Streams de EA MultiStream (ver [notas/ea-sound.md](notes/ea-sound.md)) |
 | `TTR_TRACE=rpc` | `sceSifBindRpc`/`CallRpc`/`CheckStatRpc` cuando se llaman por la tabla de funciones |

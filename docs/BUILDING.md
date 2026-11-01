@@ -103,7 +103,8 @@ powershell -ExecutionPolicy Bypass -File tools\build_runtime.ps1 -Preset win-cla
 ```
 
 Presets disponibles (`CMakePresets.json`): `win-clang-debug`, `win-clang-relwithdebinfo`,
-`win-clang-release`, `win-msvc-debug`, `win-msvc-release`. Los scripts cargan el entorno de
+`win-clang-release`, `win-msvc-debug`, `win-msvc-release`. Para jugar usa `win-clang-release` (optimización
+entre módulos, la más rápida); para depurar, `win-clang-relwithdebinfo`. Los scripts cargan el entorno de
 Visual Studio con `tools/vsenv.ps1`; para usar CMake a mano, abre antes un *Developer PowerShell for VS 2022*.
 
 Sin código generado el proyecto compila igualmente con una tabla de funciones vacía, lo que sirve

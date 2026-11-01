@@ -17,6 +17,7 @@
 #include "runtime/ps2_memory.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -156,6 +157,7 @@ namespace ttr::sles51256
         void dumpFrameIfDue(uint8_t *rdram, PS2Runtime *runtime)
         {
             static uint32_t vblanks = 0;
+            static const auto start = std::chrono::steady_clock::now();
             const FrameDumpConfig &config = frameDumpConfig();
             if (!config.enabled || (++vblanks % config.every) != 0u)
             {
@@ -165,7 +167,9 @@ namespace ttr::sles51256
             std::snprintf(name, sizeof(name), "frame_%06u.png", vblanks);
             const bool saved = ttr::debug::dumpPresentedFrame(*runtime, config.directory / name);
             const uint32_t current = ram32(rdram, kTheGame + 4u);
-            std::cout << "[ttr:frame] vblank=" << vblanks << ' ' << name << (saved ? "" : " (no frame)")
+            const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+            std::cout << "[ttr:frame] vblank=" << vblanks << " t=" << static_cast<int>(seconds) << "s " << name
+                      << (saved ? "" : " (no frame)")
                       << " game.mode=" << ram32(rdram, kTheGame) << std::hex
                       << " game.current=0x" << current
                       << " vtbl=0x" << (current ? ram32(rdram, current) : 0u)
