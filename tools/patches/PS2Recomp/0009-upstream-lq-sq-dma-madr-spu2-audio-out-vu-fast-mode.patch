@@ -1,0 +1,773 @@
+diff --git a/ps2xIOP/include/ps2x/iop/iop_subsystem.h b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+index 68fec81..e26ab2c 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_subsystem.h
++++ b/ps2xIOP/include/ps2x/iop/iop_subsystem.h
+@@ -27,6 +27,9 @@ namespace ps2x::iop
+         [[nodiscard]] ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments = nullptr, uint32_t argumentSize = 0);
+         [[nodiscard]] bool stopModule(int32_t moduleId, int32_t *result = nullptr);
+         void runEeCycles(uint64_t eeCycles) noexcept;
++        // SPU2 output since the last call: interleaved stereo 16-bit frames at 48 kHz. Call it from the
++        // thread that runs the IOP (runEeCycles).
++        void drainAudio(std::vector<int16_t> &destination);
+ 
+         [[nodiscard]] RpcAbi selectRpcAbi(const RpcAbiRequest &request) const;
+         [[nodiscard]] bool canBindRpc(uint32_t sid) const noexcept;
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index 9736273..3468a6b 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -850,6 +850,11 @@ namespace ps2x::iop::detail
+             m_impl->runCycles(iopCycles);
+     }
+ 
++    void IopEmulator::drainAudio(std::vector<int16_t> &destination)
++    {
++        m_impl->memory.spu2().drainOutput(destination);
++    }
++
+     RpcResult IopEmulator::handleRpc(const RpcRequest &request)
+     {
+         return m_impl->rpc.handleRpc(request, *m_impl);
+diff --git a/ps2xIOP/src/emulator/iop_emulator.h b/ps2xIOP/src/emulator/iop_emulator.h
+index 816ba69..4202351 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.h
++++ b/ps2xIOP/src/emulator/iop_emulator.h
+@@ -25,6 +25,8 @@ namespace ps2x::iop::detail
+         [[nodiscard]] ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize);
+         [[nodiscard]] bool stopModule(int32_t moduleId, int32_t *result);
+         void runEeCycles(uint64_t eeCycles) noexcept;
++        // Appends the SPU2 output (interleaved stereo 16-bit, 48 kHz) produced since the last call.
++        void drainAudio(std::vector<int16_t> &destination);
+         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request);
+         [[nodiscard]] bool hasRpcServer(uint32_t sid) const noexcept;
+         void onSifTransfer(const SifTransfer &transfer);
+diff --git a/ps2xIOP/src/iop_subsystem.cpp b/ps2xIOP/src/iop_subsystem.cpp
+index 345d19c..9ca77d7 100644
+--- a/ps2xIOP/src/iop_subsystem.cpp
++++ b/ps2xIOP/src/iop_subsystem.cpp
+@@ -169,6 +169,11 @@ namespace ps2x::iop
+         m_impl->emulator.runEeCycles(eeCycles);
+     }
+ 
++    void IopSubsystem::drainAudio(std::vector<int16_t> &destination)
++    {
++        m_impl->emulator.drainAudio(destination);
++    }
++
+     RpcAbi IopSubsystem::selectRpcAbi(const RpcAbiRequest &request) const
+     {
+         for (const auto &service : m_impl->coreServices)
+diff --git a/ps2xRuntime/include/ps2_runtime_macros.h b/ps2xRuntime/include/ps2_runtime_macros.h
+index 2474992..76da351 100644
+--- a/ps2xRuntime/include/ps2_runtime_macros.h
++++ b/ps2xRuntime/include/ps2_runtime_macros.h
+@@ -476,7 +476,11 @@ static inline uint64_t Ps2FastRead64(const uint8_t *rdram, uint32_t addr)
+ 
+ static inline __m128i Ps2FastRead128(const uint8_t *rdram, uint32_t addr)
+ {
+-    const uint32_t offset = addr & PS2_RAM_MASK;
++    // EE LQ ignores the low 4 bits of the effective address (16-byte
++    // alignment is forced, not faulted). Gen code for LQ lands here, so an
++    // unaligned guest LQ must read the aligned quadword below — Sony's libc
++    // memcpy relies on it (LQ at src+0x00/0x10/0x20/0x30 + QFSRV repair).
++    const uint32_t offset = (addr & ~0xFu) & PS2_RAM_MASK;
+     if (!Ps2FastRangeIsContiguous(offset, sizeof(__m128i)))
+     {
+         alignas(16) uint8_t wrapped[sizeof(__m128i)];
+@@ -549,7 +553,9 @@ static inline void Ps2FastWrite64(uint8_t *rdram, uint32_t addr, uint64_t value)
+ 
+ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
+ {
+-    const uint32_t offset = addr & PS2_RAM_MASK;
++    // EE SQ ignores the low 4 bits of the effective address — same as
++    // Ps2FastRead128 above.
++    const uint32_t offset = (addr & ~0xFu) & PS2_RAM_MASK;
+     if (!Ps2FastRangeIsContiguous(offset, sizeof(__m128i)))
+     {
+         alignas(16) uint8_t wrapped[sizeof(__m128i)];
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 5f89768..65442e1 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -832,10 +832,13 @@ uint64_t PS2Memory::read64(uint32_t address)
+ 
+ __m128i PS2Memory::read128(uint32_t address)
+ {
+-    if (address & 15)
+-    {
+-        throw std::runtime_error("Unaligned 128-bit read at address: 0x" + std::to_string(address));
+-    }
++    // EE LQ ignores the low 4 bits of the effective address (16-byte alignment
++    // is forced, not faulted). Sony's libc memcpy exploits this: it loads an
++    // unaligned source with LQ at src+0x00/0x10/0x20/0x30 and repairs the
++    // lanes with QFSRV. Throwing here corrupted every such copy by the
++    // misalignment (MOH:Vanguard stream-manager reload copied its BRGR blob
++    // 8 bytes late, underflowing the reload size to -1784).
++    address &= ~0xFu;
+ 
+     const bool scratch = isScratchpad(address);
+     uint32_t physAddr = translateAddress(address);
+@@ -1062,10 +1065,9 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
+ 
+ void PS2Memory::write128(uint32_t address, __m128i value)
+ {
+-    if (address & 15)
+-    {
+-        throw std::runtime_error("Unaligned 128-bit write at address: 0x" + std::to_string(address));
+-    }
++    // EE SQ ignores the low 4 bits of the effective address — same semantics
++    // as read128 above (16-byte alignment is forced, not faulted).
++    address &= ~0xFu;
+ 
+     const bool scratch = isScratchpad(address);
+     uint32_t physAddr = translateAddress(address);
+@@ -1336,6 +1338,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                 if (mode == 0 && qwc > 0)
+                 {
+                     enqueueTransfer(madr, qwc);
++                    // The transfer completes at once here: MADR ends after the data (QWC is
++                    // cleared on completion), as the DMAC leaves it.
++                    m_ioRegisters[channelBase + 0x10] = (madr + qwc * 16u) & 0x7FFFFFF0u;
+                 }
+                 else if (mode == 1)
+                 {
+@@ -1407,6 +1412,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+ 
+                     int tagsProcessed = 0;
+                     uint32_t lastTagUpper = (chcr >> 16) & 0xFFFFu;
++                    // MADR as the DMAC leaves it: the end of the last tag's payload (PCSX2 hwDmacSrcChain).
++                    uint32_t endMadr = 0u;
++                    bool endMadrValid = false;
+ 
+                     while (tagsProcessed < kMaxChainTags)
+                     {
+@@ -1515,6 +1523,11 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+ 
+                         if (transferTagData)
+                             appendVifTagData(currentTagAddr);
++                        if (id <= 7u)
++                        {
++                            endMadr = (dataAddr + static_cast<uint32_t>(tagQwc) * 16u) & 0x7FFFFFF0u;
++                            endMadrValid = true;
++                        }
+ 
+                         if (hasPayload)
+                             appendData(dataAddr, tagQwc);
+@@ -1540,6 +1553,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     }
+ 
+                     m_ioRegisters[channelBase + 0x30] = tagAddr;
++                    if (endMadrValid)
++                        m_ioRegisters[channelBase + 0x10] = endMadr;
+                     m_ioRegisters[channelBase + 0x40] = asr0;
+                     m_ioRegisters[channelBase + 0x50] = asr1;
+                     chcr = (chcr & ~(0x3u << 4)) | ((asp & 0x3u) << 4);
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index b277608..e9e3c40 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -28,6 +28,147 @@
+ #include <unordered_map>
+ #include <sstream>
+ 
++namespace
++{
++    // SPU2 output to the host. The thread that runs the IOP pushes the mix into a ring and raylib's audio
++    // thread pulls it. When the game runs slower than real time the ring runs dry: the callback then plays
++    // silence and waits for kStartFrames again, so slow stretches sound choppy instead of crackling. The
++    // ring is capped at kMaxBufferedFrames so latency never builds up. PS2X_AUDIO=0 turns it off.
++    class SpuAudioOutput
++    {
++    public:
++        static SpuAudioOutput &instance()
++        {
++            static SpuAudioOutput output;
++            return output;
++        }
++
++        void push(const std::vector<int16_t> &interleaved)
++        {
++            if (m_dump && !interleaved.empty())
++                std::fwrite(interleaved.data(), sizeof(int16_t), interleaved.size() & ~size_t{1}, m_dump);
++            if (!m_enabled || interleaved.size() < 2u)
++                return;
++            if (!m_streamReady && !start())
++                return;
++
++            std::lock_guard<std::mutex> lock(m_mutex);
++            const size_t frames = interleaved.size() / 2u;
++            for (size_t i = 0; i < frames; ++i)
++            {
++                if (m_count == kRingFrames)
++                {
++                    m_read = (m_read + 1u) % kRingFrames;
++                    --m_count;
++                }
++                m_ring[m_write * 2u] = interleaved[i * 2u];
++                m_ring[m_write * 2u + 1u] = interleaved[i * 2u + 1u];
++                m_write = (m_write + 1u) % kRingFrames;
++                ++m_count;
++            }
++            if (m_count > kMaxBufferedFrames)
++            {
++                const size_t drop = m_count - kMaxBufferedFrames;
++                m_read = (m_read + drop) % kRingFrames;
++                m_count -= drop;
++            }
++        }
++
++        void stop()
++        {
++            if (!m_streamReady)
++                return;
++            StopAudioStream(m_stream);
++            UnloadAudioStream(m_stream);
++            m_streamReady = false;
++        }
++
++    private:
++        static constexpr uint32_t kSampleRate = 48000u;
++        static constexpr size_t kRingFrames = kSampleRate / 2u;          // 500 ms of storage
++        static constexpr size_t kMaxBufferedFrames = kSampleRate / 5u;   // 200 ms of latency at most
++        static constexpr size_t kStartFrames = kSampleRate / 25u;        // 40 ms before (re)starting
++
++        SpuAudioOutput()
++        {
++            const char *env = std::getenv("PS2X_AUDIO");
++            m_enabled = !(env && env[0] == '0');
++            m_ring.resize(kRingFrames * 2u);
++            // PS2X_AUDIO_DUMP=<file>: raw interleaved stereo s16le at 48 kHz, everything the SPU2 produced.
++            if (const char *dump = std::getenv("PS2X_AUDIO_DUMP"); dump && dump[0] != 0)
++                m_dump = std::fopen(dump, "wb");
++        }
++
++        ~SpuAudioOutput()
++        {
++            if (m_dump)
++                std::fclose(m_dump);
++        }
++
++        bool start()
++        {
++            if (!IsAudioDeviceReady())
++            {
++                m_enabled = false;
++                return false;
++            }
++            SetAudioStreamBufferSizeDefault(1024);
++            m_stream = LoadAudioStream(kSampleRate, 16, 2);
++            if (!IsAudioStreamValid(m_stream))
++            {
++                std::cerr << "[audio] could not open a 48 kHz stereo stream; SPU2 output disabled" << std::endl;
++                m_enabled = false;
++                return false;
++            }
++            SetAudioStreamCallback(m_stream, &SpuAudioOutput::callback);
++            PlayAudioStream(m_stream);
++            m_streamReady = true;
++            std::cout << "[audio] SPU2 output: 48 kHz stereo" << std::endl;
++            return true;
++        }
++
++        static void callback(void *buffer, unsigned int frames)
++        {
++            instance().fill(static_cast<int16_t *>(buffer), frames);
++        }
++
++        void fill(int16_t *out, unsigned int frames)
++        {
++            std::lock_guard<std::mutex> lock(m_mutex);
++            if (m_priming && m_count < kStartFrames)
++            {
++                std::memset(out, 0, static_cast<size_t>(frames) * 2u * sizeof(int16_t));
++                return;
++            }
++            m_priming = false;
++            for (unsigned int i = 0; i < frames; ++i)
++            {
++                if (m_count == 0u)
++                {
++                    std::memset(out + i * 2u, 0, static_cast<size_t>(frames - i) * 2u * sizeof(int16_t));
++                    m_priming = true;
++                    return;
++                }
++                out[i * 2u] = m_ring[m_read * 2u];
++                out[i * 2u + 1u] = m_ring[m_read * 2u + 1u];
++                m_read = (m_read + 1u) % kRingFrames;
++                --m_count;
++            }
++        }
++
++        std::mutex m_mutex;
++        std::vector<int16_t> m_ring;
++        size_t m_read = 0u;
++        size_t m_write = 0u;
++        size_t m_count = 0u;
++        bool m_priming = true;
++        bool m_enabled = true;
++        bool m_streamReady = false;
++        AudioStream m_stream{};
++        FILE *m_dump = nullptr;
++    };
++}
++
+ namespace ps2_stubs
+ {
+     void resetSifState();
+@@ -599,6 +740,7 @@ PS2Runtime::~PS2Runtime()
+ #else
+         if (IsAudioDeviceReady())
+         {
++            SpuAudioOutput::instance().stop();
+             CloseAudioDevice();
+             m_audioBackend.setAudioReady(false);
+         }
+@@ -670,6 +812,24 @@ void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransf
+ void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
+ {
+     m_iopSubsystem->runEeCycles(eeCycles);
++
++    // Hand the SPU2 mix to the host about once per millisecond of EE time (294 912 cycles).
++    static uint64_t audioCycles = 0u;
++    static std::vector<int16_t> audioFrames;
++    audioCycles += eeCycles;
++    if (audioCycles >= 294912u)
++    {
++        audioCycles = 0u;
++        try
++        {
++            m_iopSubsystem->drainAudio(audioFrames);
++            SpuAudioOutput::instance().push(audioFrames);
++        }
++        catch (...)
++        {
++        }
++        audioFrames.clear();
++    }
+ }
+ 
+ void PS2Runtime::resetIop()
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index bd70224..f0ca7c6 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -5,6 +5,9 @@
+ #include "ps2_vu1_detail.h"
+ 
+ #include <algorithm>
++#include <bit>
++#include <chrono>
++#include <mutex>
+ #include <cfenv>
+ #include <cmath>
+ #include <cstdio>
+@@ -107,21 +110,20 @@ float VU1Interpreter::broadcast(const float *vf, uint8_t bc)
+     return normalizeOperand(vf[bc & 3u]);
+ }
+ 
+-float VU1Interpreter::normalizeOperand(float value) const
++namespace
+ {
+-    uint32_t bits = 0;
+-    std::memcpy(&bits, &value, sizeof(bits));
+-    const uint32_t exponent = (bits >> 23) & 0xFFu;
+-    if (exponent == 0u)
+-    {
+-        bits &= 0x80000000u;
+-    }
+-    else if (exponent == 0xFFu)
++    // Fast mode (default), as PCSX2's microVU does it:
++    // - VF, VI and ACC results are written as soon as the instruction executes. Every reader still waits
++    //   (calculatePairReadyCycle) until the producer's latency has passed, so it sees the same values; only
++    //   the write queues go away. MAC/status/clip flags, Q, P, stores and XGKICK keep their pipelines.
++    // - FMAC flags come from the rounded float result instead of a second, exact computation per lane, and
++    //   the product overflow/underflow sticky bits of the multiply-add family are not computed.
++    // PS2X_VU_ACCURATE=1 restores the queued writes and the exact flags.
++    const bool g_vuImmediateWrites = []
+     {
+-        bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
+-    }
+-    std::memcpy(&value, &bits, sizeof(value));
+-    return value;
++        const char *env = std::getenv("PS2X_VU_ACCURATE");
++        return !(env && env[0] == '1');
++    }();
+ }
+ 
+ float VU1Interpreter::normalizeResult(float value, uint32_t &laneFlags) const
+@@ -205,7 +207,7 @@ void VU1Interpreter::normalizeFmacResult(float *result, uint8_t dest,
+             continue;
+ 
+         long double exactResult = 0.0L;
+-        if (calculateFmacExactResult(component, exactResult))
++        if (!g_vuImmediateWrites && calculateFmacExactResult(component, exactResult))
+         {
+             laneFlags[component] = normalizeFmacExactResult(result[component], exactResult);
+             continue;
+@@ -432,6 +434,8 @@ uint8_t VU1Interpreter::normalizeFmacExactResult(float &value,
+ 
+ uint32_t VU1Interpreter::calculateFmacProductSticky(uint8_t dest) const
+ {
++    if (g_vuImmediateWrites)
++        return 0u;
+     uint32_t extraSticky = 0u;
+     const uint32_t upper = m_currentUpperInstruction;
+     const uint8_t op = static_cast<uint8_t>(upper & 0x3Fu);
+@@ -830,6 +834,12 @@ void VU1Interpreter::commitReadyPipelines()
+         store = {};
+     }
+ 
++    if (g_vuImmediateWrites)
++    {
++        m_nextCommitCycle = next;
++        return;
++    }
++
+     for (PendingVfWrite &write : m_vfWritePipeline)
+     {
+         if (!write.valid)
+@@ -903,10 +913,18 @@ void VU1Interpreter::progressXgkick()
+         }
+ 
+         const uint32_t qwordOffset = m_xgkick.copiedBytes;
+-        for (uint32_t i = 0; i < 16u; ++i)
++        const uint32_t firstSource = (m_xgkick.sourceAddress + m_xgkick.copiedBytes) % m_activeVuDataSize;
++        if (firstSource + 16u <= m_activeVuDataSize)
+         {
+-            const uint32_t source = (m_xgkick.sourceAddress + m_xgkick.copiedBytes + i) % m_activeVuDataSize;
+-            m_xgkick.packet[m_xgkick.copiedBytes + i] = m_activeVuData[source];
++            std::memcpy(m_xgkick.packet.data() + m_xgkick.copiedBytes, m_activeVuData + firstSource, 16u);
++        }
++        else
++        {
++            for (uint32_t i = 0; i < 16u; ++i)
++            {
++                const uint32_t source = (firstSource + i) % m_activeVuDataSize;
++                m_xgkick.packet[m_xgkick.copiedBytes + i] = m_activeVuData[source];
++            }
+         }
+         m_xgkick.copiedBytes += 16u;
+ 
+@@ -1051,11 +1069,8 @@ uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &d
+                     ready = std::max(ready, m_vfReady[access.reg][component]);
+             }
+         }
+-        for (uint32_t reg = 1; reg < m_viReady.size(); ++reg)
+-        {
+-            if ((usage->viRead & (1u << reg)) != 0u)
+-                ready = std::max(ready, m_viReady[reg]);
+-        }
++        for (uint32_t bits = usage->viRead & 0xFFFEu; bits != 0u; bits &= bits - 1u)
++            ready = std::max(ready, m_viReady[static_cast<uint32_t>(std::countr_zero(bits))]);
+         for (uint32_t component = 0; component < 4u; ++component)
+         {
+             if ((usage->accRead & laneForComponent(component)) != 0u)
+@@ -1589,6 +1604,26 @@ void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t cod
+     m_cachedCodeSize = codeSize;
+     m_cachedCodeGeneration = generation;
+     m_decodedCodeCacheValid = true;
++
++    // PS2X_VU_DUMP=<folder>: saves each distinct micro memory image the unit runs as vu<n>_<fnv64>.bin.
++    static const char *dumpDir = std::getenv("PS2X_VU_DUMP");
++    if (dumpDir && dumpDir[0] != '\0')
++    {
++        uint64_t hash = 0xCBF29CE484222325ull;
++        for (uint32_t i = 0; i < codeSize; ++i)
++            hash = (hash ^ vuCode[i]) * 0x100000001B3ull;
++        char path[1024];
++        std::snprintf(path, sizeof(path), "%s/vu%d_%016llx.bin", dumpDir, m_unit == Unit::VU1 ? 1 : 0,
++                      static_cast<unsigned long long>(hash));
++        if (FILE *existing = std::fopen(path, "rb"))
++            std::fclose(existing);
++        else if (FILE *file = std::fopen(path, "wb"))
++        {
++            std::fwrite(vuCode, 1, codeSize, file);
++            std::fclose(file);
++            std::fprintf(stderr, "[vu-dump] %s (generation %llu)\n", path, static_cast<unsigned long long>(generation));
++        }
++    }
+ }
+ 
+ VU1Interpreter::DecodedInstructionPair VU1Interpreter::getDecodedInstructionPairForPc(
+@@ -1666,10 +1701,65 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
+     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
+ }
+ 
++namespace
++{
++    // PS2X_VU_STATS=1: once per second of host time, microprogram runs, VU cycles and instruction pairs
++    // executed by each unit.
++    struct VuRunStats
++    {
++        bool enabled = false;
++        std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
++        uint64_t runs[2]{};
++        uint64_t cycles[2]{};
++        uint64_t pairs[2]{};
++        std::mutex mutex;
++    };
++
++    VuRunStats &vuRunStats()
++    {
++        static VuRunStats stats;
++        static const bool initialized = []
++        {
++            const char *env = std::getenv("PS2X_VU_STATS");
++            stats.enabled = env && env[0] == '1';
++            return true;
++        }();
++        (void)initialized;
++        return stats;
++    }
++
++    void recordVuRun(int unit, uint64_t cycles, uint64_t pairs)
++    {
++        VuRunStats &stats = vuRunStats();
++        if (!stats.enabled)
++            return;
++        std::lock_guard<std::mutex> lock(stats.mutex);
++        stats.runs[unit] += 1u;
++        stats.cycles[unit] += cycles;
++        stats.pairs[unit] += pairs;
++        const auto now = std::chrono::steady_clock::now();
++        const double seconds = std::chrono::duration<double>(now - stats.last).count();
++        if (seconds < 1.0)
++            return;
++        std::fprintf(stderr, "[vu-stats] %.1fs VU0 runs=%llu cycles=%llu pairs=%llu | VU1 runs=%llu cycles=%llu pairs=%llu\n",
++                     seconds,
++                     static_cast<unsigned long long>(stats.runs[0]), static_cast<unsigned long long>(stats.cycles[0]),
++                     static_cast<unsigned long long>(stats.pairs[0]),
++                     static_cast<unsigned long long>(stats.runs[1]), static_cast<unsigned long long>(stats.cycles[1]),
++                     static_cast<unsigned long long>(stats.pairs[1]));
++        stats.last = now;
++        stats.runs[0] = stats.runs[1] = 0u;
++        stats.cycles[0] = stats.cycles[1] = 0u;
++        stats.pairs[0] = stats.pairs[1] = 0u;
++    }
++}
++
+ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+                          uint8_t *vuData, uint32_t dataSize,
+                          GS &gs, PS2Memory *memory, uint32_t maxCycles)
+ {
++    const uint64_t statsStartCycle = m_cycle;
++    uint64_t statsPairs = 0u;
+     m_activeVuData = vuData;
+     m_activeVuDataSize = dataSize;
+     m_activeGs = &gs;
+@@ -1708,20 +1798,20 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+ 
+         uint8_t writtenVi = 0u;
+         int32_t oldVi = 0;
+-        for (uint32_t reg = 1; reg < 16u; ++reg)
++        if (const uint32_t viWrites = decoded.lowerUsage.viWrite & 0xFFFEu; viWrites != 0u)
+         {
+-            if ((decoded.lowerUsage.viWrite & (1u << reg)) != 0u)
+-            {
+-                writtenVi = static_cast<uint8_t>(reg);
+-                oldVi = m_state.vi[reg];
+-                break;
+-            }
++            uint32_t reg = 1u;
++            while ((viWrites & (1u << reg)) == 0u)
++                ++reg;
++            writtenVi = static_cast<uint8_t>(reg);
++            oldVi = m_state.vi[reg];
+         }
+ 
+         const VfAccess upperWrite = decoded.upperUsage.vfWrite;
+         const VfAccess lowerWrite = decoded.lowerUsage.vfWrite;
+-        const bool hasUpperWrite = upperWrite.reg != 0u;
+-        const bool hasLowerWrite = lowerWrite.reg != 0u && decoded.suppressedLowerVf != lowerWrite.reg;
++        const bool queueWrites = !g_vuImmediateWrites;
++        const bool hasUpperWrite = queueWrites && upperWrite.reg != 0u;
++        const bool hasLowerWrite = queueWrites && lowerWrite.reg != 0u && decoded.suppressedLowerVf != lowerWrite.reg;
+         const bool hasDistinctLowerWrite = hasLowerWrite && (!hasUpperWrite || lowerWrite.reg != upperWrite.reg);
+         float oldUpperVf[4]{};
+         float newUpperVf[4]{};
+@@ -1733,7 +1823,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+             std::memcpy(oldUpperVf, m_state.vf[upperWrite.reg], sizeof(oldUpperVf));
+         if (hasDistinctLowerWrite)
+             std::memcpy(oldLowerVf, m_state.vf[lowerWrite.reg], sizeof(oldLowerVf));
+-        if (decoded.upperUsage.accWrite != 0u)
++        if (queueWrites && decoded.upperUsage.accWrite != 0u)
+             std::memcpy(oldAcc, m_state.acc, sizeof(oldAcc));
+ 
+         if (decoded.iBit)
+@@ -1789,7 +1879,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+                                          : decoded.lowerUsage.latency;
+             queueVfWrite(lowerWrite.reg, lowerWrite.lanes, newLowerVf, latency);
+         }
+-        if (decoded.upperUsage.accWrite != 0u)
++        if (queueWrites && decoded.upperUsage.accWrite != 0u)
+         {
+             std::memcpy(newAcc, m_state.acc, sizeof(newAcc));
+             std::memcpy(m_state.acc, oldAcc, sizeof(oldAcc));
+@@ -1798,7 +1888,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+             queueAccWrite(decoded.upperUsage.accWrite, newAcc,
+                           kAccForwardLatency);
+         }
+-        if (writtenVi != 0u)
++        if (queueWrites && writtenVi != 0u)
+         {
+             const int32_t newVi = m_state.vi[writtenVi];
+             m_state.vi[writtenVi] = oldVi;
+@@ -1866,10 +1956,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         }
+ 
+         advanceOneCycle();
++        ++statsPairs;
+         if (programEnded)
+             break;
+     }
+ 
++    recordVuRun(m_unit == Unit::VU1 ? 1 : 0, m_cycle - statsStartCycle, statsPairs);
+     m_lastRunFinished = programEnded;
+     if (programEnded)
+     {
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h b/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h
+index ed0ee71..53d018d 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_detail.h
+@@ -1,7 +1,10 @@
+ #ifndef PS2_VU1_DETAIL_H
+ #define PS2_VU1_DETAIL_H
+ 
++#include "runtime/ps2_vu1.h"
++
+ #include <cstdint>
++#include <cstring>
+ 
+ // Instruction field extraction helpers
+ static inline uint8_t DEST(uint32_t i) { return (uint8_t)((i >> 21) & 0xF); }
+@@ -26,4 +29,18 @@ static inline int16_t IMM15(uint32_t i)
+     return (int16_t)(int32_t)((int32_t)(raw << 17) >> 17);
+ }
+ 
++// Inline: every FMAC operand goes through it.
++inline float VU1Interpreter::normalizeOperand(float value) const
++{
++    uint32_t bits = 0;
++    std::memcpy(&bits, &value, sizeof(bits));
++    const uint32_t exponent = (bits >> 23) & 0xFFu;
++    if (exponent == 0u)
++        bits &= 0x80000000u;
++    else if (exponent == 0xFFu)
++        bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
++    std::memcpy(&value, &bits, sizeof(value));
++    return value;
++}
++
+ #endif
+diff --git a/ps2xTest/src/ps2_memory_tests.cpp b/ps2xTest/src/ps2_memory_tests.cpp
+index 0b22fe0..21b5d14 100644
+--- a/ps2xTest/src/ps2_memory_tests.cpp
++++ b/ps2xTest/src/ps2_memory_tests.cpp
+@@ -159,6 +159,68 @@ void register_ps2_memory_tests()
+ {
+     MiniTest::Case("PS2Memory", [](TestCase &tc)
+     {
++        tc.Run("EE LQ/SQ (read128/write128) ignore the low 4 bits of the address", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++
++            // Sony's libc memcpy (sub_003553F0 in MOH:Vanguard) loads unaligned
++            // sources with LQ from src+0x00/0x10/0x20/0x30 and repairs the
++            // lanes with QFSRV — that only works because EE LQ/SQ truncate the
++            // effective address to 16-byte alignment instead of faulting.
++            alignas(16) uint8_t pattern[32];
++            for (uint32_t i = 0; i < sizeof(pattern); ++i)
++            {
++                pattern[i] = static_cast<uint8_t>(i);
++            }
++            mem.write128(0x00002000u, _mm_loadu_si128(reinterpret_cast<const __m128i *>(pattern)));
++            mem.write128(0x00002010u, _mm_loadu_si128(reinterpret_cast<const __m128i *>(pattern + 16)));
++
++            __m128i got = mem.read128(0x00002008u);
++            alignas(16) uint8_t gotBytes[16];
++            _mm_storeu_si128(reinterpret_cast<__m128i *>(gotBytes), got);
++            t.IsTrue(std::memcmp(gotBytes, pattern, 16) == 0,
++                     "read128 at +8 should return the 16 bytes at the aligned base (EE LQ ignores addr[3:0])");
++
++            mem.write128(0x00002008u, _mm_setzero_si128());
++            alignas(16) uint8_t after[32];
++            std::memcpy(after, mem.getRDRAM() + 0x2000u, sizeof(after));
++            alignas(16) uint8_t zeros[16] = {};
++            t.IsTrue(std::memcmp(after, zeros, 16) == 0, "write128 at +8 should land on the aligned base");
++            t.IsTrue(std::memcmp(after + 16, pattern + 16, 16) == 0, "write128 at +8 must not touch the next quadword");
++        });
++
++        tc.Run("Ps2FastRead128/Ps2FastWrite128 (gen fast path) truncate to 16-byte alignment", [](TestCase &t)
++        {
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++            uint8_t *rdram = mem.getRDRAM();
++            t.IsTrue(rdram != nullptr, "RDRAM should be allocated");
++
++            alignas(16) uint8_t pattern[32];
++            for (uint32_t i = 0; i < sizeof(pattern); ++i)
++            {
++                pattern[i] = static_cast<uint8_t>(0x40u + i);
++            }
++            std::memcpy(rdram + 0x3000u, pattern, sizeof(pattern));
++
++            // Vanguard regression: LQ $t0, 0($a1) with $a1 = ...8 must read the
++            // aligned quadword below, otherwise the QFSRV repair copies the
++            // stream-manager BRGR blob 8 bytes late and its reload underflows.
++            __m128i got = Ps2FastRead128(rdram, 0x3008u);
++            alignas(16) uint8_t gotBytes[16];
++            _mm_storeu_si128(reinterpret_cast<__m128i *>(gotBytes), got);
++            t.IsTrue(std::memcmp(gotBytes, pattern, 16) == 0,
++                     "fast read128 at +8 should return the aligned base quadword");
++
++            Ps2FastWrite128(rdram, 0x3008u, _mm_setzero_si128());
++            alignas(16) uint8_t after[32];
++            std::memcpy(after, rdram + 0x3000u, sizeof(after));
++            alignas(16) uint8_t zeros[16] = {};
++            t.IsTrue(std::memcmp(after, zeros, 16) == 0, "fast write128 at +8 should land on the aligned base");
++            t.IsTrue(std::memcmp(after + 16, pattern + 16, 16) == 0, "fast write128 at +8 must not touch the next quadword");
++        });
++
+         tc.Run("uncached aliases map to same RDRAM bytes", [](TestCase &t)
+         {
+             PS2Memory mem;
+@@ -1100,6 +1162,38 @@ void register_ps2_memory_tests()
+             t.IsTrue(contentOk, "scratchpad GIF DMA packet bytes should match scratchpad source");
+         });
+ 
++        tc.Run("GIF DMA leaves MADR after the transferred data, as the DMAC does", [](TestCase &t)
++        {
++            // PCSX2 (Gif.cpp, Dmac.cpp hwDmacSrcChain): normal mode advances MADR by QWC*16;
++            // chain mode sets MADR to each tag's data address and advances it over the payload,
++            // so at the END tag it points past the last payload. QWC ends at 0.
++            PS2Memory mem;
++            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
++            constexpr uint32_t kGifCh = 0x1000A000u;
++            uint8_t *rdram = mem.getRDRAM();
++            mem.setGifPacketCallback([](const uint8_t *, uint32_t) {});
++
++            // Normal mode: 2 qwords of zeroed (empty) GIFtags at 0x100000.
++            std::memset(rdram + 0x100000u, 0, 32u);
++            t.IsTrue(mem.writeIORegister(kGifCh + 0x10u, 0x100000u), "write MADR");
++            t.IsTrue(mem.writeIORegister(kGifCh + 0x20u, 2u), "write QWC");
++            t.IsTrue(mem.writeIORegister(kGifCh + 0x00u, 0x100u), "write CHCR STR (normal)");
++            mem.processPendingTransfers();
++            t.Equals(mem.readIORegister(kGifCh + 0x10u), 0x100020u, "normal mode: MADR = start + QWC*16");
++            t.Equals(mem.readIORegister(kGifCh + 0x20u), 0u, "normal mode: QWC = 0");
++
++            // Chain: CNT (1 qword) at 0x110000, REF (2 qwords at 0x120000), END (1 qword).
++            writeDmaTag(rdram, 0x110000u, makeDmaTag(1u, 1u, 0u, false));         // CNT
++            writeDmaTag(rdram, 0x110020u, makeDmaTag(2u, 3u, 0x120000u, false));   // REF
++            writeDmaTag(rdram, 0x110030u, makeDmaTag(1u, 7u, 0u, false));         // END
++            std::memset(rdram + 0x120000u, 0, 32u);
++            t.IsTrue(mem.writeIORegister(kGifCh + 0x30u, 0x110000u), "write TADR");
++            t.IsTrue(mem.writeIORegister(kGifCh + 0x00u, 0x104u), "write CHCR STR|CHAIN");
++            mem.processPendingTransfers();
++            t.Equals(mem.readIORegister(kGifCh + 0x10u), 0x110050u, "chain: MADR ends after the END tag's payload");
++            t.Equals(mem.readIORegister(kGifCh + 0x20u), 0u, "chain: QWC = 0");
++        });
++
+         tc.Run("GIF DMA chain can source tags and payload from 0xF000 scratchpad alias", [](TestCase &t)
+         {
+             PS2Memory mem;

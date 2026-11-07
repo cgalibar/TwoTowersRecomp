@@ -28,9 +28,29 @@ runtime están desactivados por defecto (`-DTTR_VERBOSE_RUNTIME_LOGS=ON` los act
 | `PS2X_IOP_TRACE=1` | Trazas del IOP (parche `0001`): `cdvdman`, `ioman`, enlaces entre módulos, RPC |
 | `PS2X_IOP_CALLTRACE=<Mciclos>:<líneas>:<lo>-<hi>` | `jal`/`jalr` ejecutados en `[lo, hi)` a partir de un ciclo IOP |
 | `PS2X_WATCH=<lo>-<hi>` | Avisa (con el origen) cuando el runtime escribe en ese rango de la RAM del EE: stubs de libc, DMA SIF/IOP, lecturas de fichero, copias RPC, `sceMpegGetPicture`. No cubre los `sw`/`sq` del código recompilado |
+| `PS2X_VU_STATS=1` | Cada segundo: ejecuciones de microprogramas, ciclos y pares de instrucciones de VU0 y VU1 (parche `0009`). Mide la carga de VU y la velocidad del intérprete |
+| `PS2X_VU_DUMP=<carpeta>` | Guarda cada imagen distinta de la memoria de microcódigo que ejecuta una VU como `vu<n>_<fnv64>.bin` (para `tools/vu_disasm.py`) |
+| `PS2X_VU_ACCURATE=1` | Vuelve al modelo de VU con colas de escritura y flags FMAC exactos (más lento; para comparar si se sospecha del modo rápido) |
+| `PS2X_AUDIO=0` | Sin salida de audio del SPU2 |
+| `PS2X_AUDIO_DUMP=<fichero>` | Vuelca toda la mezcla del SPU2 en PCM crudo (estéreo, 16 bits, 48 kHz) |
 | `PS2X_PROFILE_CALLS=<n>` | Cada `n` llamadas entre funciones del juego, imprime las 30 más llamadas (`tools/disasm.py --sym` las traduce) |
 
-Se pueden combinar: `TTR_TRACE=sound,dma`.
+Se pueden combinar: `TTR_TRACE=sound,dma`. `anims` imprime mucho en cada frame y frena el juego (los vídeos
+pasan de 50 a ~2 VBlanks/s); úsala en tramos cortos.
+
+### Llegar a la batalla del prólogo
+
+Sin partida guardada, los vídeos de logos solo se saltan con el hack. Con esta secuencia se salta el de logos
+y la misión del prólogo arranca con su cinemática en el motor; la batalla empieza hacia el VBlank 2700 (a la
+velocidad actual, ~10 min de reloj):
+
+```powershell
+$env:TTR_HACK_SKIPPABLE_FMV = '1'
+$env:TTR_PAD_SCRIPT = '1100:cross;3000-3300:ly=0;3400:square'
+$env:TTR_FRAME_DUMP = 'out\frames'; $env:TTR_FRAME_DUMP_EVERY = '50'
+```
+
+Start durante la misión abre la pausa (Opciones / Salir a Menú).
 
 ## Herramientas
 

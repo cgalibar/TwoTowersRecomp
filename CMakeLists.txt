@@ -8,6 +8,9 @@ project(TwoTowersRecomp
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+# No C++20 modules here: without this, CMake runs clang-scan-deps over each of the ~4700 generated
+# sources before compiling them, which roughly doubles a full build.
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 
 set(TTR_PS2RECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tools/PS2Recomp" CACHE PATH
     "PS2Recomp checkout providing ps2xRuntime (git submodule)")

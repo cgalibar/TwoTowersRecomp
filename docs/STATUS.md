@@ -2,9 +2,11 @@
 
 [Inicio](../README.md) · [Compilación](BUILDING.md) · [Depuración](DEBUGGING.md)
 
-Fase: **en progreso**. Arranca, carga el prólogo, reproduce el vídeo de introducción y entra en el
-nivel: la simulación corre y se dibujan el mundo 3D, el cielo y el HUD. Falta comprobar el control con el
-mando y el sonido; todavía no se ha jugado una partida.
+Fase: **en progreso**. Arranca, reproduce los vídeos y entra en la misión del prólogo: la cinemática en el
+motor y la batalla se dibujan con personajes, el mando mueve a Isildur y el tutorial avanza ("Atacar
+Rápido" → "Atacar Fiero"). Los menús (pausa, opciones, "Salir a Menú") responden y el SPU2 suena por el
+host. **Bloqueo actual: velocidad.** Con personajes en pantalla el juego va a 3-4 VBlanks/s (~7 % de la
+velocidad real) porque el intérprete de VU1 no da abasto.
 
 ## Progreso del arranque
 
@@ -16,12 +18,16 @@ mando y el sonido; todavía no se ha jugado una partida.
 | Pantalla "CARGANDO..." (`ClGameModePlay`) | ✅ |
 | Banco de efectos del nivel subido a la RAM del SPU2 (`00ISUL1.MSB`, el prólogo de Isildur) | ✅ |
 | Streams de narrador/música (EA MultiStream) y carga del nivel (`ClEnemyDB::load`) | ✅ |
-| Vídeo de introducción `MONT.FMV` (`ClFMV::playModal`), completo (~3 min) | ✅ imagen (sin sonido en el host) |
+| Vídeos de logos e introducción (`ClFMV::playModal`), a 50 VBlanks/s | ✅ |
 | Nivel: actores, colisiones, partículas, guiones; microprogramas VU0 por VIF0 | ✅ |
 | Nivel: cielo y HUD (espada, "Defender", luna) | ✅ |
 | Nivel: terreno, campo de batalla y cielo (plano de apertura del prólogo) | ✅ |
-| Nivel: personajes y control con el mando | pendiente de comprobar |
-| Mando, menú principal, sonido | pendiente |
+| Nivel: personajes (cinemática en el motor y batalla) | ✅ |
+| Control con el mando: Isildur avanza con el stick, ataques y tutorial | ✅ (con `TTR_PAD_SCRIPT`) |
+| Menú de pausa de la misión, opciones, confirmación de "Salir a Menú" | ✅ |
+| Sonido: mezcla del SPU2 al host (raylib, 48 kHz) | ✅ (falta escucharlo con calma: AutoDMA, efectos, reverb) |
+| Velocidad jugable con personajes | ❌ 3-4 VBlanks/s |
+| Menú principal y nueva partida desde cero | pendiente |
 
 ## Problemas resueltos
 
@@ -110,6 +116,16 @@ En el EE, `SQRT.S fd, ft` toma el operando del campo **ft** (fs vale 0); el reco
 452 raíces cuadradas del juego calculaban `sqrt($f0)`, así que `ClVector::normalize3d`, las distancias, la
 cámara y la física trabajaban con vectores sin normalizar. Corregido en `fpu_translator.cpp`.
 
+### Escenas con personajes a 2-3 VBlanks/s (intérprete de VU1)
+
+`PS2X_VU_STATS=1` mide 3,4 M pares de instrucciones de VU1 por segundo en la cinemática del prólogo: unos
+250 ns por par, con el hilo del EE dedicado casi entero al intérprete. El intérprete modela el pipeline
+ciclo a ciclo (colas de escritura de VF/VI/ACC, flags FMAC calculados dos veces en precisión extendida). El
+parche `0009` pasa por defecto al modelo de microVU de PCSX2: los resultados se escriben al momento (los
+lectores siguen esperando la latencia, así que ven los mismos valores) y los flags salen del resultado float;
+`PS2X_VU_ACCURATE=1` vuelve al modelo anterior. La imagen es idéntica y VU1 sube a ~5,7 M pares/s (1,7x),
+insuficiente: la escena pide ~1,2 M ciclos de VU1 por frame, unos 60 M pares/s a 50 Hz.
+
 ## Rendimiento
 
 Medido en el nivel del prólogo con un Ryzen 5 3600X (`TTR_FRAME_DUMP` + `t=`, build `RelWithDebInfo`):
@@ -134,14 +150,19 @@ Ahora el límite es el GS: el nivel dibuja unos 3,2 M píxeles por VBlank (unas 
 completa por frame: posproceso en franjas de sprites, triángulos aditivos gigantes y la cúpula del cielo con
 filtrado bilineal) a ~100 ns por píxel y hilo.
 
+Con personajes (cinemática y batalla del prólogo) el límite es VU1, no el GS: ~5,7 M pares/s con el parche
+`0009` frente a los ~60 M que harían falta para 50 Hz.
+
 ## Siguiente
 
-1. Rendimiento: el rasterizador del GS es el cuello de botella (coste por píxel: direcciones de VRAM por
-   puntero a función, estado del GS decodificado en cada píxel). Después, el intérprete de VU1 (~25 % del
-   hilo del EE).
-2. Jugar el prólogo con mando/teclado: comprobar movimiento (stick izquierdo), personajes y cámara. En los
-   frames volcados del nivel no se ve ningún personaje.
-3. Salida de audio: llevar la mezcla del SPU2 al backend de audio del runtime (raylib).
+1. **Recompilador de microcódigo VU1** (el bloqueo para jugar). El juego sube ~30 imágenes de microcódigo
+   distintas por VIF (`PS2X_VU_DUMP`), así que hace falta traducir por bloque básico con caché por contenido
+   (como microVU) o generar C++ por adelantado a partir de los volcados, con flags MAC/estado retrasados 4
+   ciclos y Q/P con su latencia. Objetivo: >60 M pares/s.
+2. Llegar al menú principal sin pasar por la misión (Start → "Salir a Menú" → Sí) y empezar una partida nueva.
+3. Escuchar el audio: AutoDMA (voz/música por bloques), volumen y efectos; el volcado (`PS2X_AUDIO_DUMP`)
+   suena tonal y casi sin saturar.
+4. GS: con VU1 resuelto vuelve a ser el límite (coste por píxel, ver *Rendimiento*).
 
 ## Observaciones
 
