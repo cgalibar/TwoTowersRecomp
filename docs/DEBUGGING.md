@@ -36,9 +36,17 @@ runtime están desactivados por defecto (`-DTTR_VERBOSE_RUNTIME_LOGS=ON` los act
 | `PS2X_VU_ACCURATE=1` | Vuelve al modelo de VU con colas de escritura y flags FMAC exactos (más lento; para comparar si se sospecha del modo rápido) |
 | `PS2X_VU_FLAGS_ALWAYS=1` | El motor rápido calcula todos los flags MAC/estado/clip, aunque el microcódigo no pueda leerlos |
 | `PS2X_VU_CAPTURE=<fichero>` | Guarda el estado inicial, el código y los datos de `PS2X_VU_CAPTURE_COUNT` ejecuciones de VU1 (3000) tras saltarse `PS2X_VU_CAPTURE_SKIP` (20 000), para `ttr_vu_bench` |
+| `PS2X_VU_JIT=0` | Sin el compilador de bloques de VU (parche `0012`): todo el microcódigo pasa por el bucle del motor rápido |
+| `PS2X_VU_JIT_INLINE=0` | El compilador de bloques llama a todos los manejadores en vez de emitir en línea las FMAC sin flags |
+| `PS2X_VU_JIT_STATS=1` | Al salir: pares ejecutados por bloques compilados y por el bucle, bloques compilados y tamaño medio (`[vu-jit]`) |
+| `PS2X_VU_STALL_SKIP=0` | El motor rápido comprueba la disponibilidad de registros en todos los pares (sin `kNoStall`) |
 | `PS2X_VIF1_ASYNC=0` | VIF1, VU1, PATH1 y PATH2 vuelven al hilo del EE (parche `0011`); por defecto corren en su propio hilo |
-| `PS2X_VIF1_STATS=1` | Cada segundo: ocupación del hilo de VIF1 (y qué parte es VU1 y envío al GS), bloques procesados y cuántas veces y cuánto tiempo esperó el EE, por motivo (`[vif1-stats]`) |
-| `PS2X_GS_STATS=1` | Cada segundo: píxeles que llegan al pipeline del GS y primitivas por tipo (`[gs-stats]`), y los sprites de más de 60 000 píxeles (`[gs-big]`) |
+| `PS2X_VIF1_STATS=1` | Cada segundo: ocupación del hilo de VIF1 (y qué parte es VU1 y envío al GS, y cuánto de ese envío esperó con la cola del GS llena), bloques procesados y cuántas veces y cuánto tiempo esperó el EE, por motivo (`[vif1-stats]`) |
+| `PS2X_GS_STATS=1` | Cada segundo: píxeles y primitivas por tipo (`[gs-stats]`), sprites de más de 60 000 píxeles (`[gs-big]`) y, en `[gs-flush]`, lotes del pipeline de franjas, espera por huecos, CLUT leídas de la VRAM sombra, casos de lectura tras escritura y esperas del hilo del GS por motivo |
+| `PS2X_GS_SHADOW_CLUT=0`, `PS2X_GS_IMMEDIATE_UPLOAD=0` | Diagnóstico del pipeline del GS (parche `0012`): las cargas de CLUT no leen la VRAM sombra; las subidas host→local siempre van en cola |
+| `PS2X_GS_SELF_NOW=0`, `PS2X_GS_SELF_COPY=0` | Las primitivas que leen páginas que escriben no se dibujan al momento en el hilo del GS / no se dibujan desde una copia congelada (esperan a todo y se dibujan en el hilo del GS) |
+| `PS2X_GS_RAW_BARRIER=0`, `PS2X_GS_RAW_TRIM=1`, `PS2X_GS_UV_READS=1` | Sin barrera cuando una primitiva lee páginas que dibuja un lote en curso; barrera solo si el que escribe va después de la última barrera; páginas leídas según las coordenadas en vez de la textura entera |
+| `PS2X_GS_DEFER_CLUT=1` | Experimental: una CLUT cuyas páginas dibuja un lote en curso la carga el hilo de rasterizado 0 en orden, en vez de esperar (puede dar paletas incorrectas) |
 | `PS2X_AUDIO=0` | Sin salida de audio del SPU2 |
 | `PS2X_AUDIO_DUMP=<fichero>` | Vuelca toda la mezcla del SPU2 en PCM crudo (estéreo, 16 bits, 48 kHz) |
 | `PS2X_PROFILE_CALLS=<n>` | Cada `n` llamadas entre funciones del juego, imprime las 30 más llamadas (`tools/disasm.py --sym` las traduce) |

@@ -42,8 +42,12 @@ set_target_properties(TwoTowersRecomp PROPERTIES
     VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_DIR:TwoTowersRecomp>")
 
 # VU microprogram benchmark and fast-engine check on captured runs (PS2X_VU_CAPTURE); see docs/DEBUGGING.md.
-add_executable(ttr_vu_bench debug/vu_bench.cpp)
+add_executable(ttr_vu_bench debug/vu_bench.cpp debug/sampling_profiler.cpp)
 target_link_libraries(ttr_vu_bench PRIVATE ps2_runtime)
+target_include_directories(ttr_vu_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+if(WIN32)
+    target_link_libraries(ttr_vu_bench PRIVATE dbghelp)
+endif()
 if(MSVC)
     target_link_options(ttr_vu_bench PRIVATE "/FORCE:MULTIPLE")
     target_compile_options(ttr_vu_bench PRIVATE /utf-8)

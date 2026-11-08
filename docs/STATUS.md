@@ -5,8 +5,8 @@
 Fase: **en progreso**. Arranca, reproduce los vídeos y entra en la misión del prólogo: la cinemática en el
 motor y la batalla se dibujan con personajes, el mando mueve a Isildur y el tutorial avanza ("Atacar
 Rápido" → "Atacar Fiero"). Los menús (pausa, opciones, "Salir a Menú") responden y el SPU2 suena por el
-host. **Bloqueo actual: velocidad.** En la batalla del prólogo va a ~14-15 VBlanks/s en la build `Release`
-(~30 % de la velocidad real; eran 3-4 antes del motor rápido de VU y del GS por lotes). Ver *Rendimiento*.
+host. **Bloqueo actual: velocidad.** En la batalla del prólogo va a ~17-18 VBlanks/s en la build `Release`
+(~35 % de la velocidad real; eran 3-4 antes del motor rápido de VU y del GS por lotes). Ver *Rendimiento*.
 
 ## Progreso del arranque
 
@@ -26,7 +26,7 @@ host. **Bloqueo actual: velocidad.** En la batalla del prólogo va a ~14-15 VBla
 | Control con el mando: Isildur avanza con el stick, ataques y tutorial | ✅ (con `TTR_PAD_SCRIPT`) |
 | Menú de pausa de la misión, opciones, confirmación de "Salir a Menú" | ✅ |
 | Sonido: mezcla del SPU2 al host (raylib, 48 kHz) | ✅ (falta escucharlo con calma: AutoDMA, efectos, reverb) |
-| Velocidad jugable con personajes | ⚠️ ~14-15 VBlanks/s en batalla, ~25 en cinemáticas, ~5 con humo a pantalla completa |
+| Velocidad jugable con personajes | ⚠️ ~17-18 VBlanks/s en batalla, ~14-15 en la cinemática del motor, ~8 con humo a pantalla completa |
 | Menú principal y nueva partida desde cero | pendiente |
 
 ## Problemas resueltos
@@ -162,6 +162,35 @@ El motor de VU se mide fuera del juego con `ttr_vu_bench` sobre 3000 ejecuciones
 (`PS2X_VU_CAPTURE`): 30,4 ns por par al empezar, 22,5 ns tras quitar los flags que nadie lee (el microcódigo no
 usa nunca el registro de estado) y llevar la disponibilidad de registros en SSE; siempre idéntico al intérprete.
 
+### Compilador de bloques de VU y pipeline del GS sin esperas (parche `0012`)
+
+`PS2X_VIF1_STATS` mostró que en la batalla el hilo de VIF1 pasaba hasta un 55 % del tiempo bloqueado con la cola
+del GS llena, y `PS2X_GS_STATS` por qué: el hilo del GS esperaba a todos los hilos de rasterizado en cada carga
+de CLUT (~1000/s), cada `TEXFLUSH` y cada subida de textura. Ahora cada lote del pipeline de franjas lleva su copia
+de la CLUT, su época de caché de texturas y las páginas de VRAM que lee y escribe, y el hilo del GS solo espera
+cuando hay una dependencia real:
+
+- Carga de CLUT: si ningún lote en curso escribe sus páginas, se lee al momento. Si solo las escriben subidas en
+  cola, se lee de una VRAM sombra a la que el hilo del GS también aplica esas subidas.
+- `TEXFLUSH`: barrera dentro del pipeline (los hilos de rasterizado se esperan entre ellos) en vez de una espera
+  del hilo del GS.
+- Subidas host→local: al momento si no tocan nada en curso; si no, en orden en el hilo de rasterizado 0. En los
+  dos casos las cachés de página de los hilos se vacían para los lotes siguientes.
+- Lectura tras escritura: una primitiva que muestrea páginas que dibuja el lote pendiente o uno en curso va tras
+  una barrera. Las que leen las páginas que escriben ellas mismas (conversiones de formato en el sitio, unas
+  10 000/s, y posproceso sobre el propio framebuffer) se dibujan en orden: las pequeñas al momento en el hilo del
+  GS, las grandes en todos los hilos desde una copia congelada de las páginas que leen.
+
+Esto último corrige una carrera que ya existía con las franjas: el hilo que dibujaba una franja podía leer una
+página antes o después de que otro la escribiera, y la lluvia salía a veces con rayas moradas.
+
+El compilador de bloques de VU traduce cada tramo recto de pares a código x64 que llama a los manejadores (y emite
+en línea las FMAC sin flags) y lleva ciclos, disponibilidad de registros y saltos igual que el bucle. Las
+comprobaciones de espera se hacen en línea con SSE y solo donde un registro puede no estar listo (`kNoStall`, que
+también usa el bucle). Una caché por contenido evita volver a decodificar y compilar el microcódigo que el juego
+vuelve a subir (15 imágenes y 23 cambios en 3000 ejecuciones). `ttr_vu_bench`: 22,4 → 14,2 ns por par, idéntico al
+intérprete en las 3000 ejecuciones.
+
 ### Escenas con personajes a 2-3 VBlanks/s (intérprete de VU1)
 
 `PS2X_VU_STATS=1` mide 3,4 M pares de instrucciones de VU1 por segundo en la cinemática del prólogo: unos
@@ -196,31 +225,36 @@ Ahora el límite es el GS: el nivel dibuja unos 3,2 M píxeles por VBlank (unas 
 completa por frame: posproceso en franjas de sprites, triángulos aditivos gigantes y la cúpula del cielo con
 filtrado bilineal) a ~100 ns por píxel y hilo.
 
-Medido con la build `Release` (Ryzen 5 3600X, 6 núcleos/12 hilos) tras el parche `0010`:
+Medido con la build `Release` (Ryzen 5 3600X, 6 núcleos/12 hilos) tras el parche `0012`:
 
 | Escena | VBlanks/s | Límite |
 | --- | --- | --- |
 | Vídeos FMV | 50 | ninguno (tiempo real) |
-| Cinemática del prólogo en el motor | ~20-25 | GS (posproceso y personajes) |
-| Plano con humo a pantalla completa | ~5 | GS (~16 M píxeles por frame) |
-| Batalla del prólogo | ~14-15 | hilo de VIF1: envío de primitivas al GS (~35 %) y VU1 (~45 %) |
+| Cinemática del prólogo en el motor | ~14-15 (eran ~11) | hilo de VIF1 (VU1) y GS |
+| Plano con humo a pantalla completa | ~8 | GS (~16 M píxeles por frame) |
+| Batalla del prólogo | ~17-18 (eran ~14,5) | hilo de VIF1: VU1 y espera a la cola del GS (~25 %) |
 
-En la batalla los hilos de rasterizado están ocupados en un ~40 % y el EE en un ~15 % (el resto espera al hilo
-de VIF1). Para 50 VBlanks/s ese hilo tendría que hacer su trabajo de cada frame unas 3,5 veces más deprisa.
+Ningún hilo está saturado: en la batalla el EE trabaja un ~20 % (espera al hilo de VIF1), el hilo de VIF1 un ~60 %
+(la mitad en VU1), el del GS un ~60 % y los de rasterizado un ~40-50 %. Cada etapa espera a la siguiente: para
+50 VBlanks/s el hilo de VIF1 tendría que hacer el trabajo de cada frame unas 2,5 veces más deprisa y el
+rasterizado no debería frenar su cola.
 
 ## Siguiente
 
-1. **Envío de primitivas al GS** (~35 % del hilo de VIF1 en la batalla): cada triángulo copia el estado
-   completo del GS (contexto, TEXA, CLUT...) al montarse y otra vez al encolarse. Encolar el estado solo cuando
-   cambia y las primitivas con una referencia a él.
-2. **Motor de VU** (~45 %, 22,5 ns por par): un JIT de bloques a x64 (como microVU) bajaría a pocos ns; con
-   `ttr_vu_bench` se puede iterar y comprobar sin arrancar el juego.
-3. **Coste por píxel del GS** (límite de las cinemáticas y del humo): direcciones de VRAM separables por
-   fila/columna (tablas de desplazamiento) en vez de funciones por formato, y bucles especializados para los
-   sprites de posproceso.
+1. **VU1 en el hilo de VIF1**: emitir en línea las FMAC con flags, las cargas/almacenamientos y la aritmética de
+   VI (hoy son llamadas), y abaratar `commit` y las esperas de Q/P; `ttr_vu_bench` lo comprueba sin arrancar el
+   juego.
+2. **Rasterizado**: coste por píxel (direcciones de VRAM por fila/columna, bucles de sprite especializados) y
+   reparto de las subidas en cola, que hoy hace solo el hilo 0 mientras los demás esperan.
+3. **Envío de primitivas al GS**: cada triángulo copia el estado completo del GS al montarse y al encolarse.
 4. Llegar al menú principal sin pasar por la misión y empezar una partida nueva; escuchar el audio.
 
 ## Observaciones
+
+- Pipeline del GS: en raras ocasiones (1 frame de cada ~50 en algunas ejecuciones) aparecen unos pocos píxeles
+  morados en rejilla; con las barreras actuales no se ha podido reproducir a voluntad. `PS2X_GS_SELF_NOW=0`,
+  `PS2X_GS_SELF_COPY=0`, `PS2X_GS_IMMEDIATE_UPLOAD=0` y `PS2X_GS_SHADOW_CLUT=0` desactivan cada optimización para
+  aislarlo.
 
 - ~1000 avisos de `JR`/`JALR` sin resolver (vtables de C++ y jump tables); el runtime los resuelve por
   búsqueda en tiempo de ejecución.

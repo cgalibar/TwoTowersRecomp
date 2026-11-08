@@ -6,7 +6,9 @@
 // 2. times the fast engine (and the interpreter) over all records and prints ns per instruction pair.
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ps2_vu1.h"
+#include "debug/sampling_profiler.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -62,6 +64,7 @@ int main(int argc, char **argv)
         return 2;
     }
     const int repeats = argc > 2 ? std::atoi(argv[2]) : 5;
+    ttr::debug::startSamplingProfilerFromEnvironment(); // TTR_PROFILE, as in the game
 
     FILE *file = std::fopen(argv[1], "rb");
     if (!file)
@@ -90,6 +93,18 @@ int main(int argc, char **argv)
     }
     std::fclose(file);
     std::printf("%zu records\n", records.size());
+    {
+        size_t changes = 0;
+        std::vector<uint64_t> keys;
+        for (size_t i = 0; i < records.size(); ++i)
+        {
+            if (i == 0 || records[i].codeKey != records[i - 1].codeKey)
+                ++changes;
+            if (std::find(keys.begin(), keys.end(), records[i].codeKey) == keys.end())
+                keys.push_back(records[i].codeKey);
+        }
+        std::printf("%zu code images, %zu changes between consecutive records\n", keys.size(), changes);
+    }
 
     GS gs;
     VU1Interpreter fastVu(VU1Interpreter::Unit::VU1);

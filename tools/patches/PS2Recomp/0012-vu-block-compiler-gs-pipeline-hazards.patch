@@ -1,0 +1,2904 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_async_backend.h b/ps2xRuntime/include/runtime/gs/gs_async_backend.h
+index 919aa53..edacca8 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_async_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_async_backend.h
+@@ -31,6 +31,7 @@ public:
+     void UploadImage(const uint8_t *data, uint32_t sizeBytes) override;
+ 
+     void Flush() override;
++    void Kick() override;
+     void TextureFlush() override;
+     void Sync(GSSyncReason reason) override;
+     PresentationFrame Present(const GSPresentationRequest &request) override;
+@@ -67,10 +68,14 @@ private:
+         std::vector<uint8_t> data;
+     };
+ 
+-    static constexpr uint64_t kCapacity = 1024u;
++    static constexpr uint64_t kCapacity = 8192u;
++    // Primitives are published to the GS thread in groups (and at the end of every GIF packet, by Kick),
++    // so the shared counters change once per group instead of once per primitive.
++    static constexpr uint64_t kPublishBatch = 32u;
+ 
+     template <typename Fill>
+-    void push(Fill &&fill);
++    void push(Fill &&fill, bool publishNow = true);
++    void publishUnlocked() const;
+     void waitForExecuted(uint64_t count) const;
+     void waitIdle() const;
+     void run();
+@@ -82,10 +87,14 @@ private:
+     bool m_hasPresented = false;
+     std::atomic<bool> m_presentQueued{false};
+     std::vector<Command> m_ring;
+-    std::mutex m_producerMutex;
+-    std::atomic<uint64_t> m_queued{0};
+-    std::atomic<uint64_t> m_executed{0};
+-    mutable std::atomic<uint32_t> m_executedWaiters{0};
++    // Producer side, under m_producerMutex: commands written to the ring and how many of them are published.
++    mutable std::mutex m_producerMutex;
++    uint64_t m_written = 0;
++    mutable uint64_t m_published = 0;
++    // Each counter on its own cache line: the producer writes m_queued, the GS thread m_executed.
++    alignas(64) mutable std::atomic<uint64_t> m_queued{0};
++    alignas(64) std::atomic<uint64_t> m_executed{0};
++    alignas(64) mutable std::atomic<uint32_t> m_executedWaiters{0};
+     std::atomic<bool> m_threadSleeping{false};
+     std::thread m_thread;
+ };
+diff --git a/ps2xRuntime/include/runtime/gs/gs_backend.h b/ps2xRuntime/include/runtime/gs/gs_backend.h
+index 3f00d01..9f4f61a 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_backend.h
+@@ -20,6 +20,8 @@ public:
+     virtual void UploadImage(const uint8_t *data, uint32_t sizeBytes) = 0;
+ 
+     virtual void Flush() = 0;
++    // The caller has finished a GIF packet: a queued backend hands over what it is still holding back.
++    virtual void Kick() {}
+     virtual void TextureFlush() = 0;
+     virtual void Sync(GSSyncReason reason) = 0;
+     virtual PresentationFrame Present(const GSPresentationRequest &request) = 0;
+diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+index a3d2b76..ab2ce36 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+@@ -4,6 +4,7 @@
+ #include "runtime/gs/gs_texture_page_cache.h"
+ 
+ #include <array>
++#include <bitset>
+ #include <cstdint>
+ #include <functional>
+ #include <memory>
+@@ -47,7 +48,8 @@ public:
+ 
+ private:
+     void ResetUnlocked();
+-    void LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut);
++    void LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut, const uint8_t *vram = nullptr,
++                          std::array<uint16_t, 512> *target = nullptr, GSMem::TexturePageCache *cache = nullptr);
+     uint32_t ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
+     uint32_t ReadTextureVramUnlocked(GSMem::TexturePageCache &cache, uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y);
+     void WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
+@@ -55,13 +57,31 @@ private:
+     void DrawPrimitive(const GSPrimitiveBatch &batch);
+     // Small triangles and sprites wait in m_pending and are then drawn by all raster threads at once, each
+     // one owning interleaved bands of 8 rows (every pixel is still written by one thread, in submission
+-    // order). Anything that reads or writes VRAM, the CLUT or the texture cache draws them first.
+-    void FlushPendingUnlocked() const;
++    // order). Each handed-over batch carries the CLUT and texture-cache epoch it was submitted with, so a
++    // CLUT load or TEXFLUSH does not wait for it; anything that reads or writes VRAM draws them first.
++    void FlushPendingUnlocked(int reason = 0) const;
+     // Hands m_pending to the band pipeline and returns: the GS thread keeps accepting primitives into the
+     // next batch meanwhile. WaitInflightUnlocked() waits until every handed-over batch is drawn.
+     void DrawPendingUnlocked();
+     void WaitInflightUnlocked();
+-    void DrawBatchBands(const std::vector<GSPrimitiveBatch> &batches, unsigned phase, unsigned stride);
++    void DrawBatchBands(const std::vector<GSPrimitiveBatch> &batches, const uint16_t *clut, uint32_t textureEpoch,
++                        const uint8_t *textureVram, unsigned phase, unsigned stride);
++    // VRAM pages (8 KiB) that the primitives in m_pending may write (frame and Z buffer) or read (texture).
++    void MarkPendingWritesUnlocked(const GSPrimitiveBatch &batch);
++    void MarkPendingReadsUnlocked(const std::bitset<512> &pages) { m_pendingReads |= pages; }
++    // Texture pages a primitive samples (the texels under its texture coordinates, with the wrap mode) and
++    // pages it writes (its box in the scissor).
++    std::bitset<512> PrimitiveReadPages(const GSPrimitiveBatch &batch) const;
++    std::bitset<512> PrimitiveWritePages(const GSPrimitiveBatch &batch) const;
++    void BeginTransferUnlocked(const GSTransferCommand &command, GSTransferCommand &transfer, GSTransferSnapshot &state);
++    // Shadow VRAM: queued host-to-local transfers are also applied, on the GS thread, to a copy of the pages
++    // they write (copied from VRAM first). A CLUT load whose pages only queued transfers write reads the copy
++    // instead of waiting for the band workers. A page's copy is dropped when anything else writes it.
++    // Makes copies of `pages` where it can; returns the pages that have one.
++    std::bitset<512> ShadowPrepareUnlocked(const std::bitset<512> &pages);
++    void UploadImageUnlocked(const uint8_t *data, uint32_t sizeBytes, GSTransferCommand &transfer, GSTransferSnapshot &state,
++                             uint8_t *vram);
++    const uint16_t *ActiveClut() const;
+     void DrawSprite(const GSPrimitiveBatch &batch);
+     void DrawTriangle(const GSPrimitiveBatch &batch);
+     void DrawLine(const GSPrimitiveBatch &batch);
+@@ -98,6 +118,12 @@ private:
+     std::array<ReadVramFunc, kPsmHandlerCount> m_readVramFuncs{};
+     std::array<WriteVramFunc, kPsmHandlerCount> m_writeVramFuncs{};
+     std::array<uint16_t, 512> m_clut{};
++    // Deferred CLUT loads: a load whose source pages batches in flight still draw runs on band worker 0, in
++    // order, into m_workerClut; until the pipeline drains, every batch takes its CLUT from there.
++    std::array<uint16_t, 512> m_workerClut{};
++    GSMem::TexturePageCache m_workerClutCache;
++    bool m_clutDeferred = false;
++    void ResyncClutUnlocked();
+     std::array<uint32_t, 2> m_clutCbp{};
+     GSMem::TexturePageCache m_texturePageCache;
+     std::vector<GSMem::TexturePageCache> m_workerTextureCaches;
+@@ -108,6 +134,45 @@ private:
+     std::unique_ptr<GSRasterWorkers> m_rasterWorkers;
+ 
+     mutable std::vector<GSPrimitiveBatch> m_pending;
++    std::bitset<512> m_pendingWrites;
++    std::bitset<512> m_pendingReads;
++    // Pages written by the batches handed over since the pipeline was last idle (a superset of those in flight).
++    std::bitset<512> m_inflightWritesUnion;
++    // A large primitive that samples pages it draws is drawn by all band workers from a frozen copy of those
++    // pages (taken by worker 0 once everything before it is drawn), in a slot of its own.
++    std::unique_ptr<uint8_t[]> m_textureSnapshot;
++    const uint8_t *m_nextTextureVram = nullptr;
++    // Last page sets of PrimitiveReadPages / PrimitiveWritePages, by buffer and page rectangle.
++    mutable uint64_t m_readPagesKey1 = ~0ull, m_readPagesKey2 = ~0ull;
++    mutable std::bitset<512> m_readPagesCached;
++    mutable uint64_t m_writePagesKey1 = ~0ull, m_writePagesKey2 = ~0ull;
++    mutable std::bitset<512> m_writePagesCached;
++
++    // Pages written by m_pendingSerial: in flight only until worker 0 has run the transfers.
++    std::bitset<512> m_pendingTransferWrites;
++    uint64_t m_lastWriteKey = ~0ull;
++    uint64_t m_lastWriteKey2 = ~0ull;
++    // The next handed-over batch starts only once every earlier one is drawn (set by TEXFLUSH: an earlier
++    // batch may have drawn into the texture a later one reads).
++    bool m_barrierNext = false;
++    // Host-to-local transfers queued for the band workers: they run in order with the batches (before the
++    // primitives submitted after them) instead of the GS thread waiting for every batch first.
++    std::vector<std::function<void()>> m_pendingSerial;
++    // Whether an op in m_pendingSerial needs every earlier batch drawn first (transfers, CLUT loads from pages
++    // being drawn); CLUT loads from settled pages only need worker 0 to reach them.
++    bool m_pendingSerialBarrier = false;
++    bool m_serialTransfer = false;
++    std::unique_ptr<uint8_t[]> m_shadowVram;
++    std::bitset<512> m_shadowValid;
++    GSMem::TexturePageCache m_shadowPageCache;
++    GSTransferCommand m_shadowTransfer{};
++    GSTransferSnapshot m_shadowTransferState{};
++    bool m_shadowActive = false; // the current queued transfer is also applied to the shadow
++    // A host-to-local transfer that touches nothing queued or being drawn runs at once on the GS thread, with
++    // its own state (a queued one may be running on a band worker with m_transfer meanwhile).
++    bool m_immediateTransfer = false;
++    GSTransferCommand m_immTransfer{};
++    GSTransferSnapshot m_immTransferState{};
+     std::unique_ptr<GSBandPipeline> m_bandPipeline;
+ 
+     GSTransferCommand m_transfer{};
+diff --git a/ps2xRuntime/include/runtime/ps2_vif1_worker.h b/ps2xRuntime/include/runtime/ps2_vif1_worker.h
+index 83e6767..dfb4bf6 100644
+--- a/ps2xRuntime/include/runtime/ps2_vif1_worker.h
++++ b/ps2xRuntime/include/runtime/ps2_vif1_worker.h
+@@ -63,7 +63,8 @@ namespace ps2x
+ 
+     // The worker that GS and memory accesses must wait for (null when VIF1 runs inline).
+     void setActiveVif1Worker(Vif1Worker *worker);
+-    // PS2X_VIF1_STATS: time the worker spends in a part of its work (0 = VU1 microprograms, 1 = GS submission).
++    // PS2X_VIF1_STATS: time the worker spends in a part of its work (0 = VU1 MSCAL, 1 = GS submission,
++    // 2 = blocked on a full GS queue, inside 1; 3 = VU1 MSCNT).
+     bool vif1StatsEnabled();
+     void vif1StatsAddPart(uint32_t part, uint64_t ns);
+ 
+diff --git a/ps2xRuntime/src/lib/gs/gs_async_backend.cpp b/ps2xRuntime/src/lib/gs/gs_async_backend.cpp
+index 8c1373d..2a03f3c 100644
+--- a/ps2xRuntime/src/lib/gs/gs_async_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_async_backend.cpp
+@@ -1,5 +1,8 @@
+ #include "runtime/gs/gs_async_backend.h"
+ #include "runtime/gs/gs_cpu_backend.h"
++#include "runtime/ps2_vif1_worker.h"
++
++#include <chrono>
+ 
+ #include <cstdlib>
+ #include <cstring>
+@@ -23,15 +26,38 @@ namespace
+ }
+ 
+ template <typename Fill>
+-void GSAsyncBackend::push(Fill &&fill)
++void GSAsyncBackend::push(Fill &&fill, bool publishNow)
+ {
+     std::lock_guard<std::mutex> lock(m_producerMutex);
+-    const uint64_t queued = m_queued.load(std::memory_order_relaxed);
+-    if (queued >= kCapacity)
+-        waitForExecuted(queued - kCapacity + 1u);
+-    fill(m_ring[queued % kCapacity]);
++    const uint64_t index = m_written;
++    if (index >= kCapacity)
++    {
++        // The slot is free once the command kCapacity places back has run; it must be published to run.
++        publishUnlocked();
++        if (ps2x::vif1StatsEnabled() && m_executed.load(std::memory_order_acquire) < index - kCapacity + 1u)
++        {
++            const auto start = std::chrono::steady_clock::now();
++            waitForExecuted(index - kCapacity + 1u);
++            ps2x::vif1StatsAddPart(2u, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                                                  std::chrono::steady_clock::now() - start)
++                                                                  .count()));
++        }
++        else
++            waitForExecuted(index - kCapacity + 1u);
++    }
++    fill(m_ring[index % kCapacity]);
++    m_written = index + 1u;
++    if (publishNow || m_written - m_published >= kPublishBatch)
++        publishUnlocked();
++}
++
++void GSAsyncBackend::publishUnlocked() const
++{
++    if (m_published == m_written)
++        return;
++    m_published = m_written;
+     // seq_cst pairs with the GS thread's m_threadSleeping store and m_queued check before it sleeps.
+-    m_queued.store(queued + 1u, std::memory_order_seq_cst);
++    m_queued.store(m_written, std::memory_order_seq_cst);
+     if (m_threadSleeping.load(std::memory_order_seq_cst))
+         m_queued.notify_one();
+ }
+@@ -70,7 +96,13 @@ void GSAsyncBackend::waitForExecuted(uint64_t count) const
+ 
+ void GSAsyncBackend::waitIdle() const
+ {
+-    waitForExecuted(m_queued.load(std::memory_order_acquire));
++    uint64_t target = 0;
++    {
++        std::lock_guard<std::mutex> lock(m_producerMutex);
++        publishUnlocked();
++        target = m_written;
++    }
++    waitForExecuted(target);
+ }
+ 
+ void GSAsyncBackend::run()
+@@ -163,7 +195,14 @@ void GSAsyncBackend::Submit(const GSPrimitiveBatch &batch)
+     push([&](Command &command)
+          {
+              command.type = CommandType::Submit;
+-             command.batch = batch; });
++             command.batch = batch; },
++         false);
++}
++
++void GSAsyncBackend::Kick()
++{
++    std::lock_guard<std::mutex> lock(m_producerMutex);
++    publishUnlocked();
+ }
+ 
+ void GSAsyncBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 6187cd1..c3072de 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -7,6 +7,7 @@
+ #include "runtime/gs/ps2_gs_memory.h"
+ #include "ps2_log.h"
+ #include <atomic>
++#include <bitset>
+ #include <chrono>
+ #include <algorithm>
+ #include <cmath>
+@@ -54,6 +55,8 @@ namespace
+         int stride = 0;
+         int phase = 0;
+         GSMem::TexturePageCache *cache = nullptr;
++        const uint16_t *clut = nullptr; // the batch's CLUT (band workers); null: the backend's current one
++        const uint8_t *textureVram = nullptr; // textures read from this copy of VRAM (null: VRAM)
+     };
+     thread_local RowInterleave t_interleave;
+ 
+@@ -85,6 +88,58 @@ namespace
+     std::atomic<uint64_t> g_statPixels{0};
+     std::atomic<uint64_t> g_statPrims[8]{};
+     std::chrono::steady_clock::time_point g_statLast = std::chrono::steady_clock::now();
++    // Flushes that found batches still being drawn, by reason, and the time the GS thread waited for them.
++    enum FlushReason
++    {
++        kFlushOther,
++        kFlushPrim,
++        kFlushClut,
++        kFlushFinish,
++        kFlushTexFlush,
++        kFlushSync,
++        kFlushVram,
++        kFlushTransfer,
++        kFlushUpload,
++        kFlushClear,
++        kFlushReasons
++    };
++    const char *const kFlushReasonNames[kFlushReasons] = {"other", "prim", "clut", "flush", "texflush", "sync",
++                                                          "vram", "transfer", "upload", "clear"};
++    std::atomic<uint64_t> g_flushCount[kFlushReasons]{};
++    std::atomic<uint64_t> g_flushWaitNs[kFlushReasons]{};
++    std::atomic<uint64_t> g_publishWaitNs{0};
++    std::atomic<uint64_t> g_clutShadowLoads{0};
++    std::atomic<uint64_t> g_clutDeferred{0};
++    std::atomic<uint64_t> g_rawSelf{0}, g_rawSelfNow{0}, g_rawSelfCopy{0}, g_rawPending{0}, g_rawInflight{0};
++    // Diagnostics switches: PS2X_GS_SHADOW_CLUT=0 (CLUT loads never read the shadow VRAM), PS2X_GS_IMMEDIATE_UPLOAD=0
++    // (host-to-local transfers are always queued).
++    const bool g_gsShadowClut = []
++    {
++        const char *env = std::getenv("PS2X_GS_SHADOW_CLUT");
++        return !(env && env[0] == '0');
++    }();
++    const bool g_gsSelfNow = []
++    {
++        const char *env = std::getenv("PS2X_GS_SELF_NOW");
++        return !(env && env[0] == '0');
++    }();
++    const bool g_gsSelfCopy = []
++    {
++        const char *env = std::getenv("PS2X_GS_SELF_COPY");
++        return !(env && env[0] == '0');
++    }();
++    const bool g_gsImmediateUploads = []
++    {
++        const char *env = std::getenv("PS2X_GS_IMMEDIATE_UPLOAD");
++        return !(env && env[0] == '0');
++    }();
++    // PS2X_GS_RAW_BARRIER=1: a primitive that samples pages a batch in flight draws waits for it (barrier).
++    const bool g_rawFlightBarrier = []
++    {
++        const char *env = std::getenv("PS2X_GS_RAW_BARRIER");
++        return !(env && env[0] == '0');
++    }();
++    std::atomic<uint64_t> g_publishCount{0};
+ 
+     void gsStatsFlushThread()
+     {
+@@ -109,6 +164,28 @@ namespace
+                                                      g_statPrims[GS_PRIM_TRIFAN].exchange(0)),
+                      static_cast<unsigned long long>(g_statPrims[GS_PRIM_POINT].exchange(0) + g_statPrims[GS_PRIM_LINE].exchange(0) +
+                                                      g_statPrims[GS_PRIM_LINESTRIP].exchange(0)));
++        char line[512];
++        int len = std::snprintf(line, sizeof(line),
++                                "[gs-flush] batches=%llu slot-wait=%.0fms clut-from-copy=%llu clut-deferred=%llu "
++                                "read-after-write: self=%llu (drawn at once %llu, from a copy %llu) batch=%llu flight=%llu waits:",
++                                static_cast<unsigned long long>(g_publishCount.exchange(0)),
++                                static_cast<double>(g_publishWaitNs.exchange(0)) / 1e6,
++                                static_cast<unsigned long long>(g_clutShadowLoads.exchange(0)),
++                                static_cast<unsigned long long>(g_clutDeferred.exchange(0)),
++                                static_cast<unsigned long long>(g_rawSelf.exchange(0)),
++                                static_cast<unsigned long long>(g_rawSelfNow.exchange(0)),
++                                static_cast<unsigned long long>(g_rawSelfCopy.exchange(0)),
++                                static_cast<unsigned long long>(g_rawPending.exchange(0)),
++                                static_cast<unsigned long long>(g_rawInflight.exchange(0)));
++        for (int r = 0; r < kFlushReasons && len > 0 && len < static_cast<int>(sizeof(line)); ++r)
++        {
++            const uint64_t count = g_flushCount[r].exchange(0);
++            const uint64_t ns = g_flushWaitNs[r].exchange(0);
++            if (count != 0u)
++                len += std::snprintf(line + len, sizeof(line) - static_cast<size_t>(len), " %s=%llu/%.0fms",
++                                     kFlushReasonNames[r], static_cast<unsigned long long>(count), static_cast<double>(ns) / 1e6);
++        }
++        std::fprintf(stderr, "%s\n", line);
+     }
+ }
+ 
+@@ -119,7 +196,23 @@ namespace
+ class GSBandPipeline
+ {
+ public:
+-    using DrawFn = std::function<void(const std::vector<GSPrimitiveBatch> &, unsigned phase, unsigned stride)>;
++    struct Slot
++    {
++        std::vector<GSPrimitiveBatch> primitives;
++        std::array<uint16_t, 512> clut{};
++        uint32_t textureEpoch = 0;
++        bool barrier = false;
++        std::bitset<512> writes;
++        std::bitset<512> reads;
++        std::bitset<512> transferWrites;
++        // Run by worker 0 before the primitives, once every earlier slot is drawn, with the others waiting.
++        std::vector<std::function<void()>> serial;
++        // The CLUT comes from worker 0 (deferred CLUT loads): it copies it into `clut` before the others draw.
++        bool clutFromWorker = false;
++        const uint8_t *textureVram = nullptr;
++        bool serialBarrier = false;
++    };
++    using DrawFn = std::function<void(const Slot &, unsigned phase, unsigned stride)>;
+ 
+     GSBandPipeline(unsigned workers, DrawFn draw)
+         : m_draw(std::move(draw)), m_workers(workers), m_done(new std::atomic<uint64_t>[workers])
+@@ -146,17 +239,102 @@ public:
+     unsigned workerCount() const { return m_workers; }
+ 
+     // Takes the primitives (swapping in an empty vector with the slot's old capacity).
+-    void publish(std::vector<GSPrimitiveBatch> &batch)
++    // Returns the slot's published index.
++    uint64_t publish(std::vector<GSPrimitiveBatch> &batch, const std::array<uint16_t, 512> &clut, uint32_t textureEpoch,
++                     bool barrier, const std::bitset<512> &writes, const std::bitset<512> &reads,
++                     const std::bitset<512> &transferWrites, std::vector<std::function<void()>> &serial,
++                     bool serialBarrier, const std::array<uint16_t, 512> *workerClut, const uint8_t *textureVram = nullptr)
+     {
+         const uint64_t published = m_published.load(std::memory_order_relaxed);
++        if (g_gsStats)
++        {
++            g_publishCount.fetch_add(1u, std::memory_order_relaxed);
++            if (published - minDone() >= kSlots)
++            {
++                const auto start = std::chrono::steady_clock::now();
++                waitUntil([&]()
++                          { return published - minDone() < kSlots; });
++                g_publishWaitNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                                                    std::chrono::steady_clock::now() - start)
++                                                                    .count()),
++                                          std::memory_order_relaxed);
++            }
++        }
+         waitUntil([&]()
+                   { return published - minDone() < kSlots; });
+-        std::vector<GSPrimitiveBatch> &slot = m_slots[published % kSlots];
+-        slot.swap(batch);
++        Slot &slot = m_slots[published % kSlots];
++        slot.primitives.swap(batch);
+         batch.clear();
++        slot.clut = clut;
++        slot.textureEpoch = textureEpoch;
++        slot.barrier = barrier;
++        slot.writes = writes;
++        slot.reads = reads;
++        slot.transferWrites = transferWrites;
++        slot.serial.swap(serial);
++        serial.clear();
++        slot.clutFromWorker = workerClut != nullptr;
++        slot.serialBarrier = serialBarrier;
++        slot.textureVram = textureVram;
++        if (barrier || serialBarrier)
++            m_lastBarrierSlot = published;
++        if (workerClut)
++            m_workerClut = workerClut; // never cleared: older deferred slots may still be in flight
+         m_published.store(published + 1u, std::memory_order_release);
+         m_wake.fetch_add(1u, std::memory_order_acq_rel);
+         m_wake.notify_all();
++        return published;
++    }
++
++    bool idle() const { return minDone() >= m_published.load(std::memory_order_relaxed); }
++
++    // Whether a handed-over batch that is not drawn yet may read or write one of `pages` (a queued transfer
++    // counts until worker 0 has run it).
++    bool touchesPagesInFlight(const std::bitset<512> &pages) const
++    {
++        const uint64_t published = m_published.load(std::memory_order_relaxed);
++        const uint64_t serialDone = m_serialDone.load(std::memory_order_acquire);
++        for (uint64_t n = minDone(); n < published; ++n)
++        {
++            const Slot &slot = m_slots[n % kSlots];
++            if ((slot.writes & pages).any() || (slot.reads & pages).any())
++                return true;
++            if (n >= serialDone && (slot.transferWrites & pages).any())
++                return true;
++        }
++        return false;
++    }
++
++    // Whether primitives of a handed-over batch that is not drawn yet may write one of `pages`.
++    // A slot after a barrier slot starts once everything before that barrier is drawn: only the writers from
++    // the last barrier on can still be drawing when the next slot starts.
++    bool primitivesWriteInFlight(const std::bitset<512> &pages) const
++    {
++        const uint64_t published = m_published.load(std::memory_order_relaxed);
++        static const bool trim = []
++        {
++            const char *env = std::getenv("PS2X_GS_RAW_TRIM");
++            return env && env[0] == '1';
++        }();
++        for (uint64_t n = trim ? std::max(minDone(), m_lastBarrierSlot) : minDone(); n < published; ++n)
++            if ((m_slots[n % kSlots].writes & pages).any())
++                return true;
++        return false;
++    }
++
++    // Whether a handed-over batch that is not drawn yet may write VRAM page `page` (primitives until drawn,
++    // queued transfers until run).
++    bool writesPageInFlight(uint32_t page) const
++    {
++        const uint64_t published = m_published.load(std::memory_order_relaxed);
++        const uint64_t serialDone = m_serialDone.load(std::memory_order_acquire);
++        for (uint64_t n = minDone(); n < published; ++n)
++        {
++            const Slot &slot = m_slots[n % kSlots];
++            if (slot.writes.test(page & 511u) || (n >= serialDone && slot.transferWrites.test(page & 511u)))
++                return true;
++        }
++        return false;
+     }
+ 
+     void waitAll()
+@@ -167,7 +345,7 @@ public:
+     }
+ 
+ private:
+-    static constexpr uint64_t kSlots = 8u;
++    static constexpr uint64_t kSlots = 64u;
+     static constexpr uint32_t kSpinIterations = 4096u;
+ 
+     uint64_t minDone() const
+@@ -204,7 +382,31 @@ private:
+         {
+             if (next < m_published.load(std::memory_order_acquire))
+             {
+-                m_draw(m_slots[next % kSlots], k, stride);
++                Slot &slot = m_slots[next % kSlots];
++                // A barrier slot starts once every worker has drawn all the slots before it.
++                const bool serial = !slot.serial.empty();
++                if (slot.barrier || slot.serialBarrier)
++                    waitUntil([&]()
++                              { return minDone() >= next; });
++                if (serial || slot.clutFromWorker)
++                {
++                    // Worker 0 runs the slot's transfers and CLUT loads, takes the worker CLUT, and lets the
++                    // others draw the slot (only serial slots also wait for every earlier slot).
++                    if (k == 0u)
++                    {
++                        for (const std::function<void()> &op : slot.serial)
++                            op();
++                        if (slot.clutFromWorker && m_workerClut)
++                            slot.clut = *m_workerClut;
++                        m_serialDone.store(next + 1u, std::memory_order_release);
++                        m_progress.fetch_add(1u, std::memory_order_acq_rel);
++                        m_progress.notify_all();
++                    }
++                    else
++                        waitUntil([&]()
++                                  { return m_serialDone.load(std::memory_order_acquire) > next; });
++                }
++                m_draw(slot, k, stride);
+                 ++next;
+                 m_done[k].store(next, std::memory_order_release);
+                 m_progress.fetch_add(1u, std::memory_order_acq_rel);
+@@ -230,11 +432,14 @@ private:
+     }
+ 
+     DrawFn m_draw;
+-    std::vector<GSPrimitiveBatch> m_slots[kSlots];
++    Slot m_slots[kSlots];
+     std::atomic<uint64_t> m_published{0u};
+     const unsigned m_workers;
+     std::unique_ptr<std::atomic<uint64_t>[]> m_done;
+     std::atomic<uint32_t> m_progress{0u};
++    std::atomic<uint64_t> m_serialDone{0u};
++    uint64_t m_lastBarrierSlot = 0; // GS thread only
++    const std::array<uint16_t, 512> *m_workerClut = nullptr;
+     std::atomic<uint32_t> m_wake{0u};
+     std::atomic<bool> m_stop{false};
+     std::vector<std::thread> m_threads;
+@@ -840,8 +1045,8 @@ GSCpuBackend::GSCpuBackend()
+         m_workerTextureCaches.resize(workers);
+         m_workerTextureCacheEpochs.assign(workers, ~0u);
+         m_bandPipeline = std::make_unique<GSBandPipeline>(
+-            workers, [this](const std::vector<GSPrimitiveBatch> &batches, unsigned phase, unsigned stride)
+-            { DrawBatchBands(batches, phase, stride); });
++            workers, [this](const GSBandPipeline::Slot &slot, unsigned phase, unsigned stride)
++            { DrawBatchBands(slot.primitives, slot.clut.data(), slot.textureEpoch, slot.textureVram, phase, stride); });
+     }
+ }
+ 
+@@ -867,12 +1072,22 @@ void GSCpuBackend::Reset()
+     std::lock_guard<std::mutex> lock(m_mutex);
+     WaitInflightUnlocked();
+     m_pending.clear();
++    m_pendingSerial.clear();
++    m_serialTransfer = false;
++    m_immediateTransfer = false;
++    m_pendingReads.reset();
++    m_pendingWrites.reset();
++    m_pendingTransferWrites.reset();
++    m_shadowValid.reset();
++    m_shadowActive = false;
+     ResetUnlocked();
+ }
+ 
+ void GSCpuBackend::ResetUnlocked()
+ {
+     m_clut.fill(0u);
++    m_workerClut.fill(0u);
++    m_clutDeferred = false;
+     m_clutCbp.fill(0u);
+     m_texturePageCache.Invalidate();
+     ++m_textureCacheEpoch;
+@@ -927,21 +1142,402 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
+     const bool batchable = m_bandPipeline && (triangle || sprite);
+     if (!batchable)
+     {
+-        FlushPendingUnlocked();
++        FlushPendingUnlocked(kFlushPrim);
++        m_shadowValid.reset(); // drawn here, outside the page tracking
+         DrawPrimitive(batch);
+         return;
+     }
++    const std::bitset<512> reads = PrimitiveReadPages(batch); // empty without a texture
++    if (batch.state.prim.tme)
++    {
++        // Read after write: band workers draw a batch in parallel and keep page copies, so a primitive that
++        // samples pages drawn before it must not share a slot with their drawing, or start before it ends.
++        const std::bitset<512> writes = PrimitiveWritePages(batch);
++        if ((reads & writes).any())
++        {
++            // It samples what it draws: worker 0 draws it alone (all rows, fresh page copies) once everything
++            // before it is drawn; the primitives after it follow.
++            g_rawSelf.fetch_add(1u, std::memory_order_relaxed);
++            const float area = std::fabs((batch.vertices[1].x - batch.vertices[0].x) * (batch.vertices[1].y - batch.vertices[0].y)) +
++                               (batch.vertexCount > 2u ? std::fabs((batch.vertices[2].x - batch.vertices[0].x) *
++                                                                   (batch.vertices[2].y - batch.vertices[0].y))
++                                                       : 0.0f);
++            const std::bitset<512> touched = reads | writes;
++            if (g_gsSelfNow && area < 4096.0f && !m_clutDeferred && m_pendingSerial.empty() &&
++                !(touched & (m_pendingReads | m_pendingWrites | m_pendingTransferWrites)).any() &&
++                !m_bandPipeline->touchesPagesInFlight(touched))
++            {
++                // Nothing waiting or being drawn uses these pages: this thread draws it now, in order, and the
++                // band workers drop their page copies before the next batch.
++                m_texturePageCache.Invalidate();
++                DrawPrimitive(batch);
++                m_texturePageCache.Invalidate();
++                m_shadowValid &= ~writes;
++                ++m_textureCacheEpoch;
++                g_rawSelfNow.fetch_add(1u, std::memory_order_relaxed);
++                return;
++            }
++            if (g_gsSelfCopy && !m_clutDeferred && area >= 4096.0f)
++            {
++                // Large (post-processing in place): a slot of its own, after everything before it; worker 0
++                // copies the pages it samples and every worker draws its bands from that copy.
++                if (!m_textureSnapshot)
++                    m_textureSnapshot = std::make_unique<uint8_t[]>(GSMem::MEMORY_SIZE);
++                if (!m_pending.empty() || !m_pendingSerial.empty())
++                    DrawPendingUnlocked();
++                m_pendingSerial.emplace_back([this, reads]()
++                                             {
++                                                 for (uint32_t page = 0; page < 512u; ++page)
++                                                     if (reads.test(page))
++                                                         std::memcpy(m_textureSnapshot.get() + page * 8192u, m_vram + page * 8192u, 8192u); });
++                m_pendingSerialBarrier = true;
++                m_nextTextureVram = m_textureSnapshot.get();
++                MarkPendingWritesUnlocked(batch);
++                MarkPendingReadsUnlocked(reads);
++                m_pending.push_back(batch);
++                DrawPendingUnlocked();
++                ++m_textureCacheEpoch; // the next slot drops the copied pages from the workers' caches
++                m_shadowValid &= ~writes;
++                g_rawSelfCopy.fetch_add(1u, std::memory_order_relaxed);
++                return;
++            }
++            // Otherwise it waits for everything before it and is drawn here, alone.
++            FlushPendingUnlocked(kFlushPrim);
++            m_texturePageCache.Invalidate();
++            DrawPrimitive(batch);
++            m_texturePageCache.Invalidate();
++            m_shadowValid &= ~writes;
++            ++m_textureCacheEpoch;
++            return;
++        }
++        if ((reads & m_pendingWrites).any())
++        {
++            // Drawn in the waiting batch: that batch goes first, and this one starts after it, with fresh copies.
++            g_rawPending.fetch_add(1u, std::memory_order_relaxed);
++            DrawPendingUnlocked();
++            m_barrierNext = true;
++            ++m_textureCacheEpoch;
++        }
++        else if (g_rawFlightBarrier && !m_barrierNext && !m_pendingSerialBarrier && (reads & m_inflightWritesUnion).any() &&
++                 m_bandPipeline->primitivesWriteInFlight(reads))
++        {
++            g_rawInflight.fetch_add(1u, std::memory_order_relaxed);
++            m_barrierNext = true;
++            ++m_textureCacheEpoch;
++        }
++    }
++    MarkPendingWritesUnlocked(batch);
++    MarkPendingReadsUnlocked(reads);
+     m_pending.push_back(batch);
+     if (m_pending.size() >= kBatchMaxPrimitives)
+         DrawPendingUnlocked();
+ }
+ 
+-void GSCpuBackend::FlushPendingUnlocked() const
++void GSCpuBackend::MarkPendingWritesUnlocked(const GSPrimitiveBatch &batch)
++{
++    const GSContext &ctx = batch.state.context;
++    // Pixels a primitive can write: its bounding box (one pixel of margin) inside the scissor rectangle.
++    const uint32_t count = std::min<uint32_t>(batch.vertexCount, 3u);
++    float minX = batch.vertices[0].x, maxX = minX, minY = batch.vertices[0].y, maxY = minY;
++    for (uint32_t i = 1; i < count; ++i)
++    {
++        minX = std::min(minX, batch.vertices[i].x);
++        maxX = std::max(maxX, batch.vertices[i].x);
++        minY = std::min(minY, batch.vertices[i].y);
++        maxY = std::max(maxY, batch.vertices[i].y);
++    }
++    const int ofx = ctx.xyoffset.ofx >> 4, ofy = ctx.xyoffset.ofy >> 4;
++    const int x0 = std::max<int>(static_cast<int>(std::floor(minX)) - ofx - 1, ctx.scissor.x0);
++    const int x1 = std::min<int>(static_cast<int>(std::ceil(maxX)) - ofx + 1, ctx.scissor.x1);
++    const int y0 = std::max<int>(static_cast<int>(std::floor(minY)) - ofy - 1, ctx.scissor.y0);
++    const int y1 = std::min<int>(static_cast<int>(std::ceil(maxY)) - ofy + 1, ctx.scissor.y1);
++    if (x0 > x1 || y0 > y1)
++        return; // clipped away
++    const uint64_t key = static_cast<uint64_t>(ctx.frame.fbp & 0x1FFu) | (static_cast<uint64_t>(ctx.frame.fbw & 0x3Fu) << 9u) |
++                         (static_cast<uint64_t>(ctx.frame.psm & 0x3Fu) << 15u) | (static_cast<uint64_t>(ctx.zbuf.zbp & 0x1FFu) << 21u) |
++                         (static_cast<uint64_t>(ctx.zbuf.psm & 0x3Fu) << 30u) | (static_cast<uint64_t>(ctx.zbuf.zmask ? 1u : 0u) << 36u);
++    const uint64_t key2 = static_cast<uint64_t>(x0 / 64) | (static_cast<uint64_t>(x1 / 64) << 8u) |
++                          (static_cast<uint64_t>(y0 / 32) << 16u) | (static_cast<uint64_t>(y1 / 32) << 28u);
++    if (key == m_lastWriteKey && key2 == m_lastWriteKey2)
++        return;
++    m_lastWriteKey = key;
++    m_lastWriteKey2 = key2;
++    // A page is 8 KiB: 64x32 pixels in the 32-bit formats, 64x64 in the 16-bit ones; FBW counts 64 pixels.
++    auto mark = [&](uint32_t basePage, uint32_t psm)
++    {
++        const uint32_t pageHeight = (psm & 0x2u) ? 64u : 32u;
++        const uint32_t width = std::max<uint32_t>(ctx.frame.fbw, 1u);
++        for (uint32_t row = static_cast<uint32_t>(y0) / pageHeight; row <= static_cast<uint32_t>(y1) / pageHeight; ++row)
++            for (uint32_t col = static_cast<uint32_t>(x0) / 64u; col <= static_cast<uint32_t>(x1) / 64u; ++col)
++            {
++                const uint32_t page = (basePage + row * width + col) & 511u;
++                m_pendingWrites.set(page);
++                m_shadowValid.reset(page);
++            }
++    };
++    mark(ctx.frame.fbp, ctx.frame.psm);
++    if (!ctx.zbuf.zmask)
++        mark(ctx.zbuf.zbp, ctx.zbuf.psm);
++}
++
++namespace
++{
++    // Page size in pixels of a texture or transfer format (8 KiB pages).
++    void pageSizeOf(uint32_t psm, uint32_t &width, uint32_t &height)
++    {
++        switch (psm)
++        {
++        case GS_PSM_T4:
++            width = 128u;
++            height = 128u;
++            return;
++        case GS_PSM_T8:
++            width = 128u;
++            height = 64u;
++            return;
++        case GS_PSM_CT16:
++        case GS_PSM_CT16S:
++        case GS_PSM_Z16:
++        case GS_PSM_Z16S:
++            width = 64u;
++            height = 64u;
++            return;
++        default: // 32-bit layouts, including T8H/T4HL/T4HH
++            width = 64u;
++            height = 32u;
++            return;
++        }
++    }
++
++    // Pages under the pixel rectangle [x0, x1] x [y0, y1] of a buffer starting at block `bp` with width `bw`
++    // (64 pixels). Page (row r, column c) is at page (bp >> 5) + r * pagesPerRow + c; a base that is not page
++    // aligned shifts every block, so the next page is marked as well.
++    void markRect(std::bitset<512> &pages, uint32_t bp, uint32_t bw, uint32_t psm, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1)
++    {
++        uint32_t pageWidth = 64u, pageHeight = 32u;
++        pageSizeOf(psm, pageWidth, pageHeight);
++        const uint32_t perRow = std::max<uint32_t>((std::max<uint32_t>(bw, 1u) * 64u + pageWidth - 1u) / pageWidth, 1u);
++        const uint32_t first = bp >> 5u;
++        const uint32_t spill = (bp & 31u) != 0u ? 1u : 0u;
++        // A column past the buffer width lands in the next row's pages, as the GS addresses it.
++        const uint32_t col0 = x0 / pageWidth, col1 = std::max(x0, x1) / pageWidth;
++        const uint32_t row0 = y0 / pageHeight, row1 = std::max(y0, y1) / pageHeight;
++        for (uint32_t row = row0; row <= row1 && row - row0 < 512u; ++row)
++            for (uint32_t col = col0; col <= col1 + spill; ++col)
++                pages.set((first + row * perRow + col) & 511u);
++    }
++}
++
++
++std::bitset<512> GSCpuBackend::PrimitiveReadPages(const GSPrimitiveBatch &batch) const
++{
++    std::bitset<512> pages;
++    const GSDrawState &state = batch.state;
++    if (!state.prim.tme)
++        return pages;
++    const GSTex0Reg &tex = state.context.tex0;
++    const int width = std::max<int>(state.textureWidth, 1), height = std::max<int>(state.textureHeight, 1);
++    const uint32_t count = std::min<uint32_t>(batch.vertexCount, 3u);
++    // Texel box under the vertices: UV (12.4) or S/Q, T/Q scaled by the texture size (a perspective-correct
++    // coordinate stays between its vertex values when Q is positive).
++    float u0 = 0.0f, u1 = 0.0f, v0 = 0.0f, v1 = 0.0f;
++    bool full = false;
++    for (uint32_t i = 0; i < count; ++i)
++    {
++        const GSVertex &vertex = batch.vertices[i];
++        float u, v;
++        if (state.prim.fst)
++        {
++            u = static_cast<float>(vertex.u) / 16.0f;
++            v = static_cast<float>(vertex.v) / 16.0f;
++        }
++        else
++        {
++            if (!(vertex.q > 0.0f) || !std::isfinite(vertex.s / vertex.q) || !std::isfinite(vertex.t / vertex.q))
++            {
++                full = true;
++                break;
++            }
++            u = vertex.s / vertex.q * static_cast<float>(width);
++            v = vertex.t / vertex.q * static_cast<float>(height);
++        }
++        if (i == 0u)
++        {
++            u0 = u1 = u;
++            v0 = v1 = v;
++        }
++        else
++        {
++            u0 = std::min(u0, u);
++            u1 = std::max(u1, u);
++            v0 = std::min(v0, v);
++            v1 = std::max(v1, v);
++        }
++    }
++    // One texel of margin (bilinear), then the wrap mode of each axis.
++    const uint64_t clamp = state.context.clamp;
++    auto axis = [&](float lo, float hi, int size, uint32_t mode, uint32_t minField, uint32_t maxField, int &first, int &last)
++    {
++        const double flo = std::floor(static_cast<double>(lo)) - 1.0, fhi = std::ceil(static_cast<double>(hi)) + 1.0;
++        if (full || !(flo > -1e6 && fhi < 1e6))
++        {
++            first = 0;
++            last = mode == 3u ? 1023 : size - 1;
++            return;
++        }
++        int a = static_cast<int>(flo), b = static_cast<int>(fhi);
++        switch (mode)
++        {
++        case 1u: // clamp
++            first = std::clamp(a, 0, size - 1);
++            last = std::clamp(b, 0, size - 1);
++            return;
++        case 2u: // region clamp
++            first = std::clamp(a, static_cast<int>(minField), std::max(static_cast<int>(minField), static_cast<int>(maxField)));
++            last = std::clamp(b, static_cast<int>(minField), std::max(static_cast<int>(minField), static_cast<int>(maxField)));
++            return;
++        case 3u: // region repeat: (coordinate & MSK) | FIX can be anywhere in the 1024 texels
++            first = 0;
++            last = std::max(size - 1, static_cast<int>(minField | maxField));
++            return;
++        default: // repeat
++            if (b - a + 1 >= size)
++            {
++                first = 0;
++                last = size - 1;
++                return;
++            }
++            a = ((a % size) + size) % size;
++            b = ((b % size) + size) % size;
++            if (a <= b)
++            {
++                first = a;
++                last = b;
++            }
++            else
++            {
++                first = 0; // wraps around the edge
++                last = size - 1;
++            }
++            return;
++        }
++    };
++    int x0, x1, y0, y1;
++    axis(u0, u1, width, static_cast<uint32_t>(clamp & 3u), static_cast<uint32_t>((clamp >> 4u) & 0x3FFu),
++         static_cast<uint32_t>((clamp >> 14u) & 0x3FFu), x0, x1);
++    axis(v0, v1, height, static_cast<uint32_t>((clamp >> 2u) & 3u), static_cast<uint32_t>((clamp >> 24u) & 0x3FFu),
++         static_cast<uint32_t>((clamp >> 34u) & 0x3FFu), y0, y1);
++    // By default the whole texture counts as read (safe for the hazard checks); PS2X_GS_UV_READS=1 narrows it
++    // to the texels under the coordinates.
++    static const bool uvReads = []
++    {
++        const char *env = std::getenv("PS2X_GS_UV_READS");
++        return env && env[0] == '1';
++    }();
++    if (!uvReads)
++    {
++        x0 = 0;
++        y0 = 0;
++        x1 = std::max(x1, width - 1);
++        y1 = std::max(y1, height - 1);
++    }
++    // The page set depends only on the buffer and the page rectangle: consecutive primitives repeat it.
++    uint32_t pageWidth = 64u, pageHeight = 32u;
++    pageSizeOf(tex.psm, pageWidth, pageHeight);
++    const uint32_t ux0 = static_cast<uint32_t>(std::max(x0, 0)), uy0 = static_cast<uint32_t>(std::max(y0, 0));
++    const uint32_t ux1 = static_cast<uint32_t>(std::max(x1, 0)), uy1 = static_cast<uint32_t>(std::max(y1, 0));
++    const uint64_t key1 = static_cast<uint64_t>(tex.tbp0 & 0x3FFFu) | (static_cast<uint64_t>(tex.tbw & 0x3Fu) << 14u) |
++                          (static_cast<uint64_t>(tex.psm & 0x3Fu) << 20u);
++    const uint64_t key2 = static_cast<uint64_t>(ux0 / pageWidth) | (static_cast<uint64_t>(ux1 / pageWidth) << 16u) |
++                          (static_cast<uint64_t>(uy0 / pageHeight) << 32u) | (static_cast<uint64_t>(uy1 / pageHeight) << 48u);
++    if (key1 == m_readPagesKey1 && key2 == m_readPagesKey2)
++        return m_readPagesCached;
++    markRect(pages, tex.tbp0, tex.tbw, tex.psm, ux0, uy0, ux1, uy1);
++    m_readPagesKey1 = key1;
++    m_readPagesKey2 = key2;
++    m_readPagesCached = pages;
++    return pages;
++}
++
++std::bitset<512> GSCpuBackend::PrimitiveWritePages(const GSPrimitiveBatch &batch) const
++{
++    std::bitset<512> pages;
++    const GSContext &ctx = batch.state.context;
++    const uint32_t count = std::min<uint32_t>(batch.vertexCount, 3u);
++    float minX = batch.vertices[0].x, maxX = minX, minY = batch.vertices[0].y, maxY = minY;
++    for (uint32_t i = 1; i < count; ++i)
++    {
++        minX = std::min(minX, batch.vertices[i].x);
++        maxX = std::max(maxX, batch.vertices[i].x);
++        minY = std::min(minY, batch.vertices[i].y);
++        maxY = std::max(maxY, batch.vertices[i].y);
++    }
++    const int ofx = ctx.xyoffset.ofx >> 4, ofy = ctx.xyoffset.ofy >> 4;
++    const int x0 = std::max<int>(static_cast<int>(std::floor(minX)) - ofx - 1, ctx.scissor.x0);
++    const int x1 = std::min<int>(static_cast<int>(std::ceil(maxX)) - ofx + 1, ctx.scissor.x1);
++    const int y0 = std::max<int>(static_cast<int>(std::floor(minY)) - ofy - 1, ctx.scissor.y0);
++    const int y1 = std::min<int>(static_cast<int>(std::ceil(maxY)) - ofy + 1, ctx.scissor.y1);
++    if (x0 > x1 || y0 > y1)
++        return pages;
++    const uint64_t key1 = static_cast<uint64_t>(ctx.frame.fbp & 0x1FFu) | (static_cast<uint64_t>(ctx.frame.fbw & 0x3Fu) << 9u) |
++                          (static_cast<uint64_t>(ctx.frame.psm & 0x3Fu) << 15u) | (static_cast<uint64_t>(ctx.zbuf.zbp & 0x1FFu) << 21u) |
++                          (static_cast<uint64_t>(ctx.zbuf.psm & 0x3Fu) << 30u) | (static_cast<uint64_t>(ctx.zbuf.zmask ? 1u : 0u) << 36u);
++    const uint64_t key2 = static_cast<uint64_t>(x0 / 64) | (static_cast<uint64_t>(x1 / 64) << 16u) |
++                          (static_cast<uint64_t>(y0 / 32) << 32u) | (static_cast<uint64_t>(y1 / 32) << 48u);
++    if (key1 == m_writePagesKey1 && key2 == m_writePagesKey2)
++        return m_writePagesCached;
++    auto mark = [&](uint32_t basePage, uint32_t psm)
++    {
++        const uint32_t pageHeight = (psm & 0x2u) ? 64u : 32u;
++        const uint32_t width = std::max<uint32_t>(ctx.frame.fbw, 1u);
++        for (uint32_t row = static_cast<uint32_t>(y0) / pageHeight; row <= static_cast<uint32_t>(y1) / pageHeight; ++row)
++            for (uint32_t col = static_cast<uint32_t>(x0) / 64u; col <= static_cast<uint32_t>(x1) / 64u; ++col)
++                pages.set((basePage + row * width + col) & 511u);
++    };
++    mark(ctx.frame.fbp, ctx.frame.psm);
++    if (!ctx.zbuf.zmask)
++        mark(ctx.zbuf.zbp, ctx.zbuf.psm);
++    m_writePagesKey1 = key1;
++    m_writePagesKey2 = key2;
++    m_writePagesCached = pages;
++    return pages;
++}
++
++const uint16_t *GSCpuBackend::ActiveClut() const
++{
++    return t_interleave.clut ? t_interleave.clut : m_clut.data();
++}
++
++void GSCpuBackend::FlushPendingUnlocked(int reason) const
+ {
+     GSCpuBackend *self = const_cast<GSCpuBackend *>(this);
+-    if (!m_pending.empty())
++    if (!m_pending.empty() || !m_pendingSerial.empty())
+         self->DrawPendingUnlocked();
++    if (g_gsStats && m_bandPipeline && !m_bandPipeline->idle())
++    {
++        const auto start = std::chrono::steady_clock::now();
++        self->WaitInflightUnlocked();
++        const int r = (reason >= 0 && reason < kFlushReasons) ? reason : 0;
++        g_flushCount[r].fetch_add(1u, std::memory_order_relaxed);
++        g_flushWaitNs[r].fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                                             std::chrono::steady_clock::now() - start)
++                                                             .count()),
++                                   std::memory_order_relaxed);
++        self->ResyncClutUnlocked();
++        return;
++    }
+     self->WaitInflightUnlocked();
++    self->ResyncClutUnlocked();
++}
++
++void GSCpuBackend::ResyncClutUnlocked()
++{
++    // Everything handed over has run: the worker CLUT is the current one again on this thread.
++    if (m_clutDeferred && m_pending.empty() && m_pendingSerial.empty() && (!m_bandPipeline || m_bandPipeline->idle()))
++    {
++        m_clut = m_workerClut;
++        m_clutDeferred = false;
++    }
+ }
+ 
+ void GSCpuBackend::WaitInflightUnlocked()
+@@ -952,7 +1548,7 @@ void GSCpuBackend::WaitInflightUnlocked()
+ 
+ void GSCpuBackend::DrawPendingUnlocked()
+ {
+-    if (m_pending.empty())
++    if (m_pending.empty() && m_pendingSerial.empty())
+         return;
+     if (!m_bandPipeline)
+     {
+@@ -961,19 +1557,38 @@ void GSCpuBackend::DrawPendingUnlocked()
+         m_pending.clear();
+         return;
+     }
+-    m_bandPipeline->publish(m_pending);
++    if (!m_pendingSerial.empty())
++    {
++        // The transfers change VRAM: every worker starts the slot with an empty texture cache.
++        m_texturePageCache.Invalidate();
++        ++m_textureCacheEpoch;
++    }
++    if (m_bandPipeline->idle())
++        m_inflightWritesUnion.reset();
++    m_inflightWritesUnion |= m_pendingWrites;
++    m_bandPipeline->publish(m_pending, m_clut, m_textureCacheEpoch, m_barrierNext, m_pendingWrites,
++                                                   m_pendingReads, m_pendingTransferWrites, m_pendingSerial, m_pendingSerialBarrier,
++                                                   m_clutDeferred ? &m_workerClut : nullptr, m_nextTextureVram);
++    m_nextTextureVram = nullptr;
++    m_pendingSerialBarrier = false;
++    m_barrierNext = false;
++    m_pendingWrites.reset();
++    m_pendingReads.reset();
++    m_pendingTransferWrites.reset();
++    m_lastWriteKey = ~0ull;
+ }
+ 
+-void GSCpuBackend::DrawBatchBands(const std::vector<GSPrimitiveBatch> &batches, unsigned phase, unsigned stride)
++void GSCpuBackend::DrawBatchBands(const std::vector<GSPrimitiveBatch> &batches, const uint16_t *clut, uint32_t textureEpoch,
++                                  const uint8_t *textureVram, unsigned phase, unsigned stride)
+ {
+     GSMem::TexturePageCache *cache = &m_workerTextureCaches[phase];
+     uint32_t &epoch = m_workerTextureCacheEpochs[phase];
+-    if (epoch != m_textureCacheEpoch)
++    if (epoch != textureEpoch)
+     {
+         cache->Invalidate();
+-        epoch = m_textureCacheEpoch;
++        epoch = textureEpoch;
+     }
+-    t_interleave = {static_cast<int>(stride), static_cast<int>(phase), cache};
++    t_interleave = {static_cast<int>(stride), static_cast<int>(phase), cache, clut, textureVram};
+     for (const GSPrimitiveBatch &batch : batches)
+     {
+         const int ofy = batch.state.context.xyoffset.ofy >> 4;
+@@ -996,7 +1611,6 @@ void GSCpuBackend::DrawBatchBands(const std::vector<GSPrimitiveBatch> &batches,
+ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
+-    FlushPendingUnlocked();
+     if (!m_vram || (!isFourBitIndexedPsm(tex0.psm) && !isEightBitIndexedPsm(tex0.psm)))
+         return;
+ 
+@@ -1028,11 +1642,108 @@ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+         return;
+     }
+ 
+-    LoadClutUnlocked(tex0, texclut);
++    // The primitives submitted so far are handed over with the CLUT as it is now.
++    if (!m_pending.empty() || !m_pendingSerial.empty())
++        DrawPendingUnlocked();
++    ResyncClutUnlocked();
++    if (!m_bandPipeline)
++    {
++        LoadClutUnlocked(tex0, texclut);
++        return;
++    }
++
++    // CLUT source pages: CSM1 CLUTs are at most 16x16 pixels from CBP (4 blocks); CSM2 reads a row (COV) of a
++    // CBW-wide buffer. A hazard: a batch still in flight (primitives or a queued transfer) writes one of them.
++    const uint32_t firstPage = tex0.cbp >> 5u;
++    const uint32_t lastPage = tex0.csm != 0u
++                                  ? firstPage + 1u + (static_cast<uint32_t>(texclut.cov) / 32u + 1u) * std::max<uint32_t>(texclut.cbw, 1u)
++                                  : (tex0.cbp + 3u) >> 5u;
++    bool hazard = false;
++    for (uint32_t page = firstPage; page <= lastPage && !hazard; ++page)
++        hazard = m_bandPipeline->writesPageInFlight(page);
++
++    if (!m_clutDeferred)
++    {
++        // 1. This thread loads it when it can: from VRAM when the pages are settled, or from the shadow copy
++        //    when only queued transfers write them.
++        if (!hazard)
++        {
++            m_texturePageCache.Invalidate(); // band workers may have written VRAM since it was filled
++            LoadClutUnlocked(tex0, texclut);
++            return;
++        }
++        std::bitset<512> pages;
++        for (uint32_t page = firstPage; page <= lastPage; ++page)
++            pages.set(page & 511u);
++        if (g_gsShadowClut && ShadowPrepareUnlocked(pages) == pages)
++        {
++            m_shadowPageCache.Invalidate();
++            LoadClutUnlocked(tex0, texclut, m_shadowVram.get());
++            g_clutShadowLoads.fetch_add(1u, std::memory_order_relaxed);
++            return;
++        }
++        static const bool deferEnabled = []
++        {
++            const char *env = std::getenv("PS2X_GS_DEFER_CLUT");
++            return env && env[0] == '1';
++        }();
++        if (!deferEnabled)
++        {
++            FlushPendingUnlocked(kFlushClut);
++            m_texturePageCache.Invalidate();
++            LoadClutUnlocked(tex0, texclut);
++            return;
++        }
++        // 2. Primitives in flight draw the CLUT's pages: worker 0 loads it once every earlier batch is drawn,
++        //    starting from this thread's CLUT, and the following batches take theirs from worker 0 until the
++        //    pipeline drains (ResyncClutUnlocked).
++        m_pendingSerial.emplace_back([this, snapshot = m_clut]()
++                                     { m_workerClut = snapshot; });
++        m_clutDeferred = true;
++    }
++    // While deferred, worker 0 does every load, in order (after the batches that draw the pages, on a hazard).
++    if (hazard)
++        m_pendingSerialBarrier = true;
++    m_pendingSerial.emplace_back([this, tex0, texclut]()
++                                 {
++                                     m_workerClutCache.Invalidate();
++                                     LoadClutUnlocked(tex0, texclut, m_vram, &m_workerClut, &m_workerClutCache); });
++    // Worker 0 reads the source pages later: until then they count as read, so an upload to them (the next
++    // palette, usually) is queued after this load instead of running at once on this thread.
++    for (uint32_t page = firstPage; page <= lastPage; ++page)
++        m_pendingReads.set(page & 511u);
++    g_clutDeferred.fetch_add(1u, std::memory_order_relaxed);
+ }
+ 
+-void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
++std::bitset<512> GSCpuBackend::ShadowPrepareUnlocked(const std::bitset<512> &pages)
+ {
++    std::bitset<512> ready;
++    if (!m_bandPipeline || !m_vram)
++        return ready;
++    if (!m_shadowVram)
++        m_shadowVram = std::make_unique<uint8_t[]>(GSMem::MEMORY_SIZE);
++    for (uint32_t page = 0; page < 512u; ++page)
++    {
++        if (!pages.test(page))
++            continue;
++        if (!m_shadowValid.test(page))
++        {
++            // A page gets a copy only while nothing queued or being drawn writes it (VRAM is then current).
++            if (m_pendingWrites.test(page) || m_pendingTransferWrites.test(page) || m_bandPipeline->writesPageInFlight(page))
++                continue;
++            std::memcpy(m_shadowVram.get() + page * 8192u, m_vram + page * 8192u, 8192u);
++            m_shadowValid.set(page);
++        }
++        ready.set(page);
++    }
++    return ready;
++}
++
++void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut, const uint8_t *vram,
++                                    std::array<uint16_t, 512> *target, GSMem::TexturePageCache *cache)
++{
++    std::array<uint16_t, 512> &clut = target ? *target : m_clut;
++    GSMem::TexturePageCache &pageCache = cache ? *cache : (vram ? m_shadowPageCache : m_texturePageCache);
+     const bool fourBit = isFourBitIndexedPsm(tex0.psm);
+     const bool sixteenBit = tex0.cpsm == GS_PSM_CT16 || tex0.cpsm == GS_PSM_CT16S;
+     const bool thirtyTwoBit = tex0.cpsm == GS_PSM_CT32 || tex0.cpsm == GS_PSM_CT24;
+@@ -1065,16 +1776,17 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
+             sourceY = static_cast<uint32_t>(texclut.cov);
+         }
+ 
+-        const uint32_t raw = ReadTextureVramUnlocked(m_texturePageCache, tex0.cpsm, tex0.cbp, sourceWidth, sourceX, sourceY);
++        const uint32_t raw = vram ? GSMem::ReadTexture(pageCache, vram, tex0.cpsm, tex0.cbp, sourceWidth, sourceX, sourceY)
++                                  : ReadTextureVramUnlocked(pageCache, tex0.cpsm, tex0.cbp, sourceWidth, sourceX, sourceY);
+         const uint32_t destination = (loadCsm1Suffix ? entry : destinationBase + entry) & (sixteenBit ? 0x1FFu : 0x0FFu);
+         if (sixteenBit)
+         {
+-            m_clut[destination] = static_cast<uint16_t>(raw);
++            clut[destination] = static_cast<uint16_t>(raw);
+         }
+         else
+         {
+-            m_clut[destination] = static_cast<uint16_t>(raw & 0xFFFFu);
+-            m_clut[destination + 256u] = static_cast<uint16_t>(raw >> 16u);
++            clut[destination] = static_cast<uint16_t>(raw & 0xFFFFu);
++            clut[destination + 256u] = static_cast<uint16_t>(raw >> 16u);
+         }
+     }
+ }
+@@ -1082,13 +1794,19 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
+ void GSCpuBackend::Flush()
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
+-    FlushPendingUnlocked();
++    FlushPendingUnlocked(kFlushFinish);
+ }
+ 
+ void GSCpuBackend::TextureFlush()
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
+-    FlushPendingUnlocked();
++    // Later primitives may sample what earlier ones drew: they start once those are drawn, with fresh caches.
++    if (!m_pending.empty() || !m_pendingSerial.empty())
++        DrawPendingUnlocked();
++    if (m_bandPipeline)
++        m_barrierNext = true;
++    else
++        WaitInflightUnlocked();
+     m_texturePageCache.Invalidate();
+     ++m_textureCacheEpoch;
+ }
+@@ -1096,13 +1814,13 @@ void GSCpuBackend::TextureFlush()
+ void GSCpuBackend::Sync(GSSyncReason)
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
+-    FlushPendingUnlocked();
++    FlushPendingUnlocked(kFlushSync);
+ }
+ 
+ uint32_t GSCpuBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
+-    FlushPendingUnlocked();
++    FlushPendingUnlocked(kFlushVram);
+     return ReadVramUnlocked(psm, base, bw, x, y);
+ }
+ 
+@@ -1118,13 +1836,14 @@ uint32_t GSCpuBackend::ReadTextureVramUnlocked(GSMem::TexturePageCache &cache, u
+     if (!m_vram)
+         return 0u;
+ 
+-    return GSMem::ReadTexture(cache, m_vram, psm, base, bw, x, y);
++    return GSMem::ReadTexture(cache, t_interleave.textureVram ? t_interleave.textureVram : m_vram, psm, base, bw, x, y);
+ }
+ 
+ void GSCpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
+-    FlushPendingUnlocked();
++    FlushPendingUnlocked(kFlushVram);
++    m_shadowValid.reset();
+     WriteVramUnlocked(psm, base, bw, x, y, value);
+ }
+ 
+@@ -1484,21 +2203,22 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
+         clutIndex = block + (sourceIndex & 0x0Fu);
+     }
+ 
++    const uint16_t *clut = ActiveClut();
+     switch (cpsm)
+     {
+     case GS_PSM_CT32:
+     {
+-        const uint32_t raw = static_cast<uint32_t>(m_clut[clutIndex]) | (static_cast<uint32_t>(m_clut[clutIndex + 256u]) << 16u);
++        const uint32_t raw = static_cast<uint32_t>(clut[clutIndex]) | (static_cast<uint32_t>(clut[clutIndex + 256u]) << 16u);
+         return applyTexa(state.texa, cpsm, raw);
+     }
+     case GS_PSM_CT24:
+     {
+-        const uint32_t raw = static_cast<uint32_t>(m_clut[clutIndex]) | (static_cast<uint32_t>(m_clut[clutIndex + 256u]) << 16u);
++        const uint32_t raw = static_cast<uint32_t>(clut[clutIndex]) | (static_cast<uint32_t>(clut[clutIndex + 256u]) << 16u);
+         return applyTexa(state.texa, cpsm, raw & 0x00FFFFFFu);
+     }
+     case GS_PSM_CT16:
+     case GS_PSM_CT16S:
+-        return applyTexa(state.texa, cpsm, Rgba5551ToRgba8888(m_clut[clutIndex]));
++        return applyTexa(state.texa, cpsm, Rgba5551ToRgba8888(clut[clutIndex]));
+     default:
+         break;
+     }
+@@ -1692,8 +2412,8 @@ void GSCpuBackend::BuildSampler(const GSDrawState &state, Sampler &smp) const
+     const auto &ctx = state.context;
+     const auto &tex = ctx.tex0;
+     smp.read = GSMem::GetTextureReader(tex.psm);
+-    smp.vram = m_vram;
+-    smp.clut = m_clut.data();
++    smp.vram = t_interleave.textureVram ? t_interleave.textureVram : m_vram;
++    smp.clut = ActiveClut();
+     smp.texa = state.texa;
+     smp.tbp = tex.tbp0;
+     smp.tbw = tex.tbw;
+@@ -2356,14 +3076,63 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
+ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
+-    FlushPendingUnlocked();
+-    m_transfer = command;
+-    m_transferState.x = command.trxpos.dsax;
+-    m_transferState.y = command.trxpos.dsay;
+-    m_transferState.totalPixels = static_cast<uint32_t>(command.trxreg.rrw) * static_cast<uint32_t>(command.trxreg.rrh);
+-    m_transferState.copiedPixels = 0u;
+-    m_transferState.direction = command.direction;
+-    m_transferState.localToHostPendingBytes = 0u;
++    if (m_bandPipeline && command.direction == 0u)
++    {
++        std::bitset<512> destination;
++        const uint32_t dx = command.trxpos.dsax, dy = command.trxpos.dsay;
++        markRect(destination, command.bitbltbuf.dbp, command.bitbltbuf.dbw, command.bitbltbuf.dpsm, dx, dy,
++                 dx + std::max<uint32_t>(command.trxreg.rrw, 1u) - 1u, dy + std::max<uint32_t>(command.trxreg.rrh, 1u) - 1u);
++        // Nothing waiting or being drawn (queued transfers included) reads or writes the destination: the
++        // upload happens now, on this thread (palettes, mostly: batches use their own CLUT copy).
++        if (g_gsImmediateUploads && !(destination & (m_pendingReads | m_pendingWrites | m_pendingTransferWrites)).any() &&
++            !m_bandPipeline->touchesPagesInFlight(destination))
++        {
++            m_serialTransfer = false;
++            m_immediateTransfer = true;
++            m_shadowActive = false;
++            m_shadowValid &= ~destination; // VRAM changes under the copies
++            // Band workers may still hold copies of these pages from batches already drawn (a texture that
++            // lived there): the batches after the upload start with empty page caches.
++            m_texturePageCache.Invalidate();
++            ++m_textureCacheEpoch;
++            BeginTransferUnlocked(command, m_immTransfer, m_immTransferState);
++            return;
++        }
++        m_immediateTransfer = false;
++        // Otherwise it is queued after the primitives so far, before the later ones.
++        if (!m_pending.empty())
++            DrawPendingUnlocked();
++        // The copies of its pages get the transfer as well, when they can be made.
++        // Pages that cannot get a copy keep none; the upload still goes to the others.
++        const std::bitset<512> ready = ShadowPrepareUnlocked(destination);
++        m_shadowValid &= ~(destination & ~ready);
++        m_shadowActive = ready.any();
++        if (m_shadowActive)
++            BeginTransferUnlocked(command, m_shadowTransfer, m_shadowTransferState);
++        m_pendingTransferWrites |= destination;
++        m_pendingSerial.emplace_back([this, command]()
++                                     { BeginTransferUnlocked(command, m_transfer, m_transferState); });
++        m_pendingSerialBarrier = true;
++        m_serialTransfer = true;
++        return;
++    }
++    FlushPendingUnlocked(kFlushTransfer);
++    m_serialTransfer = false;
++    m_immediateTransfer = false;
++    m_shadowActive = false;
++    m_shadowValid.reset();
++    BeginTransferUnlocked(command, m_transfer, m_transferState);
++}
++
++void GSCpuBackend::BeginTransferUnlocked(const GSTransferCommand &command, GSTransferCommand &transfer, GSTransferSnapshot &state)
++{
++    transfer = command;
++    state.x = command.trxpos.dsax;
++    state.y = command.trxpos.dsay;
++    state.totalPixels = static_cast<uint32_t>(command.trxreg.rrw) * static_cast<uint32_t>(command.trxreg.rrh);
++    state.copiedPixels = 0u;
++    state.direction = command.direction;
++    state.localToHostPendingBytes = 0u;
+ 
+     if (command.direction == 2u)
+         PerformLocalToLocalTransfer();
+@@ -2374,37 +3143,62 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
+-    FlushPendingUnlocked();
+-    if (!data || sizeBytes == 0u || !m_vram || m_transferState.direction != 0u)
++    if (m_bandPipeline && m_serialTransfer)
++    {
++        if (!data || sizeBytes == 0u)
++            return;
++        if (!m_pending.empty())
++            DrawPendingUnlocked();
++        if (m_shadowActive)
++            UploadImageUnlocked(data, sizeBytes, m_shadowTransfer, m_shadowTransferState, m_shadowVram.get());
++        m_pendingSerialBarrier = true;
++        m_pendingSerial.emplace_back([this, bytes = std::vector<uint8_t>(data, data + sizeBytes)]()
++                                     { UploadImageUnlocked(bytes.data(), static_cast<uint32_t>(bytes.size()), m_transfer, m_transferState, m_vram); });
+         return;
+-    if (m_transfer.trxreg.rrw == 0u || m_transfer.trxreg.rrh == 0u || m_transferState.totalPixels == 0u)
++    }
++    if (m_bandPipeline && m_immediateTransfer)
++    {
++        UploadImageUnlocked(data, sizeBytes, m_immTransfer, m_immTransferState, m_vram);
+         return;
++    }
++    FlushPendingUnlocked(kFlushUpload);
++    m_shadowValid.reset();
++    UploadImageUnlocked(data, sizeBytes, m_transfer, m_transferState, m_vram);
++}
+ 
+-    const uint32_t dbp = m_transfer.bitbltbuf.dbp;
+-    const uint32_t dbw = std::max<uint32_t>(m_transfer.bitbltbuf.dbw, 1u);
+-    const uint8_t dpsm = m_transfer.bitbltbuf.dpsm;
+-    const uint32_t rrw = m_transfer.trxreg.rrw;
+-    const uint32_t dsax = m_transfer.trxpos.dsax;
++void GSCpuBackend::UploadImageUnlocked(const uint8_t *data, uint32_t sizeBytes, GSTransferCommand &transfer, GSTransferSnapshot &state,
++                                       uint8_t *vram)
++{
++    if (!data || sizeBytes == 0u || !vram || state.direction != 0u)
++        return;
++    if (transfer.trxreg.rrw == 0u || transfer.trxreg.rrh == 0u || state.totalPixels == 0u)
++        return;
++
++    const uint32_t dbp = transfer.bitbltbuf.dbp;
++    const uint32_t dbw = std::max<uint32_t>(transfer.bitbltbuf.dbw, 1u);
++    const uint8_t dpsm = transfer.bitbltbuf.dpsm;
++    const uint32_t rrw = transfer.trxreg.rrw;
++    const uint32_t dsax = transfer.trxpos.dsax;
+     uint32_t offset = 0u;
+ 
+     auto advancePixel = [&](uint32_t count)
+     {
+-        const uint32_t totalPixels = m_transferState.totalPixels;
+-        m_transferState.copiedPixels =
+-            std::min<uint32_t>(totalPixels, m_transferState.copiedPixels + count);
++        const uint32_t totalPixels = state.totalPixels;
++        state.copiedPixels =
++            std::min<uint32_t>(totalPixels, state.copiedPixels + count);
+ 
+-        if (m_transferState.copiedPixels >= totalPixels)
++        if (state.copiedPixels >= totalPixels)
+         {
+-            m_transferState.direction = 3u;
+-            m_transferState.totalPixels = 0u;
++            state.direction = 3u;
++            state.totalPixels = 0u;
+             return;
+         }
+ 
+-        m_transferState.x = dsax + (m_transferState.copiedPixels % rrw);
+-        m_transferState.y = m_transfer.trxpos.dsay + (m_transferState.copiedPixels / rrw);
++        state.x = dsax + (state.copiedPixels % rrw);
++        state.y = transfer.trxpos.dsay + (state.copiedPixels / rrw);
+     };
+ 
+-    while (offset < sizeBytes && m_transferState.direction == 0u)
++    while (offset < sizeBytes && state.direction == 0u)
+     {
+         switch (dpsm)
+         {
+@@ -2415,7 +3209,7 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+                 return;
+             uint32_t value = 0u;
+             std::memcpy(&value, data + offset, sizeof(value));
+-            WriteVramUnlocked(dpsm, dbp, dbw, m_transferState.x, m_transferState.y, value);
++            m_writeVramFuncs[dpsm & 0x3Fu](vram, dbp, dbw, state.x, state.y, value);
+             offset += 4u;
+             advancePixel(1u);
+             break;
+@@ -2428,7 +3222,7 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+             const uint32_t value = static_cast<uint32_t>(data[offset]) |
+                                    (static_cast<uint32_t>(data[offset + 1u]) << 8u) |
+                                    (static_cast<uint32_t>(data[offset + 2u]) << 16u);
+-            WriteVramUnlocked(dpsm, dbp, dbw, m_transferState.x, m_transferState.y, value);
++            m_writeVramFuncs[dpsm & 0x3Fu](vram, dbp, dbw, state.x, state.y, value);
+             offset += 3u;
+             advancePixel(1u);
+             break;
+@@ -2442,14 +3236,14 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+                 return;
+             uint16_t value = 0u;
+             std::memcpy(&value, data + offset, sizeof(value));
+-            WriteVramUnlocked(dpsm, dbp, dbw, m_transferState.x, m_transferState.y, value);
++            m_writeVramFuncs[dpsm & 0x3Fu](vram, dbp, dbw, state.x, state.y, value);
+             offset += 2u;
+             advancePixel(1u);
+             break;
+         }
+         case GS_PSM_T8:
+         case GS_PSM_T8H:
+-            WriteVramUnlocked(dpsm, dbp, dbw, m_transferState.x, m_transferState.y, data[offset++]);
++            m_writeVramFuncs[dpsm & 0x3Fu](vram, dbp, dbw, state.x, state.y, data[offset++]);
+             advancePixel(1u);
+             break;
+         case GS_PSM_T4:
+@@ -2457,20 +3251,20 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+         case GS_PSM_T4HH:
+         {
+             const uint8_t packed = data[offset++];
+-            const uint32_t firstPixel = m_transferState.copiedPixels;
+-            WriteVramUnlocked(dpsm, dbp, dbw,
++            const uint32_t firstPixel = state.copiedPixels;
++            m_writeVramFuncs[dpsm & 0x3Fu](vram, dbp, dbw,
+                               dsax + (firstPixel % rrw),
+-                              m_transfer.trxpos.dsay + (firstPixel / rrw),
++                              transfer.trxpos.dsay + (firstPixel / rrw),
+                               packed & 0x0Fu);
+-            if (firstPixel + 1u < m_transferState.totalPixels)
++            if (firstPixel + 1u < state.totalPixels)
+             {
+                 const uint32_t secondPixel = firstPixel + 1u;
+-                WriteVramUnlocked(dpsm, dbp, dbw,
++                m_writeVramFuncs[dpsm & 0x3Fu](vram, dbp, dbw,
+                                   dsax + (secondPixel % rrw),
+-                                  m_transfer.trxpos.dsay + (secondPixel / rrw),
++                                  transfer.trxpos.dsay + (secondPixel / rrw),
+                                   (packed >> 4u) & 0x0Fu);
+             }
+-            advancePixel(std::min<uint32_t>(2u, m_transferState.totalPixels - firstPixel));
++            advancePixel(std::min<uint32_t>(2u, state.totalPixels - firstPixel));
+             break;
+         }
+         default:
+@@ -2592,7 +3386,7 @@ void GSCpuBackend::PerformLocalToHostTransfer()
+ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
+-    FlushPendingUnlocked();
++    FlushPendingUnlocked(kFlushTransfer);
+     if (!dst || maxBytes == 0u || m_localToHostReadPos >= m_localToHostBuffer.size())
+         return 0u;
+     const size_t count = std::min<size_t>(maxBytes, m_localToHostBuffer.size() - m_localToHostReadPos);
+@@ -2605,7 +3399,8 @@ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
+-    FlushPendingUnlocked();
++    FlushPendingUnlocked(kFlushClear);
++    m_shadowValid.reset();
+     if (!m_vram || context.frame.fbw == 0u)
+         return false;
+ 
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 93af9bd..73c08a1 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -13,6 +13,17 @@
+ 
+ namespace
+ {
++    // Hands what a queued backend holds back to its thread when a GIF packet or register write ends.
++    struct BackendKickOnExit
++    {
++        GSRasterBackend *backend;
++        ~BackendKickOnExit()
++        {
++            if (backend)
++                backend->Kick();
++        }
++    };
++
+     static constexpr uint32_t kHostFrameWidth = 640u;
+ 
+     GSPrimReg decodePrimRegister(uint64_t value)
+@@ -644,6 +655,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+     // Before the state lock: the VIF1 worker may need it to finish.
+     ps2x::syncVif1Worker();
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    const BackendKickOnExit kick{m_backend.get()};
+     if (!data || sizeBytes < 16 || !m_backend)
+         return;
+ 
+@@ -745,6 +757,7 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+     // Before the state lock: the VIF1 worker may need it to finish.
+     ps2x::syncVif1Worker();
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    const BackendKickOnExit kick{m_backend.get()};
+     if (!data || sizeBytes < 16u || !m_backend)
+         return false;
+ 
+@@ -1072,6 +1085,7 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
+     // Before the state lock: the VIF1 worker may need it to finish.
+     ps2x::syncVif1Worker();
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
++    const BackendKickOnExit kick{m_backend.get()};
+     writeRegisterUnlocked(regAddr, value);
+ }
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index e3b0c20..1bac467 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -930,9 +930,15 @@ bool PS2Runtime::syncCoreSubsystems()
+                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
+                                      m_vu1.state().tBitEnabled =
+                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
++                                     const bool timed = ps2x::vif1StatsEnabled();
++                                     const auto vuStart = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
+                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
+                                                   m_gs, &m_memory, top, itop, kMicroCycleLimit);
++                                     if (timed)
++                                         ps2x::vif1StatsAddPart(3u, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                                                                               std::chrono::steady_clock::now() - vuStart)
++                                                                                               .count()));
+                                      warnUnfinishedMicroProgram(m_vu1, "vu1", m_vu1.state().pc);
+                                      // Runs on the VIF1 worker: write VPU_STAT only when the D/T bits change.
+                                      const uint32_t vpuStat =
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_worker.cpp b/ps2xRuntime/src/lib/ps2_vif1_worker.cpp
+index 7a1bf05..e4b65c1 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_worker.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_worker.cpp
+@@ -27,7 +27,7 @@ namespace ps2x
+         std::atomic<uint64_t> g_waitNs[Vif1Worker::SyncReasonCount]{};
+         std::atomic<uint64_t> g_calls[Vif1Worker::SyncReasonCount]{};
+         std::atomic<uint64_t> g_workNs{0};
+-        std::atomic<uint64_t> g_partNs[2]{};
++        std::atomic<uint64_t> g_partNs[4]{};
+         std::atomic<uint64_t> g_items{0};
+         std::chrono::steady_clock::time_point g_statsLast = std::chrono::steady_clock::now();
+         std::mutex g_statsMutex;
+@@ -42,10 +42,11 @@ namespace ps2x
+             g_statsLast = now;
+             static const char *names[] = {"gifvif", "vu1mem", "gspriv", "gifchan", "gsfront", "path3", "other"};
+             char line[512];
+-            int len = std::snprintf(line, sizeof(line), "[vif1-stats] %.1fs worker=%.0f%% (vu1 %.0f%%, gs %.0f%%) items=%llu waits:", seconds,
++            int len = std::snprintf(line, sizeof(line), "[vif1-stats] %.1fs worker=%.0f%% (vu1 %.0f%%, gs %.0f%% of which gs-queue-full %.0f%%) items=%llu waits:", seconds,
+                                     100.0 * static_cast<double>(g_workNs.exchange(0)) / (seconds * 1e9),
+-                                    100.0 * static_cast<double>(g_partNs[0].exchange(0)) / (seconds * 1e9),
++                                    100.0 * static_cast<double>(g_partNs[0].exchange(0) + g_partNs[3].exchange(0)) / (seconds * 1e9),
+                                     100.0 * static_cast<double>(g_partNs[1].exchange(0)) / (seconds * 1e9),
++                                    100.0 * static_cast<double>(g_partNs[2].exchange(0)) / (seconds * 1e9),
+                                     static_cast<unsigned long long>(g_items.exchange(0)));
+             for (uint32_t r = 0; r < Vif1Worker::SyncReasonCount; ++r)
+             {
+@@ -191,7 +192,7 @@ namespace ps2x
+ 
+     void vif1StatsAddPart(uint32_t part, uint64_t ns)
+     {
+-        if (part < 2u && t_onVif1Worker)
++        if (part < 4u && t_onVif1Worker)
+             g_partNs[part].fetch_add(ns, std::memory_order_relaxed);
+     }
+ 
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu_fast.cpp b/ps2xRuntime/src/lib/vu/ps2_vu_fast.cpp
+index c3c7278..8687790 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu_fast.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu_fast.cpp
+@@ -8,9 +8,11 @@
+ #include <algorithm>
+ #include <bit>
+ #include <cmath>
++#include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+ #include <limits>
++#include <vector>
+ 
+ #if defined(__x86_64__) || defined(_M_X64)
+ #define PS2X_VU_FAST_AVAILABLE 1
+@@ -19,6 +21,22 @@
+ #define PS2X_VU_FAST_AVAILABLE 0
+ #endif
+ 
++// The block compiler emits Win64-ABI code.
++#if PS2X_VU_FAST_AVAILABLE && defined(_WIN32)
++#define PS2X_VU_JIT_AVAILABLE 1
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <windows.h>
++#include "ps2_x64_emitter.h"
++#include <vector>
++#else
++#define PS2X_VU_JIT_AVAILABLE 0
++#endif
++
+ #if PS2X_VU_FAST_AVAILABLE
+ 
+ namespace
+@@ -343,6 +361,54 @@ namespace
+         return flags ? selectUpperT<true>(instr, readsQ) : selectUpperT<false>(instr, readsQ);
+     }
+ 
++    // The FMAC handlers without flags, for the block compiler to emit them inline.
++    struct FmacInfo
++    {
++        VuFastEngine::Handler handler;
++        int kind;
++        int source;
++        bool toAcc;
++    };
++    template <int K, int S, bool A>
++    void addFmacInfo(std::vector<FmacInfo> &table)
++    {
++        table.push_back({&hFmac<K, S, A, false>, K, S, A});
++        // MAX and MIN never write flags: the variant with flags is the same operation.
++        if constexpr (K == kMax || K == kMin)
++            table.push_back({&hFmac<K, S, A, true>, K, S, A});
++    }
++    template <int K>
++    void addFmacKind(std::vector<FmacInfo> &table)
++    {
++        addFmacInfo<K, sBc, false>(table);
++        addFmacInfo<K, sBc, true>(table);
++        addFmacInfo<K, sFull, false>(table);
++        addFmacInfo<K, sFull, true>(table);
++        addFmacInfo<K, sQ, false>(table);
++        addFmacInfo<K, sQ, true>(table);
++        addFmacInfo<K, sI, false>(table);
++        addFmacInfo<K, sI, true>(table);
++    }
++    const FmacInfo *findFmac(VuFastEngine::Handler handler)
++    {
++        static const std::vector<FmacInfo> table = []
++        {
++            std::vector<FmacInfo> t;
++            addFmacKind<kAdd>(t);
++            addFmacKind<kSub>(t);
++            addFmacKind<kMul>(t);
++            addFmacKind<kMadd>(t);
++            addFmacKind<kMsub>(t);
++            addFmacKind<kMax>(t);
++            addFmacKind<kMin>(t);
++            return t;
++        }();
++        for (const FmacInfo &info : table)
++            if (info.handler == handler)
++                return &info;
++        return nullptr;
++    }
++
+     // ---- lower instructions ---------------------------------------------------------------------------
+ 
+     float vuEatan(float value)
+@@ -948,6 +1014,483 @@ std::unique_ptr<VuFastEngine> VuFastEngine::create(VU1Interpreter &vu)
+ VuFastEngine::VuFastEngine(VU1Interpreter &owner)
+     : vu(owner), s(owner.m_state)
+ {
++#if PS2X_VU_JIT_AVAILABLE
++    static const bool jit = []
++    {
++        const char *env = std::getenv("PS2X_VU_JIT");
++        return !(env && env[0] == '0');
++    }();
++    if (jit)
++    {
++        constexpr size_t kJitBytes = 8u << 20;
++        m_jitBuffer = static_cast<uint8_t *>(VirtualAlloc(nullptr, kJitBytes, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
++        if (m_jitBuffer)
++        {
++            m_jitCapacity = kJitBytes;
++            m_jitEnabled = true;
++        }
++        const char *inlineEnv = std::getenv("PS2X_VU_JIT_INLINE");
++        m_jitInline = !(inlineEnv && inlineEnv[0] == '0');
++    }
++#endif
++}
++
++namespace
++{
++    // PS2X_VU_JIT_STATS=1: pairs run by compiled blocks and by the loop, blocks compiled, at exit.
++    struct JitStats
++    {
++        bool enabled = []
++        {
++            const char *env = std::getenv("PS2X_VU_JIT_STATS");
++            return env && env[0] == '1';
++        }();
++        uint64_t jitPairs = 0, loopPairs = 0, blocks = 0, blockPairs = 0, failed = 0;
++        ~JitStats()
++        {
++            if (enabled)
++                std::fprintf(stderr, "[vu-jit] pairs: compiled %llu, loop %llu; blocks %llu (avg %.1f pairs), not compiled %llu\n",
++                             static_cast<unsigned long long>(jitPairs), static_cast<unsigned long long>(loopPairs),
++                             static_cast<unsigned long long>(blocks), blocks ? static_cast<double>(blockPairs) / blocks : 0.0,
++                             static_cast<unsigned long long>(failed));
++        }
++    };
++    JitStats g_jitStats;
++}
++
++VuFastEngine::~VuFastEngine()
++{
++#if PS2X_VU_JIT_AVAILABLE
++    if (m_jitBuffer)
++        VirtualFree(m_jitBuffer, 0, MEM_RELEASE);
++#endif
++}
++
++uint64_t VuFastEngine::readyFor(const Pair &p) const
++{
++    // The lanes read are masked in and the latest one wins (same rules as calculatePairReadyCycle).
++    uint64_t ready = cycle;
++    const uint32_t now32 = static_cast<uint32_t>(cycle - m_readyBase);
++    __m128i laneMax = _mm_setzero_si128();
++    for (uint32_t n = 0; n < p.readCount; ++n)
++    {
++        const __m128i laneReady = _mm_load_si128(reinterpret_cast<const __m128i *>(m_vfReady[p.readReg[n]]));
++        laneMax = _mm_max_epu32(laneMax, _mm_and_si128(laneReady, _mm_castps_si128(destMask(p.readLanes[n]))));
++    }
++    if (p.accRead)
++    {
++        const __m128i laneReady = _mm_load_si128(reinterpret_cast<const __m128i *>(m_accReady));
++        laneMax = _mm_max_epu32(laneMax, _mm_and_si128(laneReady, _mm_castps_si128(destMask(p.accRead))));
++    }
++    laneMax = _mm_max_epu32(laneMax, _mm_shuffle_epi32(laneMax, _MM_SHUFFLE(1, 0, 3, 2)));
++    laneMax = _mm_max_epu32(laneMax, _mm_shuffle_epi32(laneMax, _MM_SHUFFLE(2, 3, 0, 1)));
++    uint32_t ready32 = static_cast<uint32_t>(_mm_cvtsi128_si32(laneMax));
++    for (uint32_t bits = p.viRead; bits != 0u; bits &= bits - 1u)
++        ready32 = std::max(ready32, m_viReady[static_cast<uint32_t>(std::countr_zero(bits))]);
++    if (ready32 > now32)
++        ready = m_readyBase + ready32;
++    if (p.flags & (kFdiv | kEfu | kWaitQ | kWaitP))
++    {
++        if ((p.flags & (kFdiv | kWaitQ)) && fdiv.valid)
++            ready = std::max(ready, fdiv.ready);
++        if (p.flags & kEfu)
++            ready = std::max(ready, efuResourceReady);
++        if (p.flags & kWaitP)
++            for (const Scalar &entry : efu)
++                if (entry.valid)
++                    ready = std::max(ready, entry.ready);
++    }
++    return ready;
++}
++
++uint32_t VuFastEngine::jitStall(VuFastEngine *engine, const Pair *pair)
++{
++    VuFastEngine &e = *engine;
++    const uint64_t ready = e.readyFor(*pair);
++    if (ready > e.cycle)
++    {
++        if (ready >= e.m_budgetEnd)
++        {
++            e.cycle = e.m_budgetEnd;
++            return 1u;
++        }
++        e.cycle = ready;
++    }
++    if (pair->flags & kCommit)
++        e.commit(e.cycle);
++    return 0u;
++}
++
++bool VuFastEngine::jitable(const Pair &p) const
++{
++    return (p.flags & (kReserved | kEBit | kDBit | kTBit)) == 0u && p.shadowReg == 0u;
++}
++
++void VuFastEngine::jitReset()
++{
++    // Every image's blocks point into the one code buffer.
++    for (const std::unique_ptr<CodeImage> &image : m_images)
++        for (uint32_t n = 0; n < kMaxPairs; ++n)
++            image->blocks[n] = {};
++    m_jitUsed = 0;
++}
++
++void VuFastEngine::compileBlock(uint32_t index, uint32_t pairLimit, uint32_t codeSize)
++{
++    m_blocks[index].tried = true;
++#if PS2X_VU_JIT_AVAILABLE
++    using namespace ps2x::x64;
++    if (!m_jitBuffer)
++        return;
++    Emitter e;
++    const uint8_t *engineBase = reinterpret_cast<const uint8_t *>(this);
++    const uint8_t *stateBase = reinterpret_cast<const uint8_t *>(&s);
++    auto off = [&](const void *member)
++    { return static_cast<int32_t>(reinterpret_cast<const uint8_t *>(member) - engineBase); };
++    auto soff = [&](const void *member)
++    { return static_cast<int32_t>(reinterpret_cast<const uint8_t *>(member) - stateBase); };
++    auto call = [&](const void *fn, const void *arg)
++    {
++        e.movRR(RCX, RBX);
++        e.movImm64(RDX, reinterpret_cast<uint64_t>(arg));
++        e.movImm64(RAX, reinterpret_cast<uint64_t>(fn));
++        e.callR(RAX);
++    };
++    // pblendw word mask of VU lanes (x = 8 is element 0).
++    auto laneWords = [](uint8_t lanes)
++    {
++        uint8_t mask = 0;
++        for (uint32_t c = 0; c < 4u; ++c)
++            if (lanes & (8u >> c))
++                mask = static_cast<uint8_t>(mask | (3u << (c * 2u)));
++        return mask;
++    };
++
++    // rbx = engine, rsi = VU state, rdi = &vu.m_viBranchBackupValid. 3 pushes + 32 keep rsp 16-aligned.
++    e.push(RBX);
++    e.push(RSI);
++    e.push(RDI);
++    e.subRsp(32);
++    e.movRR(RBX, RCX);
++    e.movImm64(RSI, reinterpret_cast<uint64_t>(&s));
++    e.movImm64(RDI, reinterpret_cast<uint64_t>(&vu.m_viBranchBackupValid));
++
++    struct Exit
++    {
++        size_t patch;
++        uint32_t pairs;
++        uint32_t pc;
++    };
++    std::vector<Exit> exits;
++    uint32_t count = 0;
++    bool endedWithBranch = false;
++    bool previousBackup = false;
++    constexpr uint32_t kMaxBlockPairs = 256u;
++    const uint8_t *backupBase = reinterpret_cast<const uint8_t *>(&vu.m_viBranchBackupValid);
++    auto voff = [&](const void *member)
++    { return static_cast<int32_t>(reinterpret_cast<const uint8_t *>(member) - backupBase); };
++    // movmskps bit of each VU lane (x = 8 is element 0).
++    auto laneBits = [](uint8_t lanes)
++    {
++        uint32_t mask = 0;
++        for (uint32_t c = 0; c < 4u; ++c)
++            if (lanes & (8u >> c))
++                mask |= 1u << c;
++        return mask;
++    };
++
++    // clampOp/normalizeResult on xmm `a` (temps t, u): exponent 255 -> largest magnitude, exponent 0 -> zero,
++    // sign kept.
++    auto clamp = [&](uint8_t a, uint8_t t, uint8_t u)
++    {
++        e.movaps(t, a);
++        e.pandM(t, RBX, off(m_jitConst[0]));
++        e.pandM(a, RBX, off(m_jitConst[1]));
++        e.pminudM(a, RBX, off(m_jitConst[2]));
++        e.movaps(u, a);
++        e.pcmpgtdM(u, RBX, off(m_jitConst[3]));
++        e.pand(a, u);
++        e.por(a, t);
++    };
++    // hFmac<K, S, ToAcc, false> as inline SSE (same operations in the same order).
++    auto emitFmac = [&](const Pair &p) -> bool
++    {
++        const FmacInfo *info = findFmac(p.upper);
++        if (!info)
++            return false;
++        const auto &u = p.u;
++        e.movupsLoad(1, RSI, soff(s.vf[u.fs]));
++        clamp(1, 4, 5);
++        switch (info->source)
++        {
++        case sFull:
++            e.movupsLoad(2, RSI, soff(s.vf[u.ft]));
++            break;
++        case sBc:
++            e.movdLoad(2, RSI, soff(&s.vf[u.ft][u.bc & 3u]));
++            e.pshufd(2, 2, 0);
++            break;
++        case sQ:
++            e.movdLoad(2, RSI, soff(&s.q));
++            e.pshufd(2, 2, 0);
++            break;
++        default:
++            e.movdLoad(2, RSI, soff(&s.i));
++            e.pshufd(2, 2, 0);
++            break;
++        }
++        clamp(2, 4, 5);
++        uint8_t result = 1;
++        switch (info->kind)
++        {
++        case kAdd:
++            e.addps(1, 2);
++            break;
++        case kSub:
++            e.subps(1, 2);
++            break;
++        case kMul:
++            e.mulps(1, 2);
++            break;
++        case kMadd:
++        case kMsub:
++            e.mulps(1, 2);
++            e.movupsLoad(3, RSI, soff(s.acc));
++            clamp(3, 4, 5);
++            if (info->kind == kMadd)
++                e.addps(3, 1);
++            else
++                e.subps(3, 1);
++            result = 3;
++            break;
++        case kMax:
++            e.maxps(1, 2);
++            break;
++        default:
++            e.minps(1, 2);
++            break;
++        }
++        if (info->kind != kMax && info->kind != kMin)
++            clamp(result, 4, 5);
++        const uint8_t dest = u.dest & 0xFu;
++        const int32_t target = info->toAcc ? soff(s.acc) : soff(s.vf[u.fd]);
++        if (dest == 0xFu)
++            e.movupsStore(RSI, target, result);
++        else if (dest != 0u)
++        {
++            e.movupsLoad(0, RSI, target);
++            e.blendps(0, result, static_cast<uint8_t>(laneBits(dest)));
++            e.movupsStore(RSI, target, 0);
++        }
++        return true;
++    };
++
++    auto emitPair = [&](uint32_t n)
++    {
++        const Pair &p = m_pairs[n];
++        const uint32_t pos = count++;
++        // Branch handlers compute their target from s.pc; everything else gets it at the block's exits.
++        if (p.flags & kBranch)
++            e.store32Imm(RSI, soff(&s.pc), n * 8u);
++        // Same issue rules as execute(): the readiness check is needed in the first m_stallWindow pairs of
++        // the block (the pairs before them may not have run in a line) and where a read can still be pending.
++        // It is done inline; jitStall only runs when something is not ready (or for FDIV/EFU/Q/P/flag reads).
++        const bool always = (p.flags & (kFdiv | kEfu | kWaitQ | kWaitP | kCommit)) != 0u;
++        const bool reads = p.readCount != 0u || p.accRead != 0u || p.viRead != 0u;
++        const bool check = always || (reads && ((p.flags & kNoStall) == 0u || pos < m_stallWindow));
++        if (check)
++        {
++            std::vector<size_t> slow;
++            size_t skip = 0;
++            if (!always)
++            {
++                e.load32(RAX, RBX, off(&cycle));
++                e.sub32M(RAX, RBX, off(&m_readyBase));
++                if (p.readCount != 0u || p.accRead != 0u)
++                {
++                    e.movdXR(0, RAX);
++                    e.pshufd(0, 0, 0);
++                }
++                auto vfCheck = [&](int32_t slot, uint8_t lanes)
++                {
++                    e.loadX(1, RBX, slot);
++                    e.pcmpgtd(1, 0);
++                    e.movmskps(RCX, 1);
++                    e.test32Imm(RCX, laneBits(lanes));
++                    slow.push_back(e.jccRel32(0x85));
++                };
++                for (uint32_t r = 0; r < p.readCount; ++r)
++                    vfCheck(off(m_vfReady[p.readReg[r]]), p.readLanes[r]);
++                if (p.accRead != 0u)
++                    vfCheck(off(m_accReady), p.accRead);
++                for (uint32_t bits = p.viRead; bits != 0u; bits &= bits - 1u)
++                {
++                    e.cmp32MR(RBX, off(&m_viReady[std::countr_zero(bits)]), RAX);
++                    slow.push_back(e.jccRel32(0x87)); // ready > now (unsigned)
++                }
++                skip = e.jmpRel32();
++                for (size_t at : slow)
++                    e.patchRel32(at, e.size());
++            }
++            call(reinterpret_cast<const void *>(&VuFastEngine::jitStall), &p);
++            e.test32(RAX, RAX);
++            exits.push_back({e.jccRel32(0x85), pos, n * 8u});
++            if (!always)
++                e.patchRel32(skip, e.size());
++        }
++        if (p.flags & kBranchBackup)
++        {
++            e.load32(RAX, RSI, soff(&s.vi[p.viWriteReg]));
++            e.store32(RBX, off(&m_jitOldVi), RAX);
++        }
++        if (p.upper && !(m_jitInline && emitFmac(p)))
++            call(reinterpret_cast<const void *>(p.upper), &p);
++        if (p.flags & kIBit)
++        {
++            const float value = normOp(p.immediate);
++            uint32_t bits = 0;
++            std::memcpy(&bits, &value, sizeof(bits));
++            e.store32Imm(RSI, soff(&s.i), bits);
++        }
++        else if (p.lower)
++            call(reinterpret_cast<const void *>(p.lower), &p);
++        // The VI branch backup lives for one pair: the one before the block, or a pair in it, may have set it.
++        if (pos == 0u || previousBackup)
++            e.store8Imm(RDI, 0, 0);
++        previousBackup = (p.flags & kBranchBackup) != 0u;
++        if (previousBackup)
++        {
++            e.load32(RAX, RBX, off(&m_jitOldVi));
++            e.store32(RDI, voff(&vu.m_viBranchBackupValue), RAX);
++            e.store8Imm(RDI, voff(&vu.m_viBranchBackupReg), p.viWriteReg);
++            e.store8Imm(RDI, 0, 1);
++        }
++
++        if (p.upperWriteReg != 0u || p.lowerWriteReg != 0u || p.viWriteReg != 0u || p.accWriteLanes != 0u)
++        {
++            // eax = issue cycle relative to m_readyBase
++            e.load32(RAX, RBX, off(&cycle));
++            e.sub32M(RAX, RBX, off(&m_readyBase));
++            auto record = [&](int32_t slot, uint8_t lanes, uint32_t latency)
++            {
++                e.lea32(RCX, RAX, static_cast<int32_t>(latency));
++                e.movdXR(0, RCX);
++                e.pshufd(0, 0, 0);
++                e.loadX(1, RBX, slot);
++                e.pblendw(1, 0, laneWords(lanes));
++                e.storeX(RBX, slot, 1);
++            };
++            if (p.upperWriteReg != 0u)
++                record(off(m_vfReady[p.upperWriteReg]), p.upperWriteLanes, p.upperLatency);
++            if (p.lowerWriteReg != 0u)
++                record(off(m_vfReady[p.lowerWriteReg]), p.lowerWriteLanes, p.lowerLatency);
++            if (p.viWriteReg != 0u)
++            {
++                e.lea32(RCX, RAX, static_cast<int32_t>(p.viLatency));
++                e.store32(RBX, off(&m_viReady[p.viWriteReg]), RCX);
++            }
++            if (p.accWriteLanes != 0u)
++                record(off(m_accReady), p.accWriteLanes, VU1Interpreter::kAccForwardLatency);
++        }
++        // VF0 can only change through a field naming it (upper FD/FT, lower FT); VI0 is reset as the loop does.
++        const bool upperVf0 = p.upper != nullptr && (((p.upperInstr >> 6) & 0x1Fu) == 0u || ((p.upperInstr >> 16) & 0x1Fu) == 0u);
++        const bool lowerVf0 = p.lower != nullptr && (p.flags & kIBit) == 0u && ((p.lowerInstr >> 16) & 0x1Fu) == 0u;
++        if (upperVf0 || lowerVf0)
++        {
++            e.loadX(2, RBX, off(m_vf0Value));
++            e.storeX(RSI, soff(s.vf[0]), 2);
++        }
++        e.store32Imm(RSI, soff(&s.vi[0]), 0u);
++        e.add64MImm(RBX, off(&cycle), 1);
++    };
++
++    auto inRange = [&](uint32_t n)
++    { return n < pairLimit && n * 8u + 8u <= codeSize; };
++
++    for (uint32_t n = index; inRange(n) && count < kMaxBlockPairs; ++n)
++    {
++        const Pair &p = m_pairs[n];
++        if (!jitable(p))
++            break;
++        if (p.flags & kBranch)
++        {
++            // The branch and its delay slot, then the branch resolves as in execute(). A delay slot the
++            // block cannot take (or another branch) is left to the loop, with the branch.
++            const uint32_t slot = n + 1u;
++            if (!inRange(slot) || !jitable(m_pairs[slot]) || (m_pairs[slot].flags & kBranch))
++                break;
++            emitPair(n);
++            emitPair(slot);
++            e.cmp8Imm(RSI, soff(&s.branchPending), 0);
++            const size_t notTaken = e.jccRel32(0x84);
++            e.load32(RAX, RSI, soff(&s.branchTarget));
++            e.and32Imm(RAX, pcMask);
++            e.store32(RSI, soff(&s.pc), RAX);
++            e.store8Imm(RSI, soff(&s.branchPending), 0);
++            e.store32Imm(RSI, soff(&s.branchDelay), 0u);
++            const size_t done = e.jmpRel32();
++            e.patchRel32(notTaken, e.size());
++            uint32_t next = slot * 8u + 8u;
++            if (next >= codeSize)
++                next = 0u;
++            e.store32Imm(RSI, soff(&s.pc), next);
++            e.patchRel32(done, e.size());
++            endedWithBranch = true;
++            break;
++        }
++        emitPair(n);
++    }
++    if (count == 0u)
++    {
++        ++g_jitStats.failed;
++        return;
++    }
++    ++g_jitStats.blocks;
++    g_jitStats.blockPairs += count;
++    if (!endedWithBranch)
++    {
++        uint32_t next = (index + count) * 8u;
++        if (next >= codeSize)
++            next = 0u;
++        e.store32Imm(RSI, soff(&s.pc), next);
++    }
++    e.add64MImm(RBX, off(&m_jitPairs), static_cast<int32_t>(count));
++    e.movImm32(RAX, 0u);
++    const size_t epilogue = e.size();
++    e.addRsp(32);
++    e.pop(RDI);
++    e.pop(RSI);
++    e.pop(RBX);
++    e.ret();
++    // Budget exits: s.pc is the pair that did not run; the pairs before it are counted.
++    for (const Exit &exit : exits)
++    {
++        e.patchRel32(exit.patch, e.size());
++        e.store32Imm(RSI, soff(&s.pc), exit.pc);
++        if (exit.pairs != 0u)
++            e.add64MImm(RBX, off(&m_jitPairs), static_cast<int32_t>(exit.pairs));
++        e.movImm32(RAX, 1u);
++        e.patchRel32(e.jmpRel32(), epilogue);
++    }
++
++    const size_t bytes = (e.size() + 15u) & ~size_t{15u};
++    if (bytes > m_jitCapacity)
++        return;
++    if (m_jitUsed + bytes > m_jitCapacity)
++    {
++        jitReset();
++        m_blocks[index].tried = true;
++    }
++    uint8_t *target = m_jitBuffer + m_jitUsed;
++    std::memcpy(target, e.code.data(), e.size());
++    m_jitUsed += bytes;
++    FlushInstructionCache(GetCurrentProcess(), target, e.size());
++    m_blocks[index].fn = reinterpret_cast<BlockFn>(target);
++    m_blocks[index].pairs = count;
++#else
++    (void)pairLimit;
++    (void)codeSize;
++#endif
+ }
+ 
+ uint32_t &VuFastEngine::workingClip() { return vu.m_workingClip; }
+@@ -1363,6 +1906,54 @@ VuFastEngine::Pair VuFastEngine::decode(const uint8_t *vuCode, uint32_t pc) cons
+ void VuFastEngine::rebuild(const uint8_t *vuCode, uint32_t codeSize, uint64_t generation)
+ {
+     const uint32_t pairCount = std::min<uint32_t>(codeSize / 8u, kMaxPairs);
++    const size_t bytes = static_cast<size_t>(pairCount) * 8u;
++    uint64_t hash = 1469598103934665603ull;
++    for (size_t offset = 0; offset + 8u <= bytes; offset += 8u)
++    {
++        uint64_t word = 0;
++        std::memcpy(&word, vuCode + offset, sizeof(word));
++        hash = (hash ^ word) * 1099511628211ull;
++    }
++    m_code = vuCode;
++    m_codeSize = codeSize;
++    m_generation = generation;
++    m_valid = true;
++    for (const std::unique_ptr<CodeImage> &image : m_images)
++    {
++        if (image->hash == hash && image->code.size() == bytes && std::memcmp(image->code.data(), vuCode, bytes) == 0)
++        {
++            image->lastUse = ++m_imageClock;
++            m_pairs = image->pairs.get();
++            m_blocks = image->blocks.get();
++            m_statusLive = image->statusLive;
++            m_clipLive = image->clipLive;
++            m_stallWindow = image->stallWindow;
++            return;
++        }
++    }
++    CodeImage *image = nullptr;
++    if (m_images.size() < kImageCache)
++    {
++        m_images.push_back(std::make_unique<CodeImage>());
++        image = m_images.back().get();
++        image->pairs = std::make_unique<Pair[]>(kMaxPairs);
++        image->blocks = std::make_unique<JitBlock[]>(kMaxPairs);
++    }
++    else
++    {
++        image = m_images.front().get();
++        for (const std::unique_ptr<CodeImage> &candidate : m_images)
++            if (candidate->lastUse < image->lastUse)
++                image = candidate.get();
++        for (uint32_t n = 0; n < kMaxPairs; ++n)
++            image->blocks[n] = {};
++    }
++    image->code.assign(vuCode, vuCode + bytes);
++    image->hash = hash;
++    image->lastUse = ++m_imageClock;
++    m_pairs = image->pairs.get();
++    m_blocks = image->blocks.get();
++
+     m_statusLive = false;
+     m_clipLive = false;
+     for (uint32_t n = 0; n < pairCount; ++n)
+@@ -1395,10 +1986,56 @@ void VuFastEngine::rebuild(const uint8_t *vuCode, uint32_t codeSize, uint64_t ge
+         m_pairs[n] = decode(vuCode, n * 8u);
+     if (!flagsAlways && !m_statusLive)
+         eliminateDeadFlags(vuCode, pairCount);
+-    m_code = vuCode;
+-    m_codeSize = codeSize;
+-    m_generation = generation;
+-    m_valid = true;
++    markStallFree(pairCount);
++    image->statusLive = m_statusLive;
++    image->clipLive = m_clipLive;
++    image->stallWindow = m_stallWindow;
++}
++
++void VuFastEngine::markStallFree(uint32_t pairCount)
++{
++    static const bool disabled = []
++    {
++        const char *env = std::getenv("PS2X_VU_STALL_SKIP");
++        return env && env[0] == '0';
++    }();
++    uint32_t window = VU1Interpreter::kAccForwardLatency;
++    for (uint32_t n = 0; n < pairCount; ++n)
++    {
++        const Pair &p = m_pairs[n];
++        window = std::max<uint32_t>({window, p.upperLatency, p.lowerLatency, p.viLatency});
++    }
++    m_stallWindow = window;
++    if (disabled)
++        return;
++
++    // Pair n issues at least d cycles after pair n - d, so a write with latency <= d is ready when n reads it.
++    for (uint32_t n = window; n < pairCount; ++n)
++    {
++        Pair &p = m_pairs[n];
++        bool hazard = false;
++        auto readsVf = [&](uint8_t reg, uint8_t lanes)
++        {
++            for (uint32_t r = 0; r < p.readCount; ++r)
++                if (p.readReg[r] == reg && (p.readLanes[r] & lanes) != 0u)
++                    return true;
++            return false;
++        };
++        for (uint32_t d = 1; d < window && !hazard; ++d)
++        {
++            const Pair &q = m_pairs[n - d];
++            if (q.upperWriteReg != 0u && q.upperLatency > d && readsVf(q.upperWriteReg, q.upperWriteLanes))
++                hazard = true;
++            else if (q.lowerWriteReg != 0u && q.lowerLatency > d && readsVf(q.lowerWriteReg, q.lowerWriteLanes))
++                hazard = true;
++            else if (q.viWriteReg != 0u && q.viLatency > d && ((p.viRead >> q.viWriteReg) & 1u) != 0u)
++                hazard = true;
++            else if (q.accWriteLanes != 0u && VU1Interpreter::kAccForwardLatency > d && (p.accRead & q.accWriteLanes) != 0u)
++                hazard = true;
++        }
++        if (!hazard)
++            p.flags |= kNoStall;
++    }
+ }
+ 
+ void VuFastEngine::flushAll()
+@@ -1457,15 +2094,32 @@ bool VuFastEngine::execute(uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData,
+     cycle = vu.m_cycle;
+     rebaseReadiness(cycle);
+     const uint64_t budgetEnd = cycle + maxCycles;
++    m_budgetEnd = budgetEnd;
++    m_jitPairs = 0;
+     pcMask = vu.microAddressMask();
+     const uint32_t pairLimit = std::min<uint32_t>(codeSize / 8u, kMaxPairs);
+     bool programEnded = false;
+     uint64_t pairs = 0;
++    uint32_t linear = 0;
+ 
+     while (cycle < budgetEnd && !vu.m_stopRequested)
+     {
+         if (s.pc + 8u > codeSize || (s.pc >> 3) >= pairLimit)
+             break;
++        if (m_jitEnabled && !s.branchPending && !s.ebit && !s.haltAfterDelaySlot)
++        {
++            JitBlock &block = m_blocks[s.pc >> 3];
++            if (!block.tried)
++                compileBlock(s.pc >> 3, pairLimit, codeSize);
++            if (block.fn && budgetEnd - cycle > static_cast<uint64_t>(block.pairs) + 64u)
++            {
++                const uint32_t status = block.fn(this);
++                linear = 0;
++                if (status != 0u)
++                    break; // budget reached at a stall (cycle = budgetEnd)
++                continue;
++            }
++        }
+         const Pair &p = m_pairs[s.pc >> 3];
+         if (p.flags & kReserved)
+         {
+@@ -1474,37 +2128,11 @@ bool VuFastEngine::execute(uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData,
+             break;
+         }
+ 
+-        // Wait until everything the pair reads is ready (same rules as calculatePairReadyCycle): the lanes
+-        // read are masked in and the latest one wins.
+-        const uint32_t now32 = static_cast<uint32_t>(cycle - m_readyBase);
+-        __m128i laneMax = _mm_setzero_si128();
+-        for (uint32_t n = 0; n < p.readCount; ++n)
+-        {
+-            const __m128i laneReady = _mm_load_si128(reinterpret_cast<const __m128i *>(m_vfReady[p.readReg[n]]));
+-            laneMax = _mm_max_epu32(laneMax, _mm_and_si128(laneReady, _mm_castps_si128(destMask(p.readLanes[n]))));
+-        }
+-        if (p.accRead)
+-        {
+-            const __m128i laneReady = _mm_load_si128(reinterpret_cast<const __m128i *>(m_accReady));
+-            laneMax = _mm_max_epu32(laneMax, _mm_and_si128(laneReady, _mm_castps_si128(destMask(p.accRead))));
+-        }
+-        laneMax = _mm_max_epu32(laneMax, _mm_shuffle_epi32(laneMax, _MM_SHUFFLE(1, 0, 3, 2)));
+-        laneMax = _mm_max_epu32(laneMax, _mm_shuffle_epi32(laneMax, _MM_SHUFFLE(2, 3, 0, 1)));
+-        uint32_t ready32 = static_cast<uint32_t>(_mm_cvtsi128_si32(laneMax));
+-        for (uint32_t bits = p.viRead; bits != 0u; bits &= bits - 1u)
+-            ready32 = std::max(ready32, m_viReady[static_cast<uint32_t>(std::countr_zero(bits))]);
+-        uint64_t ready = ready32 > now32 ? m_readyBase + ready32 : cycle;
+-        if (p.flags & (kFdiv | kEfu | kWaitQ | kWaitP))
+-        {
+-            if ((p.flags & (kFdiv | kWaitQ)) && fdiv.valid)
+-                ready = std::max(ready, fdiv.ready);
+-            if (p.flags & kEfu)
+-                ready = std::max(ready, efuResourceReady);
+-            if (p.flags & kWaitP)
+-                for (const Scalar &entry : efu)
+-                    if (entry.valid)
+-                        ready = std::max(ready, entry.ready);
+-        }
++        // Wait until everything the pair reads is ready. The VF/VI/ACC part is skipped when no read can
++        // still be pending (FDIV/EFU/Q/P waits are checked by readyFor).
++        uint64_t ready = cycle;
++        if (!((p.flags & kNoStall) && linear >= m_stallWindow) || (p.flags & (kFdiv | kEfu | kWaitQ | kWaitP)))
++            ready = readyFor(p);
+         if (ready > cycle)
+         {
+             if (ready >= budgetEnd)
+@@ -1595,6 +2223,8 @@ bool VuFastEngine::execute(uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData,
+             else
+                 --s.branchDelay;
+         }
++        // Pairs run in a straight line since the entry or the last jump (a wrap to address 0 counts as a jump).
++        linear = (s.pc == nextPc && nextPc != 0u) ? std::min<uint32_t>(linear + 1u, 0xFFFFu) : 0u;
+ 
+         if ((p.flags & (kEBit | kDBit | kTBit)) || s.haltAfterDelaySlot || s.ebit)
+         {
+@@ -1643,7 +2273,12 @@ bool VuFastEngine::execute(uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData,
+     }
+     vu.m_cycle = cycle;
+     s.cycles = cycle;
+-    m_lastRunPairs = pairs;
++    m_lastRunPairs = pairs + m_jitPairs;
++    if (g_jitStats.enabled)
++    {
++        g_jitStats.jitPairs += m_jitPairs;
++        g_jitStats.loopPairs += pairs;
++    }
+     _mm_setcsr(m_hostCsr);
+     return true;
+ }
+@@ -1652,6 +2287,7 @@ bool VuFastEngine::execute(uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData,
+ 
+ std::unique_ptr<VuFastEngine> VuFastEngine::create(VU1Interpreter &) { return nullptr; }
+ VuFastEngine::VuFastEngine(VU1Interpreter &owner) : vu(owner), s(owner.m_state) {}
++VuFastEngine::~VuFastEngine() {}
+ void VuFastEngine::reset() {}
+ uint32_t &VuFastEngine::workingClip() { return vu.m_workingClip; }
+ int32_t VuFastEngine::branchVi(uint8_t) const { return 0; }
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu_fast.h b/ps2xRuntime/src/lib/vu/ps2_vu_fast.h
+index a1d6bfb..74ba63f 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu_fast.h
++++ b/ps2xRuntime/src/lib/vu/ps2_vu_fast.h
+@@ -6,6 +6,7 @@
+ #include <array>
+ #include <cstdint>
+ #include <memory>
++#include <vector>
+ 
+ // Fast execution engine for VU0/VU1 microprograms.
+ //
+@@ -115,6 +116,9 @@ public:
+         kTBit = 1u << 9,
+         kBranch = 1u << 10,
+         kReserved = 1u << 11,
++        // No VF/VI/ACC read can still be waiting for a write of the m_stallWindow pairs before it, when those
++        // ran in a straight line: the readiness check is skipped.
++        kNoStall = 1u << 12,
+     };
+ 
+     // --- execution state used by the handlers -------------------------------------------------------
+@@ -168,7 +172,8 @@ private:
+     void flushAll();
+ 
+     static constexpr uint32_t kMaxPairs = 0x4000u / 8u;
+-    std::array<Pair, kMaxPairs> m_pairs{};
++    // Decoded pairs of the current code image (owned by m_images).
++    Pair *m_pairs = nullptr;
+     const uint8_t *m_code = nullptr;
+     uint32_t m_codeSize = 0;
+     uint64_t m_generation = ~0ull;
+@@ -185,6 +190,65 @@ private:
+     bool m_statusLive = true;
+     bool m_clipLive = true;
+     void eliminateDeadFlags(const uint8_t *vuCode, uint32_t pairCount);
++    // Longest VF/VI/ACC write latency in the loaded code, and kNoStall on the pairs that cannot stall on it.
++    uint32_t m_stallWindow = 4;
++    void markStallFree(uint32_t pairCount);
++
++    // Block compiler (x86-64 Windows; PS2X_VU_JIT=0 disables it). A straight run of pairs from an entry
++    // address, up to a branch and its delay slot, becomes native code that calls the pair handlers and keeps
++    // the cycle count, readiness, PC and branch state exactly as execute()'s loop does; pairs it does not
++    // take (E/D/T bits, reserved, shadowed writes, VI branch backups) and delay slots of branches run by the
++    // loop. Blocks are compiled on first use and dropped when the microcode changes.
++    using BlockFn = uint32_t (*)(VuFastEngine *);
++    struct JitBlock
++    {
++        BlockFn fn = nullptr;
++        uint32_t pairs = 0;
++        bool tried = false;
++    };
++    JitBlock *m_blocks = nullptr;
++    // Decoded and compiled code images, by content: a microprogram the game uploads again is not decoded or
++    // compiled again. The least recently used image is reused when the cache is full.
++    struct CodeImage
++    {
++        std::vector<uint8_t> code;
++        uint64_t hash = 0;
++        std::unique_ptr<Pair[]> pairs;
++        std::unique_ptr<JitBlock[]> blocks;
++        bool statusLive = true;
++        bool clipLive = true;
++        uint32_t stallWindow = 4;
++        uint64_t lastUse = 0;
++    };
++    static constexpr size_t kImageCache = 24;
++    std::vector<std::unique_ptr<CodeImage>> m_images;
++    uint64_t m_imageClock = 0;
++    uint8_t *m_jitBuffer = nullptr;
++    size_t m_jitCapacity = 0;
++    size_t m_jitUsed = 0;
++    bool m_jitEnabled = false;
++    bool m_jitInline = true; // PS2X_VU_JIT_INLINE=0: blocks call every handler instead of emitting FMACs inline
++    uint64_t m_budgetEnd = 0;
++    uint64_t m_jitPairs = 0;
++    int32_t m_jitOldVi = 0;
++    alignas(16) float m_vf0Value[4] = {0.0f, 0.0f, 0.0f, 1.0f};
++    // Operand clamp constants for inline FMAC code: sign, magnitude mask, largest magnitude, largest denormal.
++    alignas(16) uint32_t m_jitConst[4][4] = {{0x80000000u, 0x80000000u, 0x80000000u, 0x80000000u},
++                                             {0x7FFFFFFFu, 0x7FFFFFFFu, 0x7FFFFFFFu, 0x7FFFFFFFu},
++                                             {0x7F7FFFFFu, 0x7F7FFFFFu, 0x7F7FFFFFu, 0x7F7FFFFFu},
++                                             {0x007FFFFFu, 0x007FFFFFu, 0x007FFFFFu, 0x007FFFFFu}};
++    // Cycle at which pair `p` can issue: the readiness of everything it reads (VF lanes, ACC, VI, FDIV,
++    // EFU, Q, P); `cycle` when nothing is pending.
++    uint64_t readyFor(const Pair &p) const;
++    bool jitable(const Pair &p) const;
++    void jitReset();
++    void compileBlock(uint32_t index, uint32_t pairLimit, uint32_t codeSize);
++    static uint32_t jitStall(VuFastEngine *engine, const Pair *pair);
++
++public:
++    ~VuFastEngine();
++
++private:
+     unsigned int m_hostCsr = 0;
+ };
+ 
+diff --git a/ps2xRuntime/src/lib/vu/ps2_x64_emitter.h b/ps2xRuntime/src/lib/vu/ps2_x64_emitter.h
+new file mode 100644
+index 0000000..939b9d1
+--- /dev/null
++++ b/ps2xRuntime/src/lib/vu/ps2_x64_emitter.h
+@@ -0,0 +1,359 @@
++#ifndef PS2_X64_EMITTER_H
++#define PS2_X64_EMITTER_H
++
++// Minimal x86-64 machine code emitter for the VU block compiler (ps2_vu_fast.cpp): only the instructions it
++// uses, with explicit register numbers (rax=0, rcx=1, rdx=2, rbx=3, rsp=4, rbp=5, rsi=6, rdi=7, r8..r15 = 8..15).
++
++#include <cstdint>
++#include <cstring>
++#include <initializer_list>
++#include <vector>
++
++namespace ps2x::x64
++{
++    enum Reg : uint8_t
++    {
++        RAX = 0,
++        RCX = 1,
++        RDX = 2,
++        RBX = 3,
++        RSP = 4,
++        RBP = 5,
++        RSI = 6,
++        RDI = 7,
++        R8 = 8,
++        R9 = 9,
++        R10 = 10,
++        R11 = 11,
++        R12 = 12,
++        R13 = 13,
++        R14 = 14,
++        R15 = 15,
++    };
++
++    class Emitter
++    {
++    public:
++        std::vector<uint8_t> code;
++
++        size_t size() const { return code.size(); }
++
++        void byte(uint8_t b) { code.push_back(b); }
++        void u32(uint32_t v)
++        {
++            for (int i = 0; i < 4; ++i)
++                code.push_back(static_cast<uint8_t>(v >> (i * 8)));
++        }
++        void u64(uint64_t v)
++        {
++            for (int i = 0; i < 8; ++i)
++                code.push_back(static_cast<uint8_t>(v >> (i * 8)));
++        }
++
++        // REX prefix: w = 64-bit operand, r = ModRM.reg extension, b = ModRM.rm/base extension.
++        void rex(bool w, uint8_t reg, uint8_t rm, bool force = false)
++        {
++            const uint8_t value = static_cast<uint8_t>(0x40u | (w ? 8u : 0u) | ((reg & 8u) ? 4u : 0u) | ((rm & 8u) ? 1u : 0u));
++            if (value != 0x40u || force)
++                byte(value);
++        }
++
++        // ModRM + SIB + disp32 for [base + disp32] (base is never RIP here).
++        void mem(uint8_t reg, uint8_t base, int32_t disp)
++        {
++            const uint8_t r = reg & 7u, b = base & 7u;
++            byte(static_cast<uint8_t>(0x80u | (r << 3) | b)); // mod=10: disp32
++            if (b == RSP)
++                byte(0x24); // SIB: base=rsp/r12, no index
++            u32(static_cast<uint32_t>(disp));
++        }
++
++        void push(uint8_t reg)
++        {
++            rex(false, 0, reg);
++            byte(static_cast<uint8_t>(0x50u + (reg & 7u)));
++        }
++        void pop(uint8_t reg)
++        {
++            rex(false, 0, reg);
++            byte(static_cast<uint8_t>(0x58u + (reg & 7u)));
++        }
++        void ret() { byte(0xC3); }
++
++        void subRsp(int8_t imm)
++        {
++            byte(0x48);
++            byte(0x83);
++            byte(0xEC);
++            byte(static_cast<uint8_t>(imm));
++        }
++        void addRsp(int8_t imm)
++        {
++            byte(0x48);
++            byte(0x83);
++            byte(0xC4);
++            byte(static_cast<uint8_t>(imm));
++        }
++
++        // mov dst, src (64-bit)
++        void movRR(uint8_t dst, uint8_t src)
++        {
++            rex(true, src, dst);
++            byte(0x89);
++            byte(static_cast<uint8_t>(0xC0u | ((src & 7u) << 3) | (dst & 7u)));
++        }
++        // mov reg, imm64
++        void movImm64(uint8_t reg, uint64_t imm)
++        {
++            rex(true, 0, reg);
++            byte(static_cast<uint8_t>(0xB8u + (reg & 7u)));
++            u64(imm);
++        }
++        // mov r32, imm32 (zero-extends)
++        void movImm32(uint8_t reg, uint32_t imm)
++        {
++            rex(false, 0, reg);
++            byte(static_cast<uint8_t>(0xB8u + (reg & 7u)));
++            u32(imm);
++        }
++        // call reg
++        void callR(uint8_t reg)
++        {
++            rex(false, 0, reg);
++            byte(0xFF);
++            byte(static_cast<uint8_t>(0xD0u | (reg & 7u)));
++        }
++
++        // mov r32, dword [base + disp]
++        void load32(uint8_t reg, uint8_t base, int32_t disp)
++        {
++            rex(false, reg, base);
++            byte(0x8B);
++            mem(reg, base, disp);
++        }
++        // mov dword [base + disp], r32
++        void store32(uint8_t base, int32_t disp, uint8_t reg)
++        {
++            rex(false, reg, base);
++            byte(0x89);
++            mem(reg, base, disp);
++        }
++        // sub r32, dword [base + disp]
++        void sub32M(uint8_t reg, uint8_t base, int32_t disp)
++        {
++            rex(false, reg, base);
++            byte(0x2B);
++            mem(reg, base, disp);
++        }
++        // mov dword [base + disp], imm32
++        void store32Imm(uint8_t base, int32_t disp, uint32_t imm)
++        {
++            rex(false, 0, base);
++            byte(0xC7);
++            mem(0, base, disp);
++            u32(imm);
++        }
++        // mov byte [base + disp], imm8
++        void store8Imm(uint8_t base, int32_t disp, uint8_t imm)
++        {
++            rex(false, 0, base);
++            byte(0xC6);
++            mem(0, base, disp);
++            byte(imm);
++        }
++        // cmp byte [base + disp], imm8
++        void cmp8Imm(uint8_t base, int32_t disp, uint8_t imm)
++        {
++            rex(false, 0, base);
++            byte(0x80);
++            mem(7, base, disp);
++            byte(imm);
++        }
++        // add qword [base + disp], imm32 (sign-extended)
++        void add64MImm(uint8_t base, int32_t disp, int32_t imm)
++        {
++            rex(true, 0, base);
++            byte(0x81);
++            mem(0, base, disp);
++            u32(static_cast<uint32_t>(imm));
++        }
++        // and r32, imm32
++        void and32Imm(uint8_t reg, uint32_t imm)
++        {
++            rex(false, 0, reg);
++            byte(0x81);
++            byte(static_cast<uint8_t>(0xE0u | (reg & 7u)));
++            u32(imm);
++        }
++        // lea dst32, [src + imm32]
++        void lea32(uint8_t dst, uint8_t src, int32_t disp)
++        {
++            rex(false, dst, src);
++            byte(0x8D);
++            mem(dst, src, disp);
++        }
++        // test r32, r32
++        void test32(uint8_t a, uint8_t b)
++        {
++            rex(false, b, a);
++            byte(0x85);
++            byte(static_cast<uint8_t>(0xC0u | ((b & 7u) << 3) | (a & 7u)));
++        }
++
++        // Jumps with a rel32 target patched later. Returns the offset of the rel32 field.
++        size_t jccRel32(uint8_t cc) // 0x84 je, 0x85 jne
++        {
++            byte(0x0F);
++            byte(cc);
++            const size_t at = size();
++            u32(0);
++            return at;
++        }
++        size_t jmpRel32()
++        {
++            byte(0xE9);
++            const size_t at = size();
++            u32(0);
++            return at;
++        }
++        void patchRel32(size_t at, size_t target)
++        {
++            const int32_t rel = static_cast<int32_t>(static_cast<int64_t>(target) - static_cast<int64_t>(at + 4u));
++            std::memcpy(code.data() + at, &rel, 4);
++        }
++
++        // --- SSE ---------------------------------------------------------------------------------------
++        // movd xmm, r32
++        void movdXR(uint8_t xmm, uint8_t reg)
++        {
++            byte(0x66);
++            rex(false, xmm, reg);
++            byte(0x0F);
++            byte(0x6E);
++            byte(static_cast<uint8_t>(0xC0u | ((xmm & 7u) << 3) | (reg & 7u)));
++        }
++        // pshufd xmm, xmm, imm8
++        void pshufd(uint8_t dst, uint8_t src, uint8_t imm)
++        {
++            byte(0x66);
++            rex(false, dst, src);
++            byte(0x0F);
++            byte(0x70);
++            byte(static_cast<uint8_t>(0xC0u | ((dst & 7u) << 3) | (src & 7u)));
++            byte(imm);
++        }
++        // movdqu xmm, [base + disp]
++        void loadX(uint8_t xmm, uint8_t base, int32_t disp)
++        {
++            byte(0xF3);
++            rex(false, xmm, base);
++            byte(0x0F);
++            byte(0x6F);
++            mem(xmm, base, disp);
++        }
++        // movdqu [base + disp], xmm
++        void storeX(uint8_t base, int32_t disp, uint8_t xmm)
++        {
++            byte(0xF3);
++            rex(false, xmm, base);
++            byte(0x0F);
++            byte(0x7F);
++            mem(xmm, base, disp);
++        }
++        // pcmpgtd xmm, xmm (signed dword >)
++        void pcmpgtd(uint8_t dst, uint8_t src)
++        {
++            byte(0x66);
++            rex(false, dst, src);
++            byte(0x0F);
++            byte(0x66);
++            byte(static_cast<uint8_t>(0xC0u | ((dst & 7u) << 3) | (src & 7u)));
++        }
++        // movmskps r32, xmm
++        void movmskps(uint8_t reg, uint8_t xmm)
++        {
++            rex(false, reg, xmm);
++            byte(0x0F);
++            byte(0x50);
++            byte(static_cast<uint8_t>(0xC0u | ((reg & 7u) << 3) | (xmm & 7u)));
++        }
++        // test r32, imm32
++        void test32Imm(uint8_t reg, uint32_t imm)
++        {
++            rex(false, 0, reg);
++            byte(0xF7);
++            byte(static_cast<uint8_t>(0xC0u | (reg & 7u)));
++            u32(imm);
++        }
++        // cmp dword [base + disp], r32
++        void cmp32MR(uint8_t base, int32_t disp, uint8_t reg)
++        {
++            rex(false, reg, base);
++            byte(0x39);
++            mem(reg, base, disp);
++        }
++        // mov byte [base + disp], r8 (low byte of rax/rcx/rdx/rbx only)
++        void store8(uint8_t base, int32_t disp, uint8_t reg)
++        {
++            rex(false, reg, base);
++            byte(0x88);
++            mem(reg, base, disp);
++        }
++
++        // Generic SSE forms: [prefix] [REX] 0F op... with a register or [base + disp32] operand.
++        void sseRR(uint8_t prefix, std::initializer_list<uint8_t> ops, uint8_t dst, uint8_t src)
++        {
++            if (prefix)
++                byte(prefix);
++            rex(false, dst, src);
++            byte(0x0F);
++            for (uint8_t op : ops)
++                byte(op);
++            byte(static_cast<uint8_t>(0xC0u | ((dst & 7u) << 3) | (src & 7u)));
++        }
++        void sseRM(uint8_t prefix, std::initializer_list<uint8_t> ops, uint8_t reg, uint8_t base, int32_t disp)
++        {
++            if (prefix)
++                byte(prefix);
++            rex(false, reg, base);
++            byte(0x0F);
++            for (uint8_t op : ops)
++                byte(op);
++            mem(reg, base, disp);
++        }
++        void movupsLoad(uint8_t x, uint8_t base, int32_t disp) { sseRM(0, {0x10}, x, base, disp); }
++        void movupsStore(uint8_t base, int32_t disp, uint8_t x) { sseRM(0, {0x11}, x, base, disp); }
++        void movaps(uint8_t dst, uint8_t src) { sseRR(0, {0x28}, dst, src); }
++        void movdLoad(uint8_t x, uint8_t base, int32_t disp) { sseRM(0x66, {0x6E}, x, base, disp); }
++        void pandM(uint8_t x, uint8_t base, int32_t disp) { sseRM(0x66, {0xDB}, x, base, disp); }
++        void pand(uint8_t dst, uint8_t src) { sseRR(0x66, {0xDB}, dst, src); }
++        void por(uint8_t dst, uint8_t src) { sseRR(0x66, {0xEB}, dst, src); }
++        void pminudM(uint8_t x, uint8_t base, int32_t disp) { sseRM(0x66, {0x38, 0x3B}, x, base, disp); }
++        void pcmpgtdM(uint8_t x, uint8_t base, int32_t disp) { sseRM(0x66, {0x66}, x, base, disp); }
++        void addps(uint8_t dst, uint8_t src) { sseRR(0, {0x58}, dst, src); }
++        void mulps(uint8_t dst, uint8_t src) { sseRR(0, {0x59}, dst, src); }
++        void subps(uint8_t dst, uint8_t src) { sseRR(0, {0x5C}, dst, src); }
++        void minps(uint8_t dst, uint8_t src) { sseRR(0, {0x5D}, dst, src); }
++        void maxps(uint8_t dst, uint8_t src) { sseRR(0, {0x5F}, dst, src); }
++        // blendps xmm, xmm, imm8 (SSE4.1): element i from src where bit i is set.
++        void blendps(uint8_t dst, uint8_t src, uint8_t imm)
++        {
++            sseRR(0x66, {0x3A, 0x0C}, dst, src);
++            byte(imm);
++        }
++
++        // pblendw xmm, xmm, imm8 (SSE4.1)
++        void pblendw(uint8_t dst, uint8_t src, uint8_t imm)
++        {
++            byte(0x66);
++            rex(false, dst, src);
++            byte(0x0F);
++            byte(0x3A);
++            byte(0x0E);
++            byte(static_cast<uint8_t>(0xC0u | ((dst & 7u) << 3) | (src & 7u)));
++            byte(imm);
++        }
++    };
++}
++
++#endif
