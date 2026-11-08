@@ -5,8 +5,8 @@
 Fase: **en progreso**. Arranca, reproduce los vídeos y entra en la misión del prólogo: la cinemática en el
 motor y la batalla se dibujan con personajes, el mando mueve a Isildur y el tutorial avanza ("Atacar
 Rápido" → "Atacar Fiero"). Los menús (pausa, opciones, "Salir a Menú") responden y el SPU2 suena por el
-host. **Bloqueo actual: velocidad.** Con personajes en pantalla el juego va a 3-4 VBlanks/s (~7 % de la
-velocidad real) porque el intérprete de VU1 no da abasto.
+host. **Bloqueo actual: velocidad.** En la batalla del prólogo va a ~14-15 VBlanks/s en la build `Release`
+(~30 % de la velocidad real; eran 3-4 antes del motor rápido de VU y del GS por lotes). Ver *Rendimiento*.
 
 ## Progreso del arranque
 
@@ -26,7 +26,7 @@ velocidad real) porque el intérprete de VU1 no da abasto.
 | Control con el mando: Isildur avanza con el stick, ataques y tutorial | ✅ (con `TTR_PAD_SCRIPT`) |
 | Menú de pausa de la misión, opciones, confirmación de "Salir a Menú" | ✅ |
 | Sonido: mezcla del SPU2 al host (raylib, 48 kHz) | ✅ (falta escucharlo con calma: AutoDMA, efectos, reverb) |
-| Velocidad jugable con personajes | ❌ 3-4 VBlanks/s |
+| Velocidad jugable con personajes | ⚠️ ~14-15 VBlanks/s en batalla, ~25 en cinemáticas, ~5 con humo a pantalla completa |
 | Menú principal y nueva partida desde cero | pendiente |
 
 ## Problemas resueltos
@@ -116,6 +116,52 @@ En el EE, `SQRT.S fd, ft` toma el operando del campo **ft** (fs vale 0); el reco
 452 raíces cuadradas del juego calculaban `sqrt($f0)`, así que `ClVector::normalize3d`, las distancias, la
 cámara y la física trabajaban con vectores sin normalizar. Corregido en `fpu_translator.cpp`.
 
+### Motor rápido de VU (parche `0010`)
+
+`VuFastEngine` (`ps2xRuntime/src/lib/vu/ps2_vu_fast.cpp`) decodifica cada par de instrucciones una vez por
+subida de microcódigo en un manejador para la mitad superior y otro para la inferior (SSE para las FMAC),
+más los registros que lee y escribe. Usa las mismas reglas de espera que el intérprete, los mismos flags
+MAC/estado/clip con su latencia de 4 ciclos, Q y P con la suya, la copia de seguridad de VI para las ramas
+condicionales y los bits E/D/T; el XGKICK manda el paquete entero al emitirse. `PS2X_VU_VERIFY=1` ejecuta
+cada microprograma en los dos motores desde el mismo estado y compara registros, flags, memoria de datos y
+paquetes GIF: **0 diferencias en 430 000 ejecuciones** del juego (logos, cinemática del prólogo). Hizo falta
+quitar DAZ del MXCSR: el producto denormal dentro de un MADD debe sumarse (con redondeo hacia cero cambia 1
+ulp) y un resultado denormal debe activar el flag U. VU deja de ser el límite en las cinemáticas.
+
+### GS por lotes en todos los hilos (parche `0010`)
+
+Con VU resuelto, el GS pasó a ser el límite y tres problemas lo hacían lento:
+
+- La caché de páginas de textura de cada hilo tenía **una sola página**: una textura que ocupa varias (o el
+  bilineal en el borde de una página) copiaba 8 KiB casi en cada muestra (`memmove`, 18 % de cada hilo).
+  Ahora son 64 páginas de correspondencia directa.
+- Los triángulos de menos de 4096 píxeles (todos los de los personajes) se dibujaban en el hilo del GS, y los
+  grandes con una barrera después de cada uno. Ahora triángulos y sprites se acumulan en un lote que dibujan
+  todos los hilos a la vez, cada uno en sus franjas de 8 filas entrelazadas; cada píxel lo sigue escribiendo
+  un solo hilo y en orden. El lote se vacía antes de cualquier operación que lea o escriba VRAM, la CLUT o la
+  caché de texturas (subidas, `TEXFLUSH`, lecturas, presentación).
+- Coste por píxel: bilineal entero que no lee los texels de peso 0 (las copias alineadas del posproceso leen
+  uno en vez de cuatro) y estado de píxel y muestreador decodificados una vez por primitiva.
+
+`PS2X_GS_STATS=1` mide la carga: ~3,4 M píxeles y ~33 000 triángulos por frame en la batalla; ~16 M píxeles
+en los planos con humo, donde partículas STQ de ~1000×1000 píxeles se apilan unas 50 veces.
+
+### VIF1/VU1 en su propio hilo y medición por partes (parche `0011`)
+
+En el hardware VIF1 y VU1 trabajan a la vez que el EE. `Vif1Worker` procesa en orden los datos de VIF1 (que el
+DMA ya copia al lanzarse), con VU1, XGKICK y DIRECT, en otro hilo; el EE solo espera cuando toca algo que ese
+hilo cambia. Hubo que vaciar el árbitro del GIF en el hilo de VIF1 (el EE lo vaciaba a la vez y corrompía los
+registros privilegiados del GS) y sincronizar también en el canal DMA del GIF (las rutas nativas de PATH3
+leen el estado del árbitro). `PS2X_VIF1_STATS=1` muestra el resultado en la batalla: el juego lanza la lista
+de VIF1 de cada frame y enseguida espera a que termine (lee registros GIF/VIF1), así que el EE pasa ~85 % del
+tiempo esperando a ese hilo, que va al ~85 %: ~35 % enviando primitivas al GS (paquetes GIF, montaje de cada
+primitiva con una copia completa del estado del GS) y el resto en VU1 y UNPACK. La ganancia fue de 12 a 14-15
+VBlanks/s.
+
+El motor de VU se mide fuera del juego con `ttr_vu_bench` sobre 3000 ejecuciones reales de la batalla
+(`PS2X_VU_CAPTURE`): 30,4 ns por par al empezar, 22,5 ns tras quitar los flags que nadie lee (el microcódigo no
+usa nunca el registro de estado) y llevar la disponibilidad de registros en SSE; siempre idéntico al intérprete.
+
 ### Escenas con personajes a 2-3 VBlanks/s (intérprete de VU1)
 
 `PS2X_VU_STATS=1` mide 3,4 M pares de instrucciones de VU1 por segundo en la cinemática del prólogo: unos
@@ -150,19 +196,29 @@ Ahora el límite es el GS: el nivel dibuja unos 3,2 M píxeles por VBlank (unas 
 completa por frame: posproceso en franjas de sprites, triángulos aditivos gigantes y la cúpula del cielo con
 filtrado bilineal) a ~100 ns por píxel y hilo.
 
-Con personajes (cinemática y batalla del prólogo) el límite es VU1, no el GS: ~5,7 M pares/s con el parche
-`0009` frente a los ~60 M que harían falta para 50 Hz.
+Medido con la build `Release` (Ryzen 5 3600X, 6 núcleos/12 hilos) tras el parche `0010`:
+
+| Escena | VBlanks/s | Límite |
+| --- | --- | --- |
+| Vídeos FMV | 50 | ninguno (tiempo real) |
+| Cinemática del prólogo en el motor | ~20-25 | GS (posproceso y personajes) |
+| Plano con humo a pantalla completa | ~5 | GS (~16 M píxeles por frame) |
+| Batalla del prólogo | ~14-15 | hilo de VIF1: envío de primitivas al GS (~35 %) y VU1 (~45 %) |
+
+En la batalla los hilos de rasterizado están ocupados en un ~40 % y el EE en un ~15 % (el resto espera al hilo
+de VIF1). Para 50 VBlanks/s ese hilo tendría que hacer su trabajo de cada frame unas 3,5 veces más deprisa.
 
 ## Siguiente
 
-1. **Recompilador de microcódigo VU1** (el bloqueo para jugar). El juego sube ~30 imágenes de microcódigo
-   distintas por VIF (`PS2X_VU_DUMP`), así que hace falta traducir por bloque básico con caché por contenido
-   (como microVU) o generar C++ por adelantado a partir de los volcados, con flags MAC/estado retrasados 4
-   ciclos y Q/P con su latencia. Objetivo: >60 M pares/s.
-2. Llegar al menú principal sin pasar por la misión (Start → "Salir a Menú" → Sí) y empezar una partida nueva.
-3. Escuchar el audio: AutoDMA (voz/música por bloques), volumen y efectos; el volcado (`PS2X_AUDIO_DUMP`)
-   suena tonal y casi sin saturar.
-4. GS: con VU1 resuelto vuelve a ser el límite (coste por píxel, ver *Rendimiento*).
+1. **Envío de primitivas al GS** (~35 % del hilo de VIF1 en la batalla): cada triángulo copia el estado
+   completo del GS (contexto, TEXA, CLUT...) al montarse y otra vez al encolarse. Encolar el estado solo cuando
+   cambia y las primitivas con una referencia a él.
+2. **Motor de VU** (~45 %, 22,5 ns por par): un JIT de bloques a x64 (como microVU) bajaría a pocos ns; con
+   `ttr_vu_bench` se puede iterar y comprobar sin arrancar el juego.
+3. **Coste por píxel del GS** (límite de las cinemáticas y del humo): direcciones de VRAM separables por
+   fila/columna (tablas de desplazamiento) en vez de funciones por formato, y bucles especializados para los
+   sprites de posproceso.
+4. Llegar al menú principal sin pasar por la misión y empezar una partida nueva; escuchar el audio.
 
 ## Observaciones
 

@@ -152,13 +152,16 @@ namespace ttr::debug
                         continue;
                     CONTEXT context{};
                     context.ContextFlags = CONTEXT_CONTROL;
-                    if (GetThreadContext(thread.handle, &context))
+                    const bool sampled = GetThreadContext(thread.handle, &context) != FALSE;
+                    // Resume before touching the maps: they allocate, and the suspended thread may hold the
+                    // heap lock (that deadlocked the whole process after a few minutes).
+                    ResumeThread(thread.handle);
+                    if (sampled)
                     {
                         ++samples[context.Rip];
                         ++threadSamples[thread.id][context.Rip];
                         ++total;
                     }
-                    ResumeThread(thread.handle);
                 }
                 if (now >= nextReport)
                 {

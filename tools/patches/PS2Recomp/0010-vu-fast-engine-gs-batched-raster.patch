@@ -1,0 +1,2955 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index e767fc9..0336ebe 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -394,6 +394,7 @@ add_library(ps2_runtime STATIC
+     src/lib/vu/ps2_vu1_core.cpp
+     src/lib/vu/ps2_vu1_upper.cpp
+     src/lib/vu/ps2_vu1_lower.cpp
++    src/lib/vu/ps2_vu_fast.cpp
+     src/lib/games_database.cpp
+ )
+ 
+diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+index de38805..c569806 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+@@ -38,6 +38,11 @@ public:
+     void SnapshotVram(std::vector<uint8_t> &out) const override;
+     GSTransferSnapshot GetTransferSnapshot() const override;
+ 
++    // Per-primitive decoded pixel pipeline and texture sampler (gs_cpu_backend.cpp): the same results as
++    // WritePixel and SampleTexture without decoding the GS state on every pixel.
++    struct PixelPipe;
++    struct Sampler;
++
+ private:
+     void ResetUnlocked();
+     void LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut);
+@@ -46,6 +51,11 @@ private:
+     void WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
+ 
+     void DrawPrimitive(const GSPrimitiveBatch &batch);
++    // Small triangles and sprites wait in m_pending and are then drawn by all raster threads at once, each
++    // one owning interleaved bands of 8 rows (every pixel is still written by one thread, in submission
++    // order). Anything that reads or writes VRAM, the CLUT or the texture cache draws them first.
++    void FlushPendingUnlocked() const;
++    void DrawPendingUnlocked();
+     void DrawSprite(const GSPrimitiveBatch &batch);
+     void DrawTriangle(const GSPrimitiveBatch &batch);
+     void DrawLine(const GSPrimitiveBatch &batch);
+@@ -54,6 +64,8 @@ private:
+     template <typename RowsFn>
+     void ForEachRowBand(int firstRow, int lastRow, uint64_t area, RowsFn &&rows);
+     void WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog);
++    void BuildPixelPipe(const GSDrawState &state, PixelPipe &pipe) const;
++    void BuildSampler(const GSDrawState &state, Sampler &sampler) const;
+     uint32_t SampleTexture(const GSDrawState &state, GSMem::TexturePageCache &cache, float s, float t, float q, uint16_t u, uint16_t v);
+     uint32_t LookupCLUT(const GSDrawState &state, uint8_t index, uint8_t cpsm, uint8_t csm, uint8_t csa, uint8_t sourcePsm);
+ 
+@@ -89,6 +101,8 @@ private:
+     std::vector<uint32_t> m_workerTextureCacheEpochs;
+     std::unique_ptr<GSRasterWorkers> m_rasterWorkers;
+ 
++    mutable std::vector<GSPrimitiveBatch> m_pending;
++
+     GSTransferCommand m_transfer{};
+     GSTransferSnapshot m_transferState{};
+     std::vector<uint8_t> m_localToHostBuffer;
+diff --git a/ps2xRuntime/include/runtime/gs/gs_texture_page_cache.h b/ps2xRuntime/include/runtime/gs/gs_texture_page_cache.h
+index 1cb1540..b4fcabd 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_texture_page_cache.h
++++ b/ps2xRuntime/include/runtime/gs/gs_texture_page_cache.h
+@@ -4,34 +4,49 @@
+ #include <cstddef>
+ #include <cstdint>
+ #include <cstring>
++#include <memory>
+ 
+ namespace GSMem
+ {
++    // Copies of the VRAM pages a texture reads from, so a primitive samples the texture as it was when its
++    // first texel was read from that page. Direct-mapped, kSlots pages: with a single page, a texture that
++    // spans several pages (or bilinear taps across a page edge) copied 8 KiB on almost every sample.
+     class TexturePageCache
+     {
+     public:
+         static constexpr uint32_t kPageSize = 8192u;
++        static constexpr uint32_t kSlots = 64u;
++
++        TexturePageCache()
++            : m_bytes(new uint8_t[static_cast<size_t>(kSlots) * kPageSize])
++        {
++            m_bases.fill(UINT32_MAX);
++        }
++        TexturePageCache(TexturePageCache &&) noexcept = default;
++        TexturePageCache &operator=(TexturePageCache &&) noexcept = default;
+ 
+         void Invalidate() noexcept
+         {
+-            m_pageBase = UINT32_MAX;
++            m_bases.fill(UINT32_MAX);
+         }
+ 
+         // byteAddress is the wrapped, swizzled VRAM address. The returned
+-        // pointer is valid only until the next miss or invalidation.
++        // pointer is valid only until the next miss on the same slot or invalidation.
+         const uint8_t* Resolve(const uint8_t* vram, uint32_t byteAddress) noexcept
+         {
+             const uint32_t pageBase = byteAddress & ~(kPageSize - 1u);
+-            if (m_pageBase != pageBase)
++            const uint32_t slot = (pageBase / kPageSize) & (kSlots - 1u);
++            uint8_t *bytes = m_bytes.get() + static_cast<size_t>(slot) * kPageSize;
++            if (m_bases[slot] != pageBase)
+             {
+-                std::memcpy(m_bytes.data(), vram + pageBase, kPageSize);
+-                m_pageBase = pageBase;
++                std::memcpy(bytes, vram + pageBase, kPageSize);
++                m_bases[slot] = pageBase;
+             }
+-            return m_bytes.data() + (byteAddress & (kPageSize - 1u));
++            return bytes + (byteAddress & (kPageSize - 1u));
+         }
+ 
+     private:
+-        alignas(64) std::array<uint8_t, kPageSize> m_bytes{};
+-        uint32_t m_pageBase = UINT32_MAX;
++        std::unique_ptr<uint8_t[]> m_bytes;
++        std::array<uint32_t, kSlots> m_bases{};
+     };
+ }
+diff --git a/ps2xRuntime/include/runtime/gs/ps2_gs_memory.h b/ps2xRuntime/include/runtime/gs/ps2_gs_memory.h
+index c784ff7..3b9ac0c 100644
+--- a/ps2xRuntime/include/runtime/gs/ps2_gs_memory.h
++++ b/ps2xRuntime/include/runtime/gs/ps2_gs_memory.h
+@@ -543,6 +543,10 @@ namespace GSMem
+     // Shares swizzle, VRAM wrapping, and lane extraction with the direct reads.
+     u32 ReadTexture(TexturePageCache& cache, const u8* data, u32 psm, u32 bp, u32 bw, u32 x, u32 y);
+ 
++    // The same read for one format, chosen once per primitive instead of switching on every texel.
++    using TextureReader = u32 (*)(TexturePageCache& cache, const u8* data, u32 bp, u32 bw, u32 x, u32 y);
++    TextureReader GetTextureReader(u32 psm);
++
+ 	void WriteCT32(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);
+ 	void WriteZ32(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);
+ 
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
+index 7061521..7f73724 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1.h
+@@ -3,9 +3,12 @@
+ 
+ #include <array>
+ #include <cstdint>
++#include <memory>
++#include <vector>
+ 
+ class GS;
+ class PS2Memory;
++class VuFastEngine;
+ 
+ struct VU1State
+ {
+@@ -45,6 +48,9 @@ public:
+     };
+ 
+     explicit VU1Interpreter(Unit unit = Unit::VU1);
++    ~VU1Interpreter();
++    VU1Interpreter(const VU1Interpreter &) = delete;
++    VU1Interpreter &operator=(const VU1Interpreter &) = delete;
+ 
+     void reset();
+ 
+@@ -65,6 +71,8 @@ public:
+     bool lastRunFinished() const { return m_lastRunFinished; }
+ 
+ private:
++    friend class VuFastEngine;
++
+     enum Pipeline : uint8_t
+     {
+         PipelineNone = 0,
+@@ -244,10 +252,21 @@ private:
+     bool m_stopRequested = false;
+     bool m_pendingHaltD = false;
+     bool m_pendingHaltT = false;
++    // Fast block engine (ps2_vu_fast.cpp); null when disabled.
++    std::unique_ptr<VuFastEngine> m_fast;
++    // PS2X_VU_VERIFY: while set, XGKICK packets are collected here instead of reaching the GIF.
++    std::vector<std::vector<uint8_t>> *m_kickCapture = nullptr;
+ 
+     void run(uint8_t *vuCode, uint32_t codeSize,
+              uint8_t *vuData, uint32_t dataSize,
+              GS &gs, PS2Memory *memory, uint32_t maxCycles);
++    void runInterpreter(uint8_t *vuCode, uint32_t codeSize,
++                        uint8_t *vuData, uint32_t dataSize,
++                        GS &gs, PS2Memory *memory, uint32_t maxCycles);
++    void runVerified(uint8_t *vuCode, uint32_t codeSize,
++                     uint8_t *vuData, uint32_t dataSize,
++                     GS &gs, PS2Memory *memory, uint32_t maxCycles);
++    void submitKick(const uint8_t *packet, uint32_t bytes);
+ 
+     InstructionUsage decodeUpperUsage(uint32_t upper) const;
+     InstructionUsage decodeLowerUsage(uint32_t lower) const;
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 579bb49..d8b4978 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -7,6 +7,7 @@
+ #include "runtime/gs/ps2_gs_memory.h"
+ #include "ps2_log.h"
+ #include <atomic>
++#include <chrono>
+ #include <algorithm>
+ #include <cmath>
+ #include <cstdio>
+@@ -44,6 +45,73 @@ namespace
+     }
+ }
+ 
++namespace
++{
++    // Row interleaving of the current thread while it draws a batch of pending primitives
++    // (GSCpuBackend::DrawPendingUnlocked): it owns the 8-row bands b with b % stride == phase.
++    struct RowInterleave
++    {
++        int stride = 0;
++        int phase = 0;
++        GSMem::TexturePageCache *cache = nullptr;
++    };
++    thread_local RowInterleave t_interleave;
++
++    constexpr int kInterleaveShift = 3; // 8-row bands
++
++    bool interleaveTouches(int firstRow, int lastRow)
++    {
++        if (lastRow < firstRow)
++            return false;
++        const int stride = t_interleave.stride;
++        const int firstBand = std::max(firstRow, 0) >> kInterleaveShift;
++        const int lastBand = std::max(lastRow, 0) >> kInterleaveShift;
++        if (lastBand - firstBand + 1 >= stride)
++            return true;
++        const int offset = ((t_interleave.phase - firstBand % stride) % stride + stride) % stride;
++        return firstBand + offset <= lastBand;
++    }
++
++    // Pending batches are drawn at the latest when they reach kBatchMaxPrimitives.
++    constexpr size_t kBatchMaxPrimitives = 1024u;
++
++    // PS2X_GS_STATS=1: once per second, primitives by type and pixels that reached the pixel pipeline.
++    const bool g_gsStats = []
++    {
++        const char *env = std::getenv("PS2X_GS_STATS");
++        return env && env[0] == '1';
++    }();
++    thread_local uint64_t t_statPixels = 0;
++    std::atomic<uint64_t> g_statPixels{0};
++    std::atomic<uint64_t> g_statPrims[8]{};
++    std::chrono::steady_clock::time_point g_statLast = std::chrono::steady_clock::now();
++
++    void gsStatsFlushThread()
++    {
++        if (t_statPixels != 0u)
++        {
++            g_statPixels.fetch_add(t_statPixels, std::memory_order_relaxed);
++            t_statPixels = 0u;
++        }
++    }
++
++    void gsStatsReport()
++    {
++        const auto now = std::chrono::steady_clock::now();
++        const double seconds = std::chrono::duration<double>(now - g_statLast).count();
++        if (seconds < 1.0)
++            return;
++        g_statLast = now;
++        std::fprintf(stderr, "[gs-stats] %.1fs pixels=%llu sprites=%llu tris=%llu other=%llu\n", seconds,
++                     static_cast<unsigned long long>(g_statPixels.exchange(0)),
++                     static_cast<unsigned long long>(g_statPrims[GS_PRIM_SPRITE].exchange(0)),
++                     static_cast<unsigned long long>(g_statPrims[GS_PRIM_TRIANGLE].exchange(0) + g_statPrims[GS_PRIM_TRISTRIP].exchange(0) +
++                                                     g_statPrims[GS_PRIM_TRIFAN].exchange(0)),
++                     static_cast<unsigned long long>(g_statPrims[GS_PRIM_POINT].exchange(0) + g_statPrims[GS_PRIM_LINE].exchange(0) +
++                                                     g_statPrims[GS_PRIM_LINESTRIP].exchange(0)));
++    }
++}
++
+ // Fork-join workers for large primitives. run() hands bands out to the calling thread (slot 0) and to the
+ // workers (slots 1..workerCount()) and returns once every band is drawn.
+ class GSRasterWorkers
+@@ -424,12 +492,6 @@ namespace
+         return psm == GS_PSM_T8 || psm == GS_PSM_T8H;
+     }
+ 
+-    uint8_t lerpChannel(uint8_t c00, uint8_t c10, uint8_t c01, uint8_t c11, float fx, float fy)
+-    {
+-        const float top = static_cast<float>(c00) + (static_cast<float>(c10) - static_cast<float>(c00)) * fx;
+-        const float bottom = static_cast<float>(c01) + (static_cast<float>(c11) - static_cast<float>(c01)) * fx;
+-        return clampU8(static_cast<int>(std::lround(top + (bottom - top) * fy)));
+-    }
+ }
+ 
+ namespace
+@@ -669,6 +731,7 @@ void GSCpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
+ void GSCpuBackend::Reset()
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
++    m_pending.clear();
+     ResetUnlocked();
+ }
+ 
+@@ -691,12 +754,112 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
+     std::lock_guard<std::mutex> lock(m_mutex);
+     if (!m_vram || batch.vertexCount == 0u)
+         return;
+-    DrawPrimitive(batch);
++    if (g_gsStats)
++    {
++        g_statPrims[batch.state.prim.type & 7u].fetch_add(1, std::memory_order_relaxed);
++        gsStatsFlushThread();
++        static uint32_t bigLogged = 0;
++        static auto lastSecond = std::chrono::steady_clock::now();
++        if (std::chrono::steady_clock::now() - lastSecond > std::chrono::seconds(1))
++        {
++            lastSecond = std::chrono::steady_clock::now();
++            bigLogged = 0;
++        }
++        const GSVertex &a = batch.vertices[0];
++        const GSVertex &b = batch.vertices[batch.state.prim.type == GS_PRIM_SPRITE ? 1 : 2];
++        const auto &ctx = batch.state.context;
++        const double w = std::fabs(static_cast<double>(b.x) - a.x), h = std::fabs(static_cast<double>(b.y) - a.y);
++        if (batch.state.prim.type == GS_PRIM_SPRITE && w * h > 60000.0 && bigLogged < 8u)
++        {
++            ++bigLogged;
++            std::fprintf(stderr,
++                         "[gs-big] sprite (%.0f,%.0f)-(%.0f,%.0f) ofs=(%d,%d) fbp=%u fbw=%u fpsm=%u fbmsk=%08x tme=%u tbp=%u tbw=%u tpsm=%u tw=%u th=%u "
++                         "fst=%u uv=(%u,%u)-(%u,%u) abe=%u alpha=%016llx test=%llx zbp=%u zmsk=%u rgba=%u,%u,%u,%u\n",
++                         a.x, a.y, b.x, b.y, ctx.xyoffset.ofx >> 4, ctx.xyoffset.ofy >> 4, ctx.frame.fbp, ctx.frame.fbw,
++                         ctx.frame.psm, ctx.frame.fbmsk, batch.state.prim.tme, ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm,
++                         batch.state.textureWidth, batch.state.textureHeight, batch.state.prim.fst, a.u >> 4, a.v >> 4,
++                         b.u >> 4, b.v >> 4, batch.state.prim.abe, static_cast<unsigned long long>(ctx.alpha),
++                         static_cast<unsigned long long>(ctx.test), ctx.zbuf.zbp, ctx.zbuf.zmask, b.r, b.g, b.b, b.a);
++        }
++        gsStatsReport();
++    }
++
++    const auto type = batch.state.prim.type;
++    const bool triangle = type == GS_PRIM_TRIANGLE || type == GS_PRIM_TRISTRIP || type == GS_PRIM_TRIFAN;
++    const bool sprite = type == GS_PRIM_SPRITE;
++    // Every triangle and sprite goes through the batch, whatever its size: the interleaved bands balance a
++    // full-screen sprite as well as a fork-join per primitive did, without a barrier after each one.
++    const bool batchable = m_rasterWorkers && (triangle || sprite);
++    if (!batchable)
++    {
++        FlushPendingUnlocked();
++        DrawPrimitive(batch);
++        return;
++    }
++    m_pending.push_back(batch);
++    if (m_pending.size() >= kBatchMaxPrimitives)
++        DrawPendingUnlocked();
++}
++
++void GSCpuBackend::FlushPendingUnlocked() const
++{
++    if (!m_pending.empty())
++        const_cast<GSCpuBackend *>(this)->DrawPendingUnlocked();
++}
++
++void GSCpuBackend::DrawPendingUnlocked()
++{
++    if (m_pending.empty())
++        return;
++    if (!m_rasterWorkers || m_pending.size() < 4u)
++    {
++        for (const GSPrimitiveBatch &batch : m_pending)
++            DrawPrimitive(batch);
++        m_pending.clear();
++        return;
++    }
++
++    const unsigned bands = m_rasterWorkers->workerCount() + 1u;
++    auto job = [&](unsigned band, unsigned slot)
++    {
++        GSMem::TexturePageCache *cache = &m_texturePageCache;
++        if (slot != 0u)
++        {
++            cache = &m_workerTextureCaches[slot - 1u];
++            uint32_t &epoch = m_workerTextureCacheEpochs[slot - 1u];
++            if (epoch != m_textureCacheEpoch)
++            {
++                cache->Invalidate();
++                epoch = m_textureCacheEpoch;
++            }
++        }
++        t_interleave = {static_cast<int>(bands), static_cast<int>(band), cache};
++        for (const GSPrimitiveBatch &batch : m_pending)
++        {
++            const int ofy = batch.state.context.xyoffset.ofy >> 4;
++            const uint32_t count = batch.state.prim.type == GS_PRIM_SPRITE ? 2u : 3u;
++            float minY = batch.vertices[0].y, maxY = minY;
++            for (uint32_t i = 1; i < count; ++i)
++            {
++                minY = std::min(minY, batch.vertices[i].y);
++                maxY = std::max(maxY, batch.vertices[i].y);
++            }
++            if (!interleaveTouches(static_cast<int>(std::floor(minY)) - ofy - 1, static_cast<int>(std::ceil(maxY)) - ofy + 1))
++                continue;
++            DrawPrimitive(batch);
++        }
++        t_interleave = {};
++        if (g_gsStats)
++            gsStatsFlushThread();
++    };
++    m_rasterWorkers->run(bands, job);
++    m_pending.clear();
+ }
+ 
+ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
++    FlushPendingUnlocked();
+     if (!m_vram || (!isFourBitIndexedPsm(tex0.psm) && !isEightBitIndexedPsm(tex0.psm)))
+         return;
+ 
+@@ -781,24 +944,28 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
+ 
+ void GSCpuBackend::Flush()
+ {
+-    // CPU backend is immediate. GPU backends may submit command buffers here.
++    std::lock_guard<std::mutex> lock(m_mutex);
++    FlushPendingUnlocked();
+ }
+ 
+ void GSCpuBackend::TextureFlush()
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
++    FlushPendingUnlocked();
+     m_texturePageCache.Invalidate();
+     ++m_textureCacheEpoch;
+ }
+ 
+ void GSCpuBackend::Sync(GSSyncReason)
+ {
+-    // CPU backend is immediate. GPU backends may wait on fences/readbacks here.
++    std::lock_guard<std::mutex> lock(m_mutex);
++    FlushPendingUnlocked();
+ }
+ 
+ uint32_t GSCpuBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
++    FlushPendingUnlocked();
+     return ReadVramUnlocked(psm, base, bw, x, y);
+ }
+ 
+@@ -820,6 +987,7 @@ uint32_t GSCpuBackend::ReadTextureVramUnlocked(GSMem::TexturePageCache &cache, u
+ void GSCpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
++    FlushPendingUnlocked();
+     WriteVramUnlocked(psm, base, bw, x, y, value);
+ }
+ 
+@@ -833,6 +1001,7 @@ void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, u
+ void GSCpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
++    FlushPendingUnlocked();
+     if (!m_vram || m_vramSize == 0u)
+     {
+         out.clear();
+@@ -845,6 +1014,7 @@ void GSCpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
+ GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
++    FlushPendingUnlocked();
+     GSTransferSnapshot result = m_transferState;
+     result.localToHostPendingBytes = m_localToHostReadPos < m_localToHostBuffer.size()
+                                          ? m_localToHostBuffer.size() - m_localToHostReadPos
+@@ -1199,6 +1369,336 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
+     return 0xFFFF00FFu;
+ }
+ 
++// ---- per-primitive pixel pipeline and sampler ------------------------------------------------------------
++
++struct GSCpuBackend::PixelPipe
++{
++    uint8_t *vram = nullptr;
++    ReadVramFunc readFb = nullptr;
++    WriteVramFunc writeFb = nullptr;
++    ReadVramFunc readZ = nullptr;
++    WriteVramFunc writeZ = nullptr;
++    int sx0 = 0, sx1 = 0, sy0 = 0, sy1 = 0;
++    uint32_t fbp = 0, fbw = 1, fpsm = 0, zbp = 0, zpsm = 0;
++    uint64_t test = 0;
++    uint32_t ztestMethod = 0;
++    uint32_t fbmsk = 0;
++    uint8_t fogR = 0, fogG = 0, fogB = 0;
++    uint8_t asel = 0, bsel = 0, csel = 0, dsel = 0, fix = 0;
++    bool fge = false;
++    bool alphaTest = false;
++    bool abe = false;
++    bool pabe = false;
++    bool fba = false;
++    bool fb16 = false;
++    bool fb24 = false;
++    bool dateRead = false;
++    bool zmask = false;
++};
++
++void GSCpuBackend::BuildPixelPipe(const GSDrawState &state, PixelPipe &p) const
++{
++    const auto &ctx = state.context;
++    p.vram = m_vram;
++    p.sx0 = ctx.scissor.x0;
++    p.sx1 = ctx.scissor.x1;
++    p.sy0 = ctx.scissor.y0;
++    p.sy1 = ctx.scissor.y1;
++    p.fge = state.prim.fge;
++    p.fogR = state.fogR;
++    p.fogG = state.fogG;
++    p.fogB = state.fogB;
++    p.fbp = GSInternal::framePageBaseToBlock(ctx.frame.fbp);
++    p.fbw = std::max<u32>(ctx.frame.fbw, 1u);
++    p.fpsm = ctx.frame.psm;
++    p.zbp = GSInternal::framePageBaseToBlock(ctx.zbuf.zbp);
++    p.zpsm = ctx.zbuf.psm;
++    p.readFb = m_readVramFuncs[p.fpsm & 0x3Fu];
++    p.writeFb = m_writeVramFuncs[p.fpsm & 0x3Fu];
++    p.readZ = m_readVramFuncs[p.zpsm & 0x3Fu];
++    p.writeZ = m_writeVramFuncs[p.zpsm & 0x3Fu];
++    p.test = ctx.test;
++    p.alphaTest = (ctx.test & 0x1u) != 0u;
++    p.ztestMethod = static_cast<uint32_t>((ctx.test >> 17) & 3u);
++    p.abe = state.prim.abe;
++    p.pabe = state.pabe;
++    p.asel = ctx.alpha & 3;
++    p.bsel = (ctx.alpha >> 2) & 3;
++    p.csel = (ctx.alpha >> 4) & 3;
++    p.dsel = (ctx.alpha >> 6) & 3;
++    p.fix = static_cast<uint8_t>((ctx.alpha >> 32) & 0xFF);
++    p.fba = (ctx.fba & 0x1ull) != 0ull && ctx.frame.psm != GS_PSM_CT24;
++    p.fbmsk = ctx.frame.fbmsk;
++    p.fb16 = bitsPerPixel(static_cast<uint8_t>(p.fpsm)) == 16;
++    p.fb24 = p.fpsm == GS_PSM_CT24;
++    p.dateRead = ((ctx.test >> 14) & 0x1u) != 0u && (p.fpsm == GS_PSM_CT32 || p.fpsm == GS_PSM_CT16 || p.fpsm == GS_PSM_CT16S);
++    p.zmask = ctx.zbuf.zmask;
++}
++
++namespace
++{
++    // WritePixel with the state decoded in advance.
++    inline void writePixelFast(const GSCpuBackend::PixelPipe &p, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b,
++                               uint8_t a, uint8_t fog);
++}
++
++struct GSCpuBackend::Sampler
++{
++    GSMem::TextureReader read = nullptr;
++    const uint8_t *vram = nullptr;
++    const uint16_t *clut = nullptr;
++    GSTexaReg texa{};
++    uint32_t tbp = 0, tbw = 0;
++    int texW = 1, texH = 1;
++    float fTexW = 1.0f, fTexH = 1.0f;
++    uint16_t minU = 0, maxU = 0, minV = 0, maxV = 0;
++    uint8_t psm = 0, cpsm = 0, csm = 0, csa = 0;
++    uint8_t wrapU = 0, wrapV = 0;
++    uint8_t kind = 0; // 0 none, 1 32/24-bit (+TEXA), 2 16-bit (+TEXA), 3 CLUT
++    bool linear = false;
++    bool fst = false;
++
++    uint32_t clutLookup(uint8_t index) const
++    {
++        const bool sixteenBit = cpsm == GS_PSM_CT16 || cpsm == GS_PSM_CT16S;
++        const uint32_t csaMask = sixteenBit ? 0x1Fu : 0x0Fu;
++        const uint32_t clutBase = (static_cast<uint32_t>(csa) & csaMask) << 4u;
++        const uint32_t sourceIndex = isFourBitIndexedPsm(psm) ? (static_cast<uint32_t>(index) & 0x0Fu)
++                                                              : static_cast<uint32_t>(index);
++        uint32_t clutIndex = (clutBase + sourceIndex) & (sixteenBit ? 0x1FFu : 0x0FFu);
++        if (!sixteenBit && csm == 0u && isEightBitIndexedPsm(psm))
++        {
++            const uint32_t block = std::min((sourceIndex & 0xF0u) + clutBase, 240u);
++            clutIndex = block + (sourceIndex & 0x0Fu);
++        }
++        switch (cpsm)
++        {
++        case GS_PSM_CT32:
++            return applyTexa(texa, cpsm, static_cast<uint32_t>(clut[clutIndex]) | (static_cast<uint32_t>(clut[clutIndex + 256u]) << 16u));
++        case GS_PSM_CT24:
++            return applyTexa(texa, cpsm, (static_cast<uint32_t>(clut[clutIndex]) | (static_cast<uint32_t>(clut[clutIndex + 256u]) << 16u)) & 0x00FFFFFFu);
++        case GS_PSM_CT16:
++        case GS_PSM_CT16S:
++            return applyTexa(texa, cpsm, Rgba5551ToRgba8888(clut[clutIndex]));
++        default:
++            return 0xFFFF00FFu;
++        }
++    }
++
++    uint32_t point(GSMem::TexturePageCache &cache, int u, int v) const
++    {
++        u = wrapTextureCoordinate(u, texW, wrapU, minU, maxU);
++        v = wrapTextureCoordinate(v, texH, wrapV, minV, maxV);
++        const uint32_t raw = read(cache, vram, tbp, tbw, static_cast<uint32_t>(u), static_cast<uint32_t>(v));
++        switch (kind)
++        {
++        case 1:
++            return applyTexa(texa, psm, raw);
++        case 2:
++            return applyTexa(texa, psm, Rgba5551ToRgba8888(static_cast<u16>(raw)));
++        case 3:
++            return clutLookup(static_cast<uint8_t>(raw));
++        default:
++            return 0xFFFF00FFu;
++        }
++    }
++
++    // SampleTexture with the state decoded in advance.
++    uint32_t sample(GSMem::TexturePageCache &cache, float s, float t, float q, uint16_t u, uint16_t v) const
++    {
++        float texUf, texVf;
++        if (fst)
++        {
++            texUf = static_cast<float>(u) / 16.0f;
++            texVf = static_cast<float>(v) / 16.0f;
++        }
++        else
++        {
++            const float invQ = 1.0f / fabsQ(q);
++            texUf = s * invQ * fTexW;
++            texVf = t * invQ * fTexH;
++        }
++        if (!linear)
++            return point(cache, static_cast<int>(texUf), static_cast<int>(texVf));
++
++        const float sampleU = texUf - 0.5f;
++        const float sampleV = texVf - 0.5f;
++        const int u0 = static_cast<int>(std::floor(sampleU));
++        const int v0 = static_cast<int>(std::floor(sampleV));
++        const float fx = sampleU - static_cast<float>(u0);
++        const float fy = sampleV - static_cast<float>(v0);
++        const uint32_t wx = static_cast<uint32_t>(fx * 256.0f + 0.5f);
++        const uint32_t wy = static_cast<uint32_t>(fy * 256.0f + 0.5f);
++        // A tap with weight 0 does not change the result (lerp2(a, b, 0) == a): texel-aligned copies, the
++        // usual post-processing pass, read one texel instead of four.
++        const uint32_t c00 = point(cache, u0, v0);
++        const uint32_t c10 = wx != 0u ? point(cache, u0 + 1, v0) : 0u;
++        const uint32_t c01 = wy != 0u ? point(cache, u0, v0 + 1) : 0u;
++        const uint32_t c11 = (wx != 0u && wy != 0u) ? point(cache, u0 + 1, v0 + 1) : 0u;
++        if (wx == 0u && wy == 0u)
++            return c00;
++        constexpr uint32_t kMask = 0x00FF00FFu;
++        const auto lerp2 = [](uint32_t a, uint32_t b, uint32_t w) -> uint32_t
++        {
++            return (((a * (256u - w)) + (b * w) + 0x00800080u) >> 8) & kMask;
++        };
++        const uint32_t topRb = lerp2(c00 & kMask, c10 & kMask, wx);
++        const uint32_t topGa = lerp2((c00 >> 8) & kMask, (c10 >> 8) & kMask, wx);
++        const uint32_t bottomRb = lerp2(c01 & kMask, c11 & kMask, wx);
++        const uint32_t bottomGa = lerp2((c01 >> 8) & kMask, (c11 >> 8) & kMask, wx);
++        return lerp2(topRb, bottomRb, wy) | (lerp2(topGa, bottomGa, wy) << 8);
++    }
++};
++
++void GSCpuBackend::BuildSampler(const GSDrawState &state, Sampler &smp) const
++{
++    const auto &ctx = state.context;
++    const auto &tex = ctx.tex0;
++    smp.read = GSMem::GetTextureReader(tex.psm);
++    smp.vram = m_vram;
++    smp.clut = m_clut.data();
++    smp.texa = state.texa;
++    smp.tbp = tex.tbp0;
++    smp.tbw = tex.tbw;
++    smp.texW = state.textureWidth;
++    smp.texH = state.textureHeight;
++    smp.fTexW = static_cast<float>(state.textureWidth);
++    smp.fTexH = static_cast<float>(state.textureHeight);
++    const uint64_t clamp = ctx.clamp;
++    smp.wrapU = static_cast<uint8_t>(clamp & 0x3u);
++    smp.wrapV = static_cast<uint8_t>((clamp >> 2) & 0x3u);
++    smp.minU = static_cast<uint16_t>((clamp >> 4) & 0x3FFu);
++    smp.maxU = static_cast<uint16_t>((clamp >> 14) & 0x3FFu);
++    smp.minV = static_cast<uint16_t>((clamp >> 24) & 0x3FFu);
++    smp.maxV = static_cast<uint16_t>((clamp >> 34) & 0x3FFu);
++    smp.psm = tex.psm;
++    smp.cpsm = tex.cpsm;
++    smp.csm = tex.csm;
++    smp.csa = tex.csa;
++    smp.linear = state.linearFilter;
++    smp.fst = state.prim.fst;
++    switch (tex.psm)
++    {
++    case GS_PSM_CT32:
++    case GS_PSM_Z32:
++    case GS_PSM_CT24:
++    case GS_PSM_Z24:
++        smp.kind = 1;
++        break;
++    case GS_PSM_CT16:
++    case GS_PSM_CT16S:
++    case GS_PSM_Z16:
++    case GS_PSM_Z16S:
++        smp.kind = 2;
++        break;
++    case GS_PSM_T8:
++    case GS_PSM_T8H:
++    case GS_PSM_T4:
++    case GS_PSM_T4HL:
++    case GS_PSM_T4HH:
++        smp.kind = 3;
++        break;
++    default:
++        smp.kind = 0;
++        break;
++    }
++}
++
++namespace
++{
++    inline void writePixelFast(const GSCpuBackend::PixelPipe &p, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b,
++                               uint8_t a, uint8_t fog)
++    {
++        if (x < p.sx0 || x > p.sx1 || y < p.sy0 || y > p.sy1)
++            return;
++        if (g_gsStats)
++            ++t_statPixels;
++
++        if (p.fge)
++        {
++            const uint32_t inverseFog = 255u - fog;
++            r = static_cast<uint8_t>(((static_cast<uint32_t>(fog) * r) >> 8) + ((inverseFog * p.fogR) >> 8));
++            g = static_cast<uint8_t>(((static_cast<uint32_t>(fog) * g) >> 8) + ((inverseFog * p.fogG) >> 8));
++            b = static_cast<uint8_t>(((static_cast<uint32_t>(fog) * b) >> 8) + ((inverseFog * p.fogB) >> 8));
++        }
++
++        const PixelWriteMask writeMask = p.alphaTest ? classifyAlphaTest(p.test, a, static_cast<uint8_t>(p.fpsm)) : PixelWriteMask{};
++        if (!writeMask.writesAnything())
++            return;
++
++        const bool preserveDestinationAlpha = writeMask.writeRgb && !writeMask.writeAlpha && p.fpsm == GS_PSM_CT32;
++        const bool frmw = p.dateRead || (writeMask.writesFramebuffer() && (p.fbmsk != 0 || p.abe || preserveDestinationAlpha));
++
++        u32 rawFramebufferPixel = 0;
++        u32 fbrgba = 0;
++        if (frmw)
++        {
++            rawFramebufferPixel = p.readFb(p.vram, p.fbp, p.fbw, x, y);
++            fbrgba = rawFramebufferPixel;
++            if (p.fb16)
++                fbrgba = Rgba5551ToRgba8888(static_cast<u16>(fbrgba));
++            else if (p.fb24)
++                fbrgba |= 0x80000000u;
++        }
++
++        if (p.dateRead && !passesDestinationAlphaTest(p.test, static_cast<uint8_t>(p.fpsm), rawFramebufferPixel))
++            return;
++
++        bool zpass = false;
++        switch (p.ztestMethod)
++        {
++        case 0:
++            zpass = false;
++            break;
++        case 1:
++            zpass = true;
++            break;
++        case 2:
++            zpass = static_cast<uint32_t>(z) >= p.readZ(p.vram, p.zbp, p.fbw, x, y);
++            break;
++        case 3:
++            zpass = static_cast<uint32_t>(z) > p.readZ(p.vram, p.zbp, p.fbw, x, y);
++            break;
++        }
++        if (!zpass)
++            return;
++
++        if (writeMask.writesFramebuffer())
++        {
++            if (p.abe && !(p.pabe && (a & 0x80u) == 0u))
++            {
++                const int dr = static_cast<int>(fbrgba & 0xFF);
++                const int dg = static_cast<int>((fbrgba >> 8) & 0xFF);
++                const int db = static_cast<int>((fbrgba >> 16) & 0xFF);
++                const int da = static_cast<int>((fbrgba >> 24) & 0xFF);
++                const auto pick = [](uint8_t sel, int cs, int cd) -> int
++                {
++                    return sel == 0 ? cs : (sel == 1 ? cd : 0);
++                };
++                const int cAlpha = (p.csel == 0) ? a : (p.csel == 1) ? da : p.fix;
++                r = clampU8(((pick(p.asel, r, dr) - pick(p.bsel, r, dr)) * cAlpha >> 7) + pick(p.dsel, r, dr));
++                g = clampU8(((pick(p.asel, g, dg) - pick(p.bsel, g, dg)) * cAlpha >> 7) + pick(p.dsel, g, dg));
++                b = clampU8(((pick(p.asel, b, db) - pick(p.bsel, b, db)) * cAlpha >> 7) + pick(p.dsel, b, db));
++            }
++
++            if (writeMask.writeAlpha && p.fba)
++                a = static_cast<uint8_t>(a | 0x80u);
++
++            u32 pixel = pack32(r, g, b, a);
++            if (p.fbmsk != 0)
++                pixel = (pixel & ~p.fbmsk) | (fbrgba & p.fbmsk);
++            if (preserveDestinationAlpha)
++                pixel = (pixel & 0x00FFFFFFu) | (fbrgba & 0xFF000000u);
++            if (p.fb16)
++                pixel = Rgba8888ToRgba5551(pixel);
++            p.writeFb(p.vram, p.fbp, p.fbw, x, y, pixel);
++        }
++
++        if (writeMask.writeDepth && !p.zmask)
++            p.writeZ(p.vram, p.zbp, p.fbw, x, y, z);
++    }
++}
++
+ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, GSMem::TexturePageCache &cache, float s, float t, float q, uint16_t u, uint16_t v)
+ {
+     const auto &ctx = state.context;
+@@ -1276,36 +1776,46 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, GSMem::TexturePag
+     const uint32_t c01 = samplePoint(u0, v1);
+     const uint32_t c11 = samplePoint(u1, v1);
+ 
+-    const uint8_t r = lerpChannel(static_cast<uint8_t>(c00 & 0xFFu),
+-                                  static_cast<uint8_t>(c10 & 0xFFu),
+-                                  static_cast<uint8_t>(c01 & 0xFFu),
+-                                  static_cast<uint8_t>(c11 & 0xFFu),
+-                                  fx, fy);
+-    const uint8_t g = lerpChannel(static_cast<uint8_t>((c00 >> 8) & 0xFFu),
+-                                  static_cast<uint8_t>((c10 >> 8) & 0xFFu),
+-                                  static_cast<uint8_t>((c01 >> 8) & 0xFFu),
+-                                  static_cast<uint8_t>((c11 >> 8) & 0xFFu),
+-                                  fx, fy);
+-    const uint8_t b = lerpChannel(static_cast<uint8_t>((c00 >> 16) & 0xFFu),
+-                                  static_cast<uint8_t>((c10 >> 16) & 0xFFu),
+-                                  static_cast<uint8_t>((c01 >> 16) & 0xFFu),
+-                                  static_cast<uint8_t>((c11 >> 16) & 0xFFu),
+-                                  fx, fy);
+-    const uint8_t a = lerpChannel(static_cast<uint8_t>((c00 >> 24) & 0xFFu),
+-                                  static_cast<uint8_t>((c10 >> 24) & 0xFFu),
+-                                  static_cast<uint8_t>((c01 >> 24) & 0xFFu),
+-                                  static_cast<uint8_t>((c11 >> 24) & 0xFFu),
+-                                  fx, fy);
+-
+-    return static_cast<uint32_t>(r) |
+-           (static_cast<uint32_t>(g) << 8) |
+-           (static_cast<uint32_t>(b) << 16) |
+-           (static_cast<uint32_t>(a) << 24);
++    // Integer bilinear on two channels at a time (R/B and G/A in 16-bit lanes), weights in 1/256 steps:
++    // the float lerp with lround per channel was one of the hottest paths of the rasterizer.
++    {
++        const uint32_t wx = static_cast<uint32_t>(fx * 256.0f + 0.5f);
++        const uint32_t wy = static_cast<uint32_t>(fy * 256.0f + 0.5f);
++        constexpr uint32_t kMask = 0x00FF00FFu;
++        const auto lerp2 = [](uint32_t a, uint32_t b, uint32_t w) -> uint32_t
++        {
++            // a, b: two 8-bit channels in 16-bit lanes; w in [0, 256].
++            return (((a * (256u - w)) + (b * w) + 0x00800080u) >> 8) & kMask;
++        };
++        const uint32_t topRb = lerp2(c00 & kMask, c10 & kMask, wx);
++        const uint32_t topGa = lerp2((c00 >> 8) & kMask, (c10 >> 8) & kMask, wx);
++        const uint32_t bottomRb = lerp2(c01 & kMask, c11 & kMask, wx);
++        const uint32_t bottomGa = lerp2((c01 >> 8) & kMask, (c11 >> 8) & kMask, wx);
++        const uint32_t rb = lerp2(topRb, bottomRb, wy);
++        const uint32_t ga = lerp2(topGa, bottomGa, wy);
++        return rb | (ga << 8);
++    }
++
+ }
+ 
+ template <typename RowsFn>
+ void GSCpuBackend::ForEachRowBand(int firstRow, int lastRow, uint64_t area, RowsFn &&rows)
+ {
++    if (t_interleave.stride != 0)
++    {
++        const int stride = t_interleave.stride;
++        int band = std::max(firstRow, 0) >> kInterleaveShift;
++        band += ((t_interleave.phase - band % stride) % stride + stride) % stride;
++        for (; (band << kInterleaveShift) <= lastRow; band += stride)
++        {
++            const int first = std::max(firstRow, band << kInterleaveShift);
++            const int last = std::min(lastRow, (band << kInterleaveShift) + (1 << kInterleaveShift) - 1);
++            if (first <= last)
++                rows(first, last, *t_interleave.cache);
++        }
++        return;
++    }
++
+     constexpr uint64_t kMinParallelPixels = 4096u;
+     constexpr int kMinBandRows = 4;
+     const int rowCount = lastRow - firstRow + 1;
+@@ -1343,6 +1853,11 @@ void GSCpuBackend::ForEachRowBand(int firstRow, int lastRow, uint64_t area, Rows
+ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+ {
+     const GSDrawState &state = batch.state;
++    PixelPipe pipe;
++    BuildPixelPipe(state, pipe);
++    Sampler smp;
++    if (state.prim.tme)
++        BuildSampler(state, smp);
+     const GSVertex &v0 = batch.vertices[0];
+     const GSVertex &v1 = batch.vertices[1];
+     const auto &ctx = state.context;
+@@ -1434,11 +1949,11 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+                         const int fixedV = static_cast<int>((texVf * 16.0f) + 0.5f);
+                         const uint16_t sampleU = static_cast<uint16_t>(clampInt(fixedU, 0, 0xFFFF));
+                         const uint16_t sampleV = static_cast<uint16_t>(clampInt(fixedV, 0, 0xFFFF));
+-                        texel = SampleTexture(state, cache, 0.0f, 0.0f, 1.0f, sampleU, sampleV);
++                        texel = smp.sample(cache, 0.0f, 0.0f, 1.0f, sampleU, sampleV);
+                     }
+                     else
+                     {
+-                        texel = SampleTexture(state, cache, texUf / static_cast<float>(texW), texVf / static_cast<float>(texH), 1.0f, 0u, 0u);
++                        texel = smp.sample(cache, texUf / static_cast<float>(texW), texVf / static_cast<float>(texH), 1.0f, 0u, 0u);
+                     }
+ 
+                     uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
+@@ -1447,7 +1962,7 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+                     uint8_t ta = static_cast<uint8_t>((texel >> 24) & 0xFF);
+ 
+                     const TextureCombineResult color = combineTexture(tex, r, g, b, a, tr, tg, tb, ta);
+-                    WritePixel(state, x, y, z1, color.r, color.g, color.b, color.a, v1.fog);
++                    writePixelFast(pipe, x, y, static_cast<int>(z1), color.r, color.g, color.b, color.a, v1.fog);
+                 }
+             }
+         };
+@@ -1459,7 +1974,7 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+         {
+             for (int y = firstRow; y <= lastRow; ++y)
+                 for (int x = drawX0; x <= drawX1; ++x)
+-                    WritePixel(state, x, y, z1, r, g, b, a, v1.fog);
++                    writePixelFast(pipe, x, y, static_cast<int>(z1), r, g, b, a, v1.fog);
+         };
+         ForEachRowBand(drawY0, drawY1, area, drawRows);
+     }
+@@ -1468,6 +1983,11 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+ {
+     const GSDrawState &state = batch.state;
++    PixelPipe pipe;
++    BuildPixelPipe(state, pipe);
++    Sampler smp;
++    if (state.prim.tme)
++        BuildSampler(state, smp);
+     const GSVertex &v0 = batch.vertices[0];
+     const GSVertex &v1 = batch.vertices[1];
+     const GSVertex &v2 = batch.vertices[2];
+@@ -1601,7 +2121,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+                         iv = 0;
+                     }
+ 
+-                    uint32_t texel = SampleTexture(state, cache, is, it, iq, iu, iv);
++                    uint32_t texel = smp.sample(cache, is, it, iq, iu, iv);
+ 
+                     uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
+                     uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
+@@ -1622,7 +2142,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+                 }
+ 
+                 const uint8_t fog = clampU8(static_cast<int>(v0.fog * w0 + v1.fog * w1 + v2.fog * w2));
+-                WritePixel(state, x, y, static_cast<u32>(z + 0.5), r, g, b, a, fog);
++                writePixelFast(pipe, x, y, static_cast<int>(static_cast<u32>(z + 0.5)), r, g, b, a, fog);
+             }
+         }
+     };
+@@ -1699,6 +2219,7 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
+ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
++    FlushPendingUnlocked();
+     m_transfer = command;
+     m_transferState.x = command.trxpos.dsax;
+     m_transferState.y = command.trxpos.dsay;
+@@ -1716,6 +2237,7 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
++    FlushPendingUnlocked();
+     if (!data || sizeBytes == 0u || !m_vram || m_transferState.direction != 0u)
+         return;
+     if (m_transfer.trxreg.rrw == 0u || m_transfer.trxreg.rrh == 0u || m_transferState.totalPixels == 0u)
+@@ -1933,6 +2455,7 @@ void GSCpuBackend::PerformLocalToHostTransfer()
+ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
++    FlushPendingUnlocked();
+     if (!dst || maxBytes == 0u || m_localToHostReadPos >= m_localToHostBuffer.size())
+         return 0u;
+     const size_t count = std::min<size_t>(maxBytes, m_localToHostBuffer.size() - m_localToHostReadPos);
+@@ -1945,6 +2468,7 @@ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
++    FlushPendingUnlocked();
+     if (!m_vram || context.frame.fbw == 0u)
+         return false;
+ 
+diff --git a/ps2xRuntime/src/lib/gs/ps2_gs_memory.cpp b/ps2xRuntime/src/lib/gs/ps2_gs_memory.cpp
+index a8f9fa8..b0c8070 100644
+--- a/ps2xRuntime/src/lib/gs/ps2_gs_memory.cpp
++++ b/ps2xRuntime/src/lib/gs/ps2_gs_memory.cpp
+@@ -220,6 +220,56 @@ namespace GSMem
+         PixelStorageTraits<P4>::InitPageLookupTable(PageTableP4, BlockTableP4, ColumnTable4);
+     }
+ 
++    namespace
++    {
++        template <PixelStorageMode P>
++        u32 ReadTextureAs(TexturePageCache& cache, const u8* data, u32 bp, u32 bw, u32 x, u32 y)
++        {
++            if constexpr (P == C32 || P == C24 || P == P8H || P == P4HL || P == P4HH)
++                return PixelStorageTraits<P>::Read(PageTableC32, data, bp, bw, x, y, &cache);
++            else if constexpr (P == C16)
++                return PixelStorageTraits<P>::Read(PageTableC16, data, bp, bw, x, y, &cache);
++            else if constexpr (P == C16S)
++                return PixelStorageTraits<P>::Read(PageTableC16S, data, bp, bw, x, y, &cache);
++            else if constexpr (P == P8)
++                return PixelStorageTraits<P>::Read(PageTableP8, data, bp, bw, x, y, &cache);
++            else if constexpr (P == P4)
++                return PixelStorageTraits<P>::Read(PageTableP4, data, bp, bw, x, y, &cache);
++            else if constexpr (P == Z32 || P == Z24)
++                return PixelStorageTraits<P>::Read(PageTableZ32, data, bp, bw, x, y, &cache);
++            else if constexpr (P == Z16)
++                return PixelStorageTraits<P>::Read(PageTableZ16, data, bp, bw, x, y, &cache);
++            else
++                return PixelStorageTraits<P>::Read(PageTableZ16S, data, bp, bw, x, y, &cache);
++        }
++
++        u32 ReadTextureNone(TexturePageCache&, const u8*, u32, u32, u32, u32)
++        {
++            return 0u;
++        }
++    }
++
++    TextureReader GetTextureReader(u32 psm)
++    {
++        switch (static_cast<PixelStorageMode>(psm & 0x3Fu))
++        {
++        case C32: return &ReadTextureAs<C32>;
++        case C24: return &ReadTextureAs<C24>;
++        case C16: return &ReadTextureAs<C16>;
++        case C16S: return &ReadTextureAs<C16S>;
++        case P8: return &ReadTextureAs<P8>;
++        case P4: return &ReadTextureAs<P4>;
++        case P8H: return &ReadTextureAs<P8H>;
++        case P4HL: return &ReadTextureAs<P4HL>;
++        case P4HH: return &ReadTextureAs<P4HH>;
++        case Z32: return &ReadTextureAs<Z32>;
++        case Z24: return &ReadTextureAs<Z24>;
++        case Z16: return &ReadTextureAs<Z16>;
++        case Z16S: return &ReadTextureAs<Z16S>;
++        default: return &ReadTextureNone;
++        }
++    }
++
+     u32 ReadTexture(TexturePageCache& cache, const u8* data, u32 psm, u32 bp, u32 bw, u32 x, u32 y)
+     {
+         switch (static_cast<PixelStorageMode>(psm & 0x3Fu))
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+index f0ca7c6..d3e6afa 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
+@@ -3,6 +3,7 @@
+ #include "runtime/gs/gs_frontend.h"
+ #include "runtime/ps2_memory.h"
+ #include "ps2_vu1_detail.h"
++#include "ps2_vu_fast.h"
+ 
+ #include <algorithm>
+ #include <bit>
+@@ -13,6 +14,7 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <string>
+ #include <filesystem>
+ #include <limits>
+ #include <ps2_log.h>
+@@ -65,8 +67,11 @@ VU1Interpreter::VU1Interpreter(Unit unit)
+     : m_unit(unit)
+ {
+     reset();
++    m_fast = VuFastEngine::create(*this);
+ }
+ 
++VU1Interpreter::~VU1Interpreter() = default;
++
+ void VU1Interpreter::resetScheduler()
+ {
+     m_flagPipeline = {};
+@@ -103,6 +108,8 @@ void VU1Interpreter::reset()
+     m_state.r = 0x3F800000u;
+     m_cycle = 0;
+     resetScheduler();
++    if (m_fast)
++        m_fast->reset();
+ }
+ 
+ float VU1Interpreter::broadcast(const float *vf, uint8_t bc)
+@@ -983,13 +990,20 @@ void VU1Interpreter::finishXgkick()
+     if (!m_xgkick.active)
+         return;
+ 
+-    if (m_activeMemory)
+-        m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
+-    else if (m_activeGs)
+-        m_activeGs->processGIFPacket(m_xgkick.packet.data(), m_xgkick.totalBytes);
++    submitKick(m_xgkick.packet.data(), m_xgkick.totalBytes);
+     m_xgkick.active = false;
+ }
+ 
++void VU1Interpreter::submitKick(const uint8_t *packet, uint32_t bytes)
++{
++    if (m_kickCapture)
++        m_kickCapture->emplace_back(packet, packet + bytes);
++    else if (m_activeMemory)
++        m_activeMemory->submitGifPacket(GifPathId::Path1, packet, bytes);
++    else if (m_activeGs)
++        m_activeGs->processGIFPacket(packet, bytes);
++}
++
+ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
+ {
+     if (m_unit != Unit::VU1 || !m_activeVuData || m_activeVuDataSize < 16u)
+@@ -1754,9 +1768,168 @@ namespace
+     }
+ }
+ 
++namespace
++{
++    // PS2X_VU_VERIFY=1: every microprogram that starts from a clean state runs on the fast engine and then,
++    // from the same registers and data memory, on the interpreter; differences in registers, flags, data
++    // memory or XGKICK packets are reported and the interpreter's results are kept.
++    const bool g_vuVerify = []
++    {
++        const char *env = std::getenv("PS2X_VU_VERIFY");
++        return env && env[0] == '1';
++    }();
++
++    struct VerifyCounters
++    {
++        uint64_t runs = 0;
++        uint64_t mismatches = 0;
++        uint64_t reported = 0;
++    };
++    VerifyCounters g_verifyCounters;
++
++    void reportBits(std::string &out, const char *name, const void *a, const void *b, size_t size)
++    {
++        if (std::memcmp(a, b, size) == 0)
++            return;
++        char line[256];
++        const uint32_t *wa = static_cast<const uint32_t *>(a);
++        const uint32_t *wb = static_cast<const uint32_t *>(b);
++        for (size_t i = 0; i < size / 4u; ++i)
++        {
++            if (wa[i] != wb[i])
++            {
++                std::snprintf(line, sizeof(line), " %s[%zu] fast=%08x ref=%08x;", name, i, wa[i], wb[i]);
++                out += line;
++            }
++        }
++    }
++}
++
+ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+                          uint8_t *vuData, uint32_t dataSize,
+                          GS &gs, PS2Memory *memory, uint32_t maxCycles)
++{
++    if (m_fast)
++    {
++        if (g_vuVerify)
++        {
++            runVerified(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
++            return;
++        }
++        const uint64_t startCycle = m_cycle;
++        if (m_fast->run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles))
++        {
++            recordVuRun(m_unit == Unit::VU1 ? 1 : 0, m_cycle - startCycle, m_fast->lastRunPairs());
++            return;
++        }
++    }
++    runInterpreter(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
++}
++
++void VU1Interpreter::runVerified(uint8_t *vuCode, uint32_t codeSize,
++                                 uint8_t *vuData, uint32_t dataSize,
++                                 GS &gs, PS2Memory *memory, uint32_t maxCycles)
++{
++    if (!m_lastRunFinished || !m_fast->idle() || pipelinesPending())
++    {
++        runInterpreter(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
++        return;
++    }
++
++    const VU1State before = m_state;
++    const uint64_t cycleBefore = m_cycle;
++    const uint32_t clipBefore = m_workingClip;
++    const bool backupValidBefore = m_viBranchBackupValid;
++    const int32_t backupValueBefore = m_viBranchBackupValue;
++    const uint8_t backupRegBefore = m_viBranchBackupReg;
++    const std::vector<uint8_t> dataBefore(vuData, vuData + dataSize);
++
++    std::vector<std::vector<uint8_t>> fastKicks;
++    m_kickCapture = &fastKicks;
++    const bool ran = m_fast->run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
++    m_kickCapture = nullptr;
++    if (!ran)
++    {
++        runInterpreter(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
++        return;
++    }
++    const VU1State fastState = m_state;
++    const bool fastFinished = m_lastRunFinished;
++    const std::vector<uint8_t> fastData(vuData, vuData + dataSize);
++
++    m_state = before;
++    m_cycle = cycleBefore;
++    m_workingClip = clipBefore;
++    m_viBranchBackupValid = backupValidBefore;
++    m_viBranchBackupValue = backupValueBefore;
++    m_viBranchBackupReg = backupRegBefore;
++    std::memcpy(vuData, dataBefore.data(), dataSize);
++
++    std::vector<std::vector<uint8_t>> refKicks;
++    m_kickCapture = &refKicks;
++    runInterpreter(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
++    m_kickCapture = nullptr;
++
++    std::string diff;
++    reportBits(diff, "vf", fastState.vf, m_state.vf, sizeof(m_state.vf));
++    reportBits(diff, "vi", fastState.vi, m_state.vi, sizeof(m_state.vi));
++    reportBits(diff, "acc", fastState.acc, m_state.acc, sizeof(m_state.acc));
++    reportBits(diff, "q", &fastState.q, &m_state.q, 4);
++    reportBits(diff, "p", &fastState.p, &m_state.p, 4);
++    reportBits(diff, "i", &fastState.i, &m_state.i, 4);
++    reportBits(diff, "r", &fastState.r, &m_state.r, 4);
++    reportBits(diff, "pc", &fastState.pc, &m_state.pc, 4);
++    reportBits(diff, "mac", &fastState.mac, &m_state.mac, 4);
++    reportBits(diff, "status", &fastState.status, &m_state.status, 4);
++    reportBits(diff, "clip", &fastState.clip, &m_state.clip, 4);
++    if (fastFinished != m_lastRunFinished)
++        diff += fastFinished ? " finished=fast-only;" : " finished=ref-only;";
++    if (std::memcmp(fastData.data(), vuData, dataSize) != 0)
++    {
++        uint32_t first = 0, count = 0;
++        for (uint32_t q = 0; q < dataSize; q += 16u)
++        {
++            if (std::memcmp(fastData.data() + q, vuData + q, 16u) != 0)
++            {
++                if (count++ == 0u)
++                    first = q;
++            }
++        }
++        char line[128];
++        std::snprintf(line, sizeof(line), " data: %u qwords differ, first at 0x%x;", count, first);
++        diff += line;
++    }
++    if (fastKicks != refKicks)
++    {
++        char line[128];
++        std::snprintf(line, sizeof(line), " xgkick: fast %zu packets, ref %zu;", fastKicks.size(), refKicks.size());
++        diff += line;
++    }
++
++    ++g_verifyCounters.runs;
++    if (!diff.empty())
++    {
++        ++g_verifyCounters.mismatches;
++        if (g_verifyCounters.reported < 60u)
++        {
++            ++g_verifyCounters.reported;
++            std::fprintf(stderr, "[vu-verify] VU%d start pc=0x%x:%s\n", m_unit == Unit::VU1 ? 1 : 0, before.pc,
++                         diff.substr(0, 1500).c_str());
++        }
++    }
++    if ((g_verifyCounters.runs % 5000u) == 0u)
++        std::fprintf(stderr, "[vu-verify] %llu runs, %llu with differences\n",
++                     static_cast<unsigned long long>(g_verifyCounters.runs),
++                     static_cast<unsigned long long>(g_verifyCounters.mismatches));
++
++    for (const std::vector<uint8_t> &packet : refKicks)
++        submitKick(packet.data(), static_cast<uint32_t>(packet.size()));
++    m_fast->reset();
++}
++
++void VU1Interpreter::runInterpreter(uint8_t *vuCode, uint32_t codeSize,
++                                    uint8_t *vuData, uint32_t dataSize,
++                                    GS &gs, PS2Memory *memory, uint32_t maxCycles)
+ {
+     const uint64_t statsStartCycle = m_cycle;
+     uint64_t statsPairs = 0u;
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu_fast.cpp b/ps2xRuntime/src/lib/vu/ps2_vu_fast.cpp
+new file mode 100644
+index 0000000..f611062
+--- /dev/null
++++ b/ps2xRuntime/src/lib/vu/ps2_vu_fast.cpp
+@@ -0,0 +1,1489 @@
++#include "ps2_vu_fast.h"
++
++#include "runtime/gs/ps2_gif_arbiter.h"
++#include "runtime/gs/gs_frontend.h"
++#include "runtime/ps2_memory.h"
++#include "ps2_vu1_detail.h"
++
++#include <algorithm>
++#include <bit>
++#include <cmath>
++#include <cstdlib>
++#include <cstring>
++#include <limits>
++
++#if defined(__x86_64__) || defined(_M_X64)
++#define PS2X_VU_FAST_AVAILABLE 1
++#include <immintrin.h>
++#else
++#define PS2X_VU_FAST_AVAILABLE 0
++#endif
++
++#if PS2X_VU_FAST_AVAILABLE
++
++namespace
++{
++    using Pair = VuFastEngine::Pair;
++
++    // ---- constants ------------------------------------------------------------------------------------
++
++    struct Tables
++    {
++        alignas(16) uint32_t destMask[16][4];
++        uint8_t rev4[16];
++
++        Tables()
++        {
++            for (uint32_t d = 0; d < 16u; ++d)
++            {
++                for (uint32_t c = 0; c < 4u; ++c)
++                    destMask[d][c] = (d & (8u >> c)) != 0u ? 0xFFFFFFFFu : 0u;
++                // movemask bit c (x = bit 0) -> VU lane bit (x = bit 3)
++                uint8_t r = 0;
++                for (uint32_t c = 0; c < 4u; ++c)
++                    if ((d & (1u << c)) != 0u)
++                        r = static_cast<uint8_t>(r | (8u >> c));
++                rev4[d] = r;
++            }
++        }
++    };
++    const Tables g_tables;
++
++    inline __m128 ld(const float *p) { return _mm_loadu_ps(p); }
++    inline void st(float *p, __m128 v) { _mm_storeu_ps(p, v); }
++    inline __m128 destMask(uint8_t dest) { return _mm_load_ps(reinterpret_cast<const float *>(g_tables.destMask[dest & 0xFu])); }
++    inline __m128 blendDest(__m128 old, __m128 value, uint8_t dest) { return _mm_blendv_ps(old, value, destMask(dest)); }
++
++    // VU operands: the all-ones exponent is a normal number on the VU, the largest one; zero exponent is zero.
++    inline __m128 clampOp(__m128 v)
++    {
++        const __m128i bits = _mm_castps_si128(v);
++        const __m128i expMask = _mm_set1_epi32(0x7F800000);
++        const __m128i exponent = _mm_and_si128(bits, expMask);
++        const __m128i sign = _mm_and_si128(bits, _mm_set1_epi32(static_cast<int>(0x80000000u)));
++        __m128i r = _mm_blendv_epi8(bits, _mm_or_si128(sign, _mm_set1_epi32(0x7F7FFFFF)), _mm_cmpeq_epi32(exponent, expMask));
++        r = _mm_blendv_epi8(r, sign, _mm_cmpeq_epi32(exponent, _mm_setzero_si128()));
++        return _mm_castsi128_ps(r);
++    }
++
++    inline float normOp(float value)
++    {
++        uint32_t bits = 0;
++        std::memcpy(&bits, &value, sizeof(bits));
++        const uint32_t exponent = (bits >> 23) & 0xFFu;
++        if (exponent == 0u)
++            bits &= 0x80000000u;
++        else if (exponent == 0xFFu)
++            bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
++        std::memcpy(&value, &bits, sizeof(value));
++        return value;
++    }
++
++    // VU1Interpreter::normalizeResult without the flags.
++    inline float normResult(float value)
++    {
++        uint32_t bits = 0;
++        std::memcpy(&bits, &value, sizeof(bits));
++        const uint32_t sign = bits & 0x80000000u;
++        const uint32_t magnitude = bits & 0x7FFFFFFFu;
++        const uint32_t exponent = (bits >> 23) & 0xFFu;
++        if (magnitude != 0u && exponent == 0u)
++            bits = sign;
++        else if (exponent == 0xFFu)
++            bits = sign | 0x7F7FFFFFu;
++        std::memcpy(&value, &bits, sizeof(value));
++        return value;
++    }
++
++    // Normalizes an FMAC result like VU1Interpreter::normalizeResult per lane, queues the MAC/status flags
++    // for the lanes in `dest` and writes those lanes to `dst`.
++    inline void finishFmac(VuFastEngine &e, __m128 result, uint8_t dest, float *dst)
++    {
++        const __m128i bits = _mm_castps_si128(result);
++        const __m128i expMask = _mm_set1_epi32(0x7F800000);
++        const __m128i exponent = _mm_and_si128(bits, expMask);
++        const __m128i sign = _mm_and_si128(bits, _mm_set1_epi32(static_cast<int>(0x80000000u)));
++        const __m128i magnitude = _mm_and_si128(bits, _mm_set1_epi32(0x7FFFFFFF));
++        const __m128i zero = _mm_setzero_si128();
++        const __m128i isZeroMag = _mm_cmpeq_epi32(magnitude, zero);
++        const __m128i isDenormal = _mm_andnot_si128(isZeroMag, _mm_cmpeq_epi32(exponent, zero));
++        const __m128i isOverflow = _mm_cmpeq_epi32(exponent, expMask);
++        __m128i r = _mm_blendv_epi8(bits, _mm_or_si128(sign, _mm_set1_epi32(0x7F7FFFFF)), isOverflow);
++        r = _mm_blendv_epi8(r, sign, isDenormal);
++        const __m128 out = _mm_castsi128_ps(r);
++        st(dst, blendDest(ld(dst), out, dest));
++
++        if (dest == 0u)
++            return;
++        const uint32_t z = g_tables.rev4[_mm_movemask_ps(_mm_castsi128_ps(_mm_or_si128(isZeroMag, isDenormal)))] & dest;
++        const uint32_t sg = g_tables.rev4[_mm_movemask_ps(out)] & dest;
++        const uint32_t u = g_tables.rev4[_mm_movemask_ps(_mm_castsi128_ps(isDenormal))] & dest;
++        const uint32_t o = g_tables.rev4[_mm_movemask_ps(_mm_castsi128_ps(isOverflow))] & dest;
++        const uint32_t mac = z | (sg << 4) | (u << 8) | (o << 12);
++        const uint32_t status = (z ? 1u : 0u) | (sg ? 2u : 0u) | (u ? 4u : 0u) | (o ? 8u : 0u);
++        e.pushFlags(mac, status, 1u | 2u);
++    }
++
++    // ---- upper instructions ---------------------------------------------------------------------------
++
++    enum Kind
++    {
++        kAdd,
++        kSub,
++        kMul,
++        kMadd,
++        kMsub,
++        kMax,
++        kMin
++    };
++    enum Src
++    {
++        sBc,
++        sFull,
++        sQ,
++        sI
++    };
++
++    template <int K, int S, bool ToAcc>
++    void hFmac(VuFastEngine &e, const Pair &p)
++    {
++        VU1State &s = e.s;
++        const auto &u = p.u;
++        const __m128 a = clampOp(ld(s.vf[u.fs]));
++        __m128 b;
++        if constexpr (S == sBc)
++            b = _mm_set1_ps(normOp(s.vf[u.ft][u.bc]));
++        else if constexpr (S == sFull)
++            b = clampOp(ld(s.vf[u.ft]));
++        else if constexpr (S == sQ)
++            b = _mm_set1_ps(normOp(s.q));
++        else
++            b = _mm_set1_ps(normOp(s.i));
++
++        __m128 r;
++        if constexpr (K == kAdd)
++            r = _mm_add_ps(a, b);
++        else if constexpr (K == kSub)
++            r = _mm_sub_ps(a, b);
++        else if constexpr (K == kMul)
++            r = _mm_mul_ps(a, b);
++        else if constexpr (K == kMadd)
++            r = _mm_add_ps(clampOp(ld(s.acc)), _mm_mul_ps(a, b));
++        else if constexpr (K == kMsub)
++            r = _mm_sub_ps(clampOp(ld(s.acc)), _mm_mul_ps(a, b));
++        else if constexpr (K == kMax)
++            r = _mm_max_ps(a, b);
++        else
++            r = _mm_min_ps(a, b);
++
++        float *dst = ToAcc ? s.acc : s.vf[u.fd];
++        if constexpr (K == kMax || K == kMin)
++            st(dst, blendDest(ld(dst), r, u.dest));
++        else
++            finishFmac(e, r, u.dest, dst);
++    }
++
++    void hNop(VuFastEngine &, const Pair &) {}
++
++    template <int Shift>
++    void hItof(VuFastEngine &e, const Pair &p)
++    {
++        VU1State &s = e.s;
++        __m128 r = _mm_cvtepi32_ps(_mm_castps_si128(ld(s.vf[p.u.fs])));
++        if constexpr (Shift != 0)
++            r = _mm_mul_ps(r, _mm_set1_ps(1.0f / static_cast<float>(1u << Shift)));
++        st(s.vf[p.u.ft], blendDest(ld(s.vf[p.u.ft]), r, p.u.dest));
++    }
++
++    template <int Shift>
++    void hFtoi(VuFastEngine &e, const Pair &p)
++    {
++        VU1State &s = e.s;
++        __m128 v = clampOp(ld(s.vf[p.u.fs]));
++        if constexpr (Shift != 0)
++            v = _mm_mul_ps(v, _mm_set1_ps(static_cast<float>(1u << Shift)));
++        __m128i i = _mm_cvttps_epi32(v);
++        const __m128 positiveOverflow = _mm_cmpge_ps(v, _mm_set1_ps(2147483648.0f));
++        i = _mm_blendv_epi8(i, _mm_set1_epi32(0x7FFFFFFF), _mm_castps_si128(positiveOverflow));
++        st(s.vf[p.u.ft], blendDest(ld(s.vf[p.u.ft]), _mm_castsi128_ps(i), p.u.dest));
++    }
++
++    void hAbs(VuFastEngine &e, const Pair &p)
++    {
++        VU1State &s = e.s;
++        const __m128 v = _mm_and_ps(clampOp(ld(s.vf[p.u.fs])), _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF)));
++        st(s.vf[p.u.ft], blendDest(ld(s.vf[p.u.ft]), v, p.u.dest));
++    }
++
++    void hClip(VuFastEngine &e, const Pair &p)
++    {
++        VU1State &s = e.s;
++        uint32_t wBits = 0u;
++        std::memcpy(&wBits, &s.vf[p.u.ft][3], sizeof(wBits));
++        const int32_t limit = (wBits & 0x7F800000u) != 0u ? static_cast<int32_t>(wBits & 0x7FFFFFFFu) : 0x007FFFFF;
++        uint32_t flags = 0u;
++        for (uint32_t c = 0; c < 3u; ++c)
++        {
++            uint32_t bits = 0u;
++            std::memcpy(&bits, &s.vf[p.u.fs][c], sizeof(bits));
++            if (static_cast<int32_t>(bits) > limit)
++                flags |= 1u << (c * 2u);
++            if (static_cast<int32_t>(bits ^ 0x80000000u) > limit)
++                flags |= 2u << (c * 2u);
++        }
++        e.workingClip() = ((e.workingClip() << 6) | (flags & 0x3Fu)) & 0xFFFFFFu;
++        e.pushFlags(0u, 0u, 8u, e.workingClip());
++    }
++
++    template <bool Sub>
++    void hOuter(VuFastEngine &e, const Pair &p)
++    {
++        VU1State &s = e.s;
++        const __m128 a = clampOp(ld(s.vf[p.u.fs]));
++        const __m128 b = clampOp(ld(s.vf[p.u.ft]));
++        const __m128 ayzx = _mm_shuffle_ps(a, a, _MM_SHUFFLE(3, 0, 2, 1));
++        const __m128 bzxy = _mm_shuffle_ps(b, b, _MM_SHUFFLE(3, 1, 0, 2));
++        __m128 r = _mm_mul_ps(ayzx, bzxy);
++        if constexpr (Sub)
++            r = _mm_sub_ps(clampOp(ld(s.acc)), r);
++        r = _mm_blend_ps(r, _mm_setzero_ps(), 0x8); // w = 0
++        finishFmac(e, r, p.u.dest, Sub ? s.vf[p.u.fd] : s.acc);
++    }
++
++    void hReservedUpper(VuFastEngine &e, const Pair &p) { e.reserved(true, p.upperInstr); }
++
++    VuFastEngine::Handler selectUpper(uint32_t instr, bool &readsQ)
++    {
++        readsQ = false;
++        const uint8_t op = static_cast<uint8_t>(instr & 0x3Fu);
++        if (op <= 0x2Fu)
++        {
++            switch (op)
++            {
++            case 0x00: case 0x01: case 0x02: case 0x03: return &hFmac<kAdd, sBc, false>;
++            case 0x04: case 0x05: case 0x06: case 0x07: return &hFmac<kSub, sBc, false>;
++            case 0x08: case 0x09: case 0x0A: case 0x0B: return &hFmac<kMadd, sBc, false>;
++            case 0x0C: case 0x0D: case 0x0E: case 0x0F: return &hFmac<kMsub, sBc, false>;
++            case 0x10: case 0x11: case 0x12: case 0x13: return &hFmac<kMax, sBc, false>;
++            case 0x14: case 0x15: case 0x16: case 0x17: return &hFmac<kMin, sBc, false>;
++            case 0x18: case 0x19: case 0x1A: case 0x1B: return &hFmac<kMul, sBc, false>;
++            case 0x1C: readsQ = true; return &hFmac<kMul, sQ, false>;
++            case 0x1D: return &hFmac<kMax, sI, false>;
++            case 0x1E: return &hFmac<kMul, sI, false>;
++            case 0x1F: return &hFmac<kMin, sI, false>;
++            case 0x20: readsQ = true; return &hFmac<kAdd, sQ, false>;
++            case 0x21: readsQ = true; return &hFmac<kMadd, sQ, false>;
++            case 0x22: return &hFmac<kAdd, sI, false>;
++            case 0x23: return &hFmac<kMadd, sI, false>;
++            case 0x24: readsQ = true; return &hFmac<kSub, sQ, false>;
++            case 0x25: readsQ = true; return &hFmac<kMsub, sQ, false>;
++            case 0x26: return &hFmac<kSub, sI, false>;
++            case 0x27: return &hFmac<kMsub, sI, false>;
++            case 0x28: return &hFmac<kAdd, sFull, false>;
++            case 0x29: return &hFmac<kMadd, sFull, false>;
++            case 0x2A: return &hFmac<kMul, sFull, false>;
++            case 0x2B: return &hFmac<kMax, sFull, false>;
++            case 0x2C: return &hFmac<kSub, sFull, false>;
++            case 0x2D: return &hFmac<kMsub, sFull, false>;
++            case 0x2E: return &hOuter<true>;
++            case 0x2F: return &hFmac<kMin, sFull, false>;
++            default: return &hReservedUpper;
++            }
++        }
++        if (op < 0x3Cu)
++            return &hReservedUpper;
++
++        const uint8_t special = static_cast<uint8_t>((instr & 0x3u) | ((instr >> 4) & 0x7Cu));
++        switch (special)
++        {
++        case 0x00: case 0x01: case 0x02: case 0x03: return &hFmac<kAdd, sBc, true>;
++        case 0x04: case 0x05: case 0x06: case 0x07: return &hFmac<kSub, sBc, true>;
++        case 0x08: case 0x09: case 0x0A: case 0x0B: return &hFmac<kMadd, sBc, true>;
++        case 0x0C: case 0x0D: case 0x0E: case 0x0F: return &hFmac<kMsub, sBc, true>;
++        case 0x10: return &hItof<0>;
++        case 0x11: return &hItof<4>;
++        case 0x12: return &hItof<12>;
++        case 0x13: return &hItof<15>;
++        case 0x14: return &hFtoi<0>;
++        case 0x15: return &hFtoi<4>;
++        case 0x16: return &hFtoi<12>;
++        case 0x17: return &hFtoi<15>;
++        case 0x18: case 0x19: case 0x1A: case 0x1B: return &hFmac<kMul, sBc, true>;
++        case 0x1C: readsQ = true; return &hFmac<kMul, sQ, true>;
++        case 0x1D: return &hAbs;
++        case 0x1E: return &hFmac<kMul, sI, true>;
++        case 0x1F: return &hClip;
++        case 0x20: readsQ = true; return &hFmac<kAdd, sQ, true>;
++        case 0x21: readsQ = true; return &hFmac<kMadd, sQ, true>;
++        case 0x22: return &hFmac<kAdd, sI, true>;
++        case 0x23: return &hFmac<kMadd, sI, true>;
++        case 0x24: readsQ = true; return &hFmac<kSub, sQ, true>;
++        case 0x25: readsQ = true; return &hFmac<kMsub, sQ, true>;
++        case 0x26: return &hFmac<kSub, sI, true>;
++        case 0x27: return &hFmac<kMsub, sI, true>;
++        case 0x28: return &hFmac<kAdd, sFull, true>;
++        case 0x29: return &hFmac<kMadd, sFull, true>;
++        case 0x2A: return &hFmac<kMul, sFull, true>;
++        case 0x2C: return &hFmac<kSub, sFull, true>;
++        case 0x2D: return &hFmac<kMsub, sFull, true>;
++        case 0x2E: return &hOuter<false>;
++        case 0x2F: case 0x30: return &hNop;
++        default: return &hReservedUpper;
++        }
++    }
++
++    // ---- lower instructions ---------------------------------------------------------------------------
++
++    float vuEatan(float value)
++    {
++        constexpr float coefficients[] = {0.999999344348907f, -0.333298563957214f, 0.199465364217758f,
++                                          -0.13085337519646f, 0.096420042216778f, -0.055909886956215f,
++                                          0.021861229091883f, -0.004054057877511f};
++        constexpr float quarterPi = 0.785398185253143f;
++        const float squared = value * value;
++        float polynomial = coefficients[7];
++        for (int index = 6; index >= 0; --index)
++            polynomial = coefficients[index] + squared * polynomial;
++        return quarterPi + value * polynomial;
++    }
++
++    float vuEsin(float value)
++    {
++        constexpr float coefficients[] = {1.0f, -0.166666567325592f, 0.008333025500178f, -0.000198074136279f,
++                                          0.000002601886990f};
++        const float squared = value * value;
++        float polynomial = coefficients[4];
++        for (int index = 3; index >= 0; --index)
++            polynomial = coefficients[index] + squared * polynomial;
++        return value * polynomial;
++    }
++
++    float vuEexp(float value)
++    {
++        constexpr float coefficients[] = {0.249998688697815f, 0.031257584691048f, 0.002591371303424f,
++                                          0.000171562001924f, 0.000005430199963f, 0.000000690600018f};
++        float polynomial = coefficients[5];
++        for (int index = 4; index >= 0; --index)
++            polynomial = coefficients[index] + value * polynomial;
++        polynomial = 1.0f + value * polynomial;
++        polynomial *= polynomial;
++        polynomial *= polynomial;
++        return polynomial != 0.0f ? 1.0f / polynomial : std::numeric_limits<float>::max();
++    }
++
++    inline uint32_t dataAddress(const VuFastEngine &e, int32_t qword)
++    {
++        return (static_cast<uint32_t>(qword) * 16u) & (e.dataSize - 1u);
++    }
++
++    inline void setVi(VU1State &s, uint8_t reg, int32_t value)
++    {
++        if (reg != 0u)
++            s.vi[reg] = value;
++    }
++
++    inline void storeLanes(VuFastEngine &e, uint32_t address, __m128 value, uint8_t dest)
++    {
++        if (address + 16u > e.dataSize)
++            return;
++        float *target = reinterpret_cast<float *>(e.data + address);
++        st(target, blendDest(ld(target), value, dest));
++    }
++
++    inline void loadLanes(VuFastEngine &e, uint32_t address, uint8_t reg, uint8_t dest)
++    {
++        if (address + 16u > e.dataSize)
++            return;
++        float *target = e.s.vf[reg];
++        st(target, blendDest(ld(target), ld(reinterpret_cast<const float *>(e.data + address)), dest));
++    }
++
++    inline int destComponent(uint8_t dest)
++    {
++        if (dest & 0x8u)
++            return 0;
++        if (dest & 0x4u)
++            return 1;
++        if (dest & 0x2u)
++            return 2;
++        return 3;
++    }
++
++    inline void branchTo(VuFastEngine &e, uint32_t target)
++    {
++        e.s.branchPending = true;
++        e.s.branchTarget = target;
++        e.s.branchDelay = 1;
++    }
++
++    inline uint32_t relativeTarget(const VuFastEngine &e, uint32_t instr)
++    {
++        return (e.s.pc + 8u + static_cast<uint32_t>(static_cast<int32_t>(IMM11(instr)) * 8)) & e.pcMask;
++    }
++
++    inline uint16_t imm12(uint32_t instr)
++    {
++        return static_cast<uint16_t>((((instr >> 21) & 0x1u) << 11) | (instr & 0x7FFu));
++    }
++
++    inline int32_t imm15(uint32_t instr)
++    {
++        return static_cast<int32_t>((instr & 0x7FFu) | ((instr >> 10) & 0x7800u));
++    }
++
++    void hLq(VuFastEngine &e, const Pair &p)
++    {
++        const uint32_t i = p.lowerInstr;
++        loadLanes(e, dataAddress(e, e.s.vi[VIS(i)] + IMM11(i)), FT(i), DEST(i));
++    }
++    void hSq(VuFastEngine &e, const Pair &p)
++    {
++        const uint32_t i = p.lowerInstr;
++        storeLanes(e, dataAddress(e, e.s.vi[VIT(i)] + IMM11(i)), ld(e.s.vf[FS(i)]), DEST(i));
++    }
++    void hIlw(VuFastEngine &e, const Pair &p)
++    {
++        const uint32_t i = p.lowerInstr;
++        const uint32_t address = dataAddress(e, e.s.vi[VIS(i)] + IMM11(i));
++        if (address + 16u > e.dataSize)
++            return;
++        uint32_t v = 0;
++        std::memcpy(&v, e.data + address + destComponent(DEST(i)) * 4, 4);
++        setVi(e.s, VIT(i), static_cast<int16_t>(v & 0xFFFFu));
++    }
++    void hIsw(VuFastEngine &e, const Pair &p)
++    {
++        const uint32_t i = p.lowerInstr;
++        const uint32_t address = dataAddress(e, e.s.vi[VIS(i)] + IMM11(i));
++        const int32_t value = static_cast<int32_t>(static_cast<uint16_t>(e.s.vi[VIT(i)] & 0xFFFF));
++        storeLanes(e, address, _mm_castsi128_ps(_mm_set1_epi32(value)), DEST(i));
++    }
++    void hIaddiu(VuFastEngine &e, const Pair &p)
++    {
++        const uint32_t i = p.lowerInstr;
++        setVi(e.s, VIT(i), static_cast<int16_t>(e.s.vi[VIS(i)] + imm15(i)));
++    }
++    void hIsubiu(VuFastEngine &e, const Pair &p)
++    {
++        const uint32_t i = p.lowerInstr;
++        setVi(e.s, VIT(i), static_cast<int16_t>(e.s.vi[VIS(i)] - imm15(i)));
++    }
++    void hFceq(VuFastEngine &e, const Pair &p)
++    {
++        e.s.vi[1] = ((e.s.clip & 0xFFFFFFu) == (p.lowerInstr & 0xFFFFFFu)) ? 1 : 0;
++    }
++    void hFcset(VuFastEngine &e, const Pair &p)
++    {
++        e.workingClip() = p.lowerInstr & 0xFFFFFFu;
++        for (uint32_t n = 0; n < e.flagCount; ++n)
++        {
++            VuFastEngine::FlagEntry &entry = e.flagRing[(e.flagHead + n) % VuFastEngine::kFlagRing];
++            if (entry.issue == e.cycle)
++                entry.kind = static_cast<uint8_t>(entry.kind & ~8u);
++        }
++        e.pushFlags(0u, 0u, 8u, e.workingClip());
++    }
++    void hFcand(VuFastEngine &e, const Pair &p)
++    {
++        e.s.vi[1] = ((e.s.clip & (p.lowerInstr & 0xFFFFFFu)) != 0u) ? 1 : 0;
++    }
++    void hFcor(VuFastEngine &e, const Pair &p)
++    {
++        e.s.vi[1] = ((e.s.clip | (p.lowerInstr & 0xFFFFFFu)) == 0xFFFFFFu) ? 1 : 0;
++    }
++    void hFseq(VuFastEngine &e, const Pair &p)
++    {
++        setVi(e.s, VIT(p.lowerInstr), ((e.s.status & 0xFFFu) == imm12(p.lowerInstr)) ? 1 : 0);
++    }
++    void hFsset(VuFastEngine &e, const Pair &p)
++    {
++        for (uint32_t n = 0; n < e.flagCount; ++n)
++        {
++            VuFastEngine::FlagEntry &entry = e.flagRing[(e.flagHead + n) % VuFastEngine::kFlagRing];
++            if (entry.issue == e.cycle)
++                entry.kind = static_cast<uint8_t>(entry.kind & ~2u);
++        }
++        e.pushFlags(0u, static_cast<uint32_t>(imm12(p.lowerInstr)) & 0xFC0u, 4u);
++    }
++    void hFsand(VuFastEngine &e, const Pair &p)
++    {
++        setVi(e.s, VIT(p.lowerInstr), static_cast<int32_t>((e.s.status & 0xFFFu) & imm12(p.lowerInstr)));
++    }
++    void hFsor(VuFastEngine &e, const Pair &p)
++    {
++        setVi(e.s, VIT(p.lowerInstr), static_cast<int32_t>((e.s.status & 0xFFFu) | imm12(p.lowerInstr)));
++    }
++    void hFmeq(VuFastEngine &e, const Pair &p)
++    {
++        const uint32_t i = p.lowerInstr;
++        setVi(e.s, VIT(i), ((e.s.mac & 0xFFFFu) == static_cast<uint32_t>(static_cast<uint16_t>(e.s.vi[VIS(i)]))) ? 1 : 0);
++    }
++    void hFmand(VuFastEngine &e, const Pair &p)
++    {
++        const uint32_t i = p.lowerInstr;
++        setVi(e.s, VIT(i), static_cast<int32_t>(e.s.mac & static_cast<uint32_t>(static_cast<uint16_t>(e.s.vi[VIS(i)]))));
++    }
++    void hFmor(VuFastEngine &e, const Pair &p)
++    {
++        const uint32_t i = p.lowerInstr;
++        setVi(e.s, VIT(i), static_cast<int32_t>(e.s.mac | static_cast<uint32_t>(static_cast<uint16_t>(e.s.vi[VIS(i)]))));
++    }
++    void hFcget(VuFastEngine &e, const Pair &p)
++    {
++        setVi(e.s, VIT(p.lowerInstr), static_cast<int32_t>(e.s.clip & 0x0FFFu));
++    }
++    void hB(VuFastEngine &e, const Pair &p) { branchTo(e, relativeTarget(e, p.lowerInstr)); }
++    void hBal(VuFastEngine &e, const Pair &p)
++    {
++        const uint32_t target = relativeTarget(e, p.lowerInstr);
++        setVi(e.s, VIT(p.lowerInstr), static_cast<int32_t>((e.s.pc + 16u) / 8u));
++        branchTo(e, target);
++    }
++    void hJr(VuFastEngine &e, const Pair &p)
++    {
++        const uint8_t is = VIS(p.lowerInstr);
++        branchTo(e, (static_cast<uint32_t>(static_cast<uint16_t>(is != 0u ? e.s.vi[is] : 0)) * 8u) & e.pcMask);
++    }
++    void hJalr(VuFastEngine &e, const Pair &p)
++    {
++        const uint8_t is = VIS(p.lowerInstr);
++        const uint32_t target = (static_cast<uint32_t>(static_cast<uint16_t>(is != 0u ? e.s.vi[is] : 0)) * 8u) & e.pcMask;
++        setVi(e.s, VIT(p.lowerInstr), static_cast<int32_t>((e.s.pc + 16u) / 8u));
++        branchTo(e, target);
++    }
++    template <int Cond>
++    void hCondBranch(VuFastEngine &e, const Pair &p)
++    {
++        const uint32_t i = p.lowerInstr;
++        const int16_t a = static_cast<int16_t>(e.branchVi(VIS(i)));
++        bool take = false;
++        if constexpr (Cond == 0)
++            take = a == static_cast<int16_t>(e.branchVi(VIT(i)));
++        else if constexpr (Cond == 1)
++            take = a != static_cast<int16_t>(e.branchVi(VIT(i)));
++        else if constexpr (Cond == 2)
++            take = a < 0;
++        else if constexpr (Cond == 3)
++            take = a > 0;
++        else if constexpr (Cond == 4)
++            take = a <= 0;
++        else
++            take = a >= 0;
++        if (take)
++            branchTo(e, relativeTarget(e, i));
++    }
++
++    void hIadd(VuFastEngine &e, const Pair &p)
++    {
++        const uint32_t i = p.lowerInstr;
++        setVi(e.s, VID(i), static_cast<int16_t>(e.s.vi[VIS(i)] + e.s.vi[VIT(i)]));
++    }
++    void hIsub(VuFastEngine &e, const Pair &p)
++    {
++        const uint32_t i = p.lowerInstr;
++        setVi(e.s, VID(i), static_cast<int16_t>(e.s.vi[VIS(i)] - e.s.vi[VIT(i)]));
++    }
++    void hIaddi(VuFastEngine &e, const Pair &p)
++    {
++        const uint32_t i = p.lowerInstr;
++        const int16_t imm5 = static_cast<int16_t>(static_cast<int32_t>((i >> 6) & 0x1Fu) << 27 >> 27);
++        setVi(e.s, VIT(i), static_cast<int16_t>(e.s.vi[VIS(i)] + imm5));
++    }
++    void hIand(VuFastEngine &e, const Pair &p)
++    {
++        const uint32_t i = p.lowerInstr;
++        setVi(e.s, VID(i), e.s.vi[VIS(i)] & e.s.vi[VIT(i)]);
++    }
++    void hIor(VuFastEngine &e, const Pair &p)
++    {
++        const uint32_t i = p.lowerInstr;
++        setVi(e.s, VID(i), e.s.vi[VIS(i)] | e.s.vi[VIT(i)]);
++    }
++    void hMove(VuFastEngine &e, const Pair &p)
++    {
++        const uint32_t i = p.lowerInstr;
++        float *target = e.s.vf[FT(i)];
++        st(target, blendDest(ld(target), ld(e.s.vf[FS(i)]), DEST(i)));
++    }
++    void hMr32(VuFastEngine &e, const Pair &p)
++    {
++        const uint32_t i = p.lowerInstr;
++        const __m128 v = ld(e.s.vf[FS(i)]);
++        float *target = e.s.vf[FT(i)];
++        st(target, blendDest(ld(target), _mm_shuffle_ps(v, v, _MM_SHUFFLE(0, 3, 2, 1)), DEST(i)));
++    }
++    void hLqi(VuFastEngine &e, const Pair &p)
++    {
++        const uint32_t i = p.lowerInstr;
++        const uint8_t is = VIS(i);
++        loadLanes(e, dataAddress(e, static_cast<uint16_t>(e.s.vi[is])), FT(i), DEST(i));
++        setVi(e.s, is, static_cast<int16_t>(e.s.vi[is] + 1));
++    }
++    void hSqi(VuFastEngine &e, const Pair &p)
++    {
++        const uint32_t i = p.lowerInstr;
++        const uint8_t it = VIT(i);
++        storeLanes(e, dataAddress(e, static_cast<uint16_t>(e.s.vi[it])), ld(e.s.vf[FS(i)]), DEST(i));
++        setVi(e.s, it, static_cast<int16_t>(e.s.vi[it] + 1));
++    }
++    void hLqd(VuFastEngine &e, const Pair &p)
++    {
++        const uint32_t i = p.lowerInstr;
++        const uint8_t is = VIS(i);
++        setVi(e.s, is, static_cast<int16_t>(e.s.vi[is] - 1));
++        loadLanes(e, dataAddress(e, static_cast<uint16_t>(e.s.vi[is])), FT(i), DEST(i));
++    }
++    void hSqd(VuFastEngine &e, const Pair &p)
++    {
++        const uint32_t i = p.lowerInstr;
++        const uint8_t it = VIT(i);
++        setVi(e.s, it, static_cast<int16_t>(e.s.vi[it] - 1));
++        storeLanes(e, dataAddress(e, static_cast<uint16_t>(e.s.vi[it])), ld(e.s.vf[FS(i)]), DEST(i));
++    }
++    void hDiv(VuFastEngine &e, const Pair &p)
++    {
++        const uint32_t i = p.lowerInstr;
++        const float num = normOp(e.s.vf[FS(i)][(i >> 21) & 3u]);
++        const float den = normOp(e.s.vf[FT(i)][(i >> 23) & 3u]);
++        uint32_t di = 0u;
++        float result;
++        if (den == 0.0f)
++        {
++            di = num == 0.0f ? 0x10u : 0x20u;
++            result = std::signbit(num) != std::signbit(den) ? -std::numeric_limits<float>::max()
++                                                             : std::numeric_limits<float>::max();
++        }
++        else
++            result = num / den;
++        e.queueQ(normResult(result), 7u, di);
++    }
++    void hSqrt(VuFastEngine &e, const Pair &p)
++    {
++        const uint32_t i = p.lowerInstr;
++        const float value = normOp(e.s.vf[FT(i)][(i >> 23) & 3u]);
++        e.queueQ(std::sqrt(std::fabs(value)), 7u, value < 0.0f ? 0x10u : 0u);
++    }
++    void hRsqrt(VuFastEngine &e, const Pair &p)
++    {
++        const uint32_t i = p.lowerInstr;
++        const float num = normOp(e.s.vf[FS(i)][(i >> 21) & 3u]);
++        const float radicand = normOp(e.s.vf[FT(i)][(i >> 23) & 3u]);
++        const float den = std::sqrt(std::fabs(radicand));
++        uint32_t di = radicand < 0.0f ? 0x10u : 0u;
++        float result;
++        if (den != 0.0f)
++            result = num / den;
++        else
++        {
++            di = num == 0.0f ? 0x10u : 0x20u;
++            result = std::signbit(num) ? -std::numeric_limits<float>::max() : std::numeric_limits<float>::max();
++        }
++        e.queueQ(normResult(result), 13u, di);
++    }
++    void hMtir(VuFastEngine &e, const Pair &p)
++    {
++        const uint32_t i = p.lowerInstr;
++        uint32_t bits = 0;
++        std::memcpy(&bits, &e.s.vf[FS(i)][(i >> 21) & 3u], 4);
++        setVi(e.s, VIT(i), static_cast<int16_t>(bits & 0xFFFFu));
++    }
++    void hMfir(VuFastEngine &e, const Pair &p)
++    {
++        const uint32_t i = p.lowerInstr;
++        const int32_t value = static_cast<int16_t>(e.s.vi[VIS(i)] & 0xFFFF);
++        float *target = e.s.vf[FT(i)];
++        st(target, blendDest(ld(target), _mm_castsi128_ps(_mm_set1_epi32(value)), DEST(i)));
++    }
++    void hIlwr(VuFastEngine &e, const Pair &p)
++    {
++        const uint32_t i = p.lowerInstr;
++        const uint32_t address = dataAddress(e, static_cast<uint16_t>(e.s.vi[VIS(i)]));
++        if (address + 16u > e.dataSize)
++            return;
++        uint32_t v = 0;
++        std::memcpy(&v, e.data + address + destComponent(DEST(i)) * 4, 4);
++        setVi(e.s, VIT(i), static_cast<int16_t>(v & 0xFFFFu));
++    }
++    void hIswr(VuFastEngine &e, const Pair &p)
++    {
++        const uint32_t i = p.lowerInstr;
++        const uint32_t address = dataAddress(e, static_cast<uint16_t>(e.s.vi[VIS(i)]));
++        const int32_t value = static_cast<int32_t>(static_cast<uint16_t>(e.s.vi[VIT(i)] & 0xFFFF));
++        storeLanes(e, address, _mm_castsi128_ps(_mm_set1_epi32(value)), DEST(i));
++    }
++    void writeBroadcast(VuFastEngine &e, uint32_t i, uint32_t bits)
++    {
++        float *target = e.s.vf[FT(i)];
++        st(target, blendDest(ld(target), _mm_castsi128_ps(_mm_set1_epi32(static_cast<int>(bits))), DEST(i)));
++    }
++    void hRnext(VuFastEngine &e, const Pair &p)
++    {
++        const uint32_t x = (e.s.r >> 4) & 1u;
++        const uint32_t y = (e.s.r >> 22) & 1u;
++        e.s.r = (((e.s.r << 1) ^ x ^ y) & 0x007FFFFFu) | 0x3F800000u;
++        writeBroadcast(e, p.lowerInstr, e.s.r);
++    }
++    void hRget(VuFastEngine &e, const Pair &p) { writeBroadcast(e, p.lowerInstr, e.s.r); }
++    void hRinit(VuFastEngine &e, const Pair &p)
++    {
++        const uint32_t i = p.lowerInstr;
++        uint32_t bits = 0u;
++        std::memcpy(&bits, &e.s.vf[FS(i)][(i >> 21) & 3u], sizeof(bits));
++        e.s.r = 0x3F800000u | (bits & 0x007FFFFFu);
++    }
++    void hRxor(VuFastEngine &e, const Pair &p)
++    {
++        const uint32_t i = p.lowerInstr;
++        uint32_t bits = 0u;
++        std::memcpy(&bits, &e.s.vf[FS(i)][(i >> 21) & 3u], sizeof(bits));
++        e.s.r = 0x3F800000u | ((e.s.r ^ bits) & 0x007FFFFFu);
++    }
++    void hMfp(VuFastEngine &e, const Pair &p)
++    {
++        uint32_t bits = 0;
++        std::memcpy(&bits, &e.s.p, 4);
++        writeBroadcast(e, p.lowerInstr, bits);
++    }
++    void hXtop(VuFastEngine &e, const Pair &p) { setVi(e.s, VIT(p.lowerInstr), static_cast<int32_t>(e.s.top & 0x3FFu)); }
++    void hXitop(VuFastEngine &e, const Pair &p) { setVi(e.s, VIT(p.lowerInstr), static_cast<int32_t>(e.s.itop & 0x3FFu)); }
++    void hXgkick(VuFastEngine &e, const Pair &p) { e.kick(static_cast<uint16_t>(e.s.vi[VIS(p.lowerInstr)])); }
++
++    inline float vfx(VuFastEngine &e, uint32_t i, uint32_t c) { return normOp(e.s.vf[FS(i)][c]); }
++    void hEsadd(VuFastEngine &e, const Pair &p)
++    {
++        const uint32_t i = p.lowerInstr;
++        const float x = vfx(e, i, 0), y = vfx(e, i, 1), z = vfx(e, i, 2);
++        e.queueP(x * x + y * y + z * z, 11u);
++    }
++    void hErsadd(VuFastEngine &e, const Pair &p)
++    {
++        const uint32_t i = p.lowerInstr;
++        const float x = vfx(e, i, 0), y = vfx(e, i, 1), z = vfx(e, i, 2);
++        const float sum = x * x + y * y + z * z;
++        e.queueP(sum != 0.0f ? 1.0f / sum : sum, 18u);
++    }
++    void hEleng(VuFastEngine &e, const Pair &p)
++    {
++        const uint32_t i = p.lowerInstr;
++        const float x = vfx(e, i, 0), y = vfx(e, i, 1), z = vfx(e, i, 2);
++        e.queueP(std::sqrt(x * x + y * y + z * z), 18u);
++    }
++    void hErleng(VuFastEngine &e, const Pair &p)
++    {
++        const uint32_t i = p.lowerInstr;
++        const float x = vfx(e, i, 0), y = vfx(e, i, 1), z = vfx(e, i, 2);
++        const float len = std::sqrt(x * x + y * y + z * z);
++        e.queueP(len != 0.0f ? 1.0f / len : len, 24u);
++    }
++    void hEatanxy(VuFastEngine &e, const Pair &p)
++    {
++        const uint32_t i = p.lowerInstr;
++        const float x = vfx(e, i, 0), y = vfx(e, i, 1);
++        e.queueP(x != 0.0f ? vuEatan(y / x) : 0.0f, 54u);
++    }
++    void hEatanxz(VuFastEngine &e, const Pair &p)
++    {
++        const uint32_t i = p.lowerInstr;
++        const float x = vfx(e, i, 0), z = vfx(e, i, 2);
++        e.queueP(x != 0.0f ? vuEatan(z / x) : 0.0f, 54u);
++    }
++    void hEsum(VuFastEngine &e, const Pair &p)
++    {
++        const uint32_t i = p.lowerInstr;
++        float sum = 0.0f;
++        for (uint32_t c = 0; c < 4u; ++c)
++            sum += vfx(e, i, c);
++        e.queueP(sum, 12u);
++    }
++    inline float vfc(VuFastEngine &e, uint32_t i) { return normOp(e.s.vf[FS(i)][(i >> 21) & 3u]); }
++    void hErsqrt(VuFastEngine &e, const Pair &p)
++    {
++        float result = vfc(e, p.lowerInstr);
++        if (result >= 0.0f)
++        {
++            result = std::sqrt(result);
++            if (result != 0.0f)
++                result = 1.0f / result;
++        }
++        e.queueP(result, 18u);
++    }
++    void hEsqrt(VuFastEngine &e, const Pair &p)
++    {
++        const float value = vfc(e, p.lowerInstr);
++        e.queueP(value >= 0.0f ? std::sqrt(value) : value, 12u);
++    }
++    void hEsin(VuFastEngine &e, const Pair &p) { e.queueP(vuEsin(vfc(e, p.lowerInstr)), 29u); }
++    void hErcpr(VuFastEngine &e, const Pair &p)
++    {
++        const float value = vfc(e, p.lowerInstr);
++        e.queueP(value != 0.0f ? 1.0f / value : value, 12u);
++    }
++    void hEatan(VuFastEngine &e, const Pair &p) { e.queueP(vuEatan(vfc(e, p.lowerInstr)), 54u); }
++    void hEexp(VuFastEngine &e, const Pair &p) { e.queueP(vuEexp(vfc(e, p.lowerInstr)), 44u); }
++    void hReservedLower(VuFastEngine &e, const Pair &p) { e.reserved(false, p.lowerInstr); }
++
++    VuFastEngine::Handler selectLower(uint32_t instr, bool &readsPipelines)
++    {
++        readsPipelines = false;
++        if (instr == 0x00000000u || instr == 0x8000033Cu)
++            return &hNop;
++        const uint8_t opHi = static_cast<uint8_t>((instr >> 25) & 0x7Fu);
++        switch (opHi)
++        {
++        case 0x00: return &hLq;
++        case 0x01: return &hSq;
++        case 0x04: return &hIlw;
++        case 0x05: return &hIsw;
++        case 0x08: return &hIaddiu;
++        case 0x09: return &hIsubiu;
++        case 0x10: readsPipelines = true; return &hFceq;
++        case 0x11: return &hFcset;
++        case 0x12: readsPipelines = true; return &hFcand;
++        case 0x13: readsPipelines = true; return &hFcor;
++        case 0x14: readsPipelines = true; return &hFseq;
++        case 0x15: return &hFsset;
++        case 0x16: readsPipelines = true; return &hFsand;
++        case 0x17: readsPipelines = true; return &hFsor;
++        case 0x18: readsPipelines = true; return &hFmeq;
++        case 0x1A: readsPipelines = true; return &hFmand;
++        case 0x1B: readsPipelines = true; return &hFmor;
++        case 0x1C: readsPipelines = true; return &hFcget;
++        case 0x20: return &hB;
++        case 0x21: return &hBal;
++        case 0x24: return &hJr;
++        case 0x25: return &hJalr;
++        case 0x28: return &hCondBranch<0>;
++        case 0x29: return &hCondBranch<1>;
++        case 0x2C: return &hCondBranch<2>;
++        case 0x2D: return &hCondBranch<3>;
++        case 0x2E: return &hCondBranch<4>;
++        case 0x2F: return &hCondBranch<5>;
++        case 0x40:
++            break;
++        default:
++            return &hReservedLower;
++        }
++
++        switch (instr & 0x3Fu)
++        {
++        case 0x30: return &hIadd;
++        case 0x31: return &hIsub;
++        case 0x32: return &hIaddi;
++        case 0x34: return &hIand;
++        case 0x35: return &hIor;
++        case 0x3C: case 0x3D: case 0x3E: case 0x3F:
++            break;
++        default:
++            return &hReservedLower;
++        }
++
++        switch (static_cast<uint8_t>((instr & 0x3u) | ((instr >> 4) & 0x7Cu)))
++        {
++        case 0x30: return &hMove;
++        case 0x31: return &hMr32;
++        case 0x34: return &hLqi;
++        case 0x35: return &hSqi;
++        case 0x36: return &hLqd;
++        case 0x37: return &hSqd;
++        case 0x38: return &hDiv;
++        case 0x39: return &hSqrt;
++        case 0x3A: return &hRsqrt;
++        case 0x3B: return &hNop; // WAITQ (the wait is a stall)
++        case 0x3C: return &hMtir;
++        case 0x3D: return &hMfir;
++        case 0x3E: return &hIlwr;
++        case 0x3F: return &hIswr;
++        case 0x40: return &hRnext;
++        case 0x41: return &hRget;
++        case 0x42: return &hRinit;
++        case 0x43: return &hRxor;
++        case 0x64: readsPipelines = true; return &hMfp;
++        case 0x68: return &hXtop;
++        case 0x69: return &hXitop;
++        case 0x6C: return &hXgkick;
++        case 0x70: return &hEsadd;
++        case 0x71: return &hErsadd;
++        case 0x72: return &hEleng;
++        case 0x73: return &hErleng;
++        case 0x74: return &hEatanxy;
++        case 0x75: return &hEatanxz;
++        case 0x76: return &hEsum;
++        case 0x77: return &hErsqrt;
++        case 0x78: return &hEsqrt;
++        case 0x79: return &hEsin;
++        case 0x7A: return &hErcpr;
++        case 0x7B: return &hNop; // WAITP
++        case 0x7C: return &hEatan;
++        case 0x7D: return &hEexp;
++        default: return &hReservedLower;
++        }
++    }
++
++    bool fastEngineEnabled()
++    {
++        const char *env = std::getenv("PS2X_VU_FAST");
++        return !(env && env[0] == '0');
++    }
++}
++
++std::unique_ptr<VuFastEngine> VuFastEngine::create(VU1Interpreter &vu)
++{
++    static const bool enabled = fastEngineEnabled();
++    if (!enabled)
++        return nullptr;
++    return std::make_unique<VuFastEngine>(vu);
++}
++
++VuFastEngine::VuFastEngine(VU1Interpreter &owner)
++    : vu(owner), s(owner.m_state)
++{
++}
++
++uint32_t &VuFastEngine::workingClip() { return vu.m_workingClip; }
++
++int32_t VuFastEngine::branchVi(uint8_t reg) const { return vu.readBranchVi(reg); }
++
++void VuFastEngine::reset()
++{
++    flagHead = 0;
++    flagCount = 0;
++    fdiv = {};
++    efu = {};
++    efuResourceReady = 0;
++    m_vfReady = {};
++    m_viReady = {};
++    m_accReady = {};
++}
++
++bool VuFastEngine::idle() const
++{
++    return flagCount == 0u && !fdiv.valid && !efu[0].valid && !efu[1].valid;
++}
++
++void VuFastEngine::reserved(bool upper, uint32_t instruction)
++{
++    vu.m_state.pc = s.pc;
++    vu.m_cycle = cycle;
++    vu.reportReservedInstruction(upper, instruction);
++}
++
++void VuFastEngine::pushFlags(uint32_t mac, uint32_t status, uint8_t kind, uint32_t clip)
++{
++    if (flagCount >= kFlagRing - 4u)
++        commit(cycle);
++    if (flagCount >= kFlagRing)
++    {
++        // Every entry still pending: cannot happen with a 4-cycle latency.
++        reserved(true, 0xFFFFFFFFu);
++        return;
++    }
++    FlagEntry &entry = flagRing[(flagHead + flagCount) % kFlagRing];
++    entry.ready = cycle + 4u;
++    entry.issue = cycle;
++    entry.mac = mac;
++    entry.status = status;
++    entry.clip = clip;
++    entry.kind = kind;
++    ++flagCount;
++}
++
++void VuFastEngine::commit(uint64_t now)
++{
++    for (;;)
++    {
++        // Same order as the interpreter, which commits every cycle: by ready cycle, then flags, Q, P.
++        int which = -1;
++        uint64_t best = ~0ull;
++        if (flagCount != 0u && flagRing[flagHead].ready <= now)
++        {
++            best = flagRing[flagHead].ready;
++            which = 0;
++        }
++        if (fdiv.valid && fdiv.ready <= now && fdiv.ready < best)
++        {
++            best = fdiv.ready;
++            which = 1;
++        }
++        for (int n = 0; n < 2; ++n)
++        {
++            if (efu[n].valid && efu[n].ready <= now && efu[n].ready < best)
++            {
++                best = efu[n].ready;
++                which = 2 + n;
++            }
++        }
++        if (which < 0)
++            return;
++
++        if (which == 0)
++        {
++            const FlagEntry &entry = flagRing[flagHead];
++            if (entry.kind & 1u)
++                s.mac = entry.mac;
++            if (entry.kind & 2u)
++            {
++                const uint32_t current = entry.status & 0xFu;
++                s.status = (s.status & 0xFF0u) | current | (current << 6);
++            }
++            if (entry.kind & 4u)
++                s.status = (s.status & 0x03Fu) | (entry.status & 0xFC0u);
++            if (entry.kind & 8u)
++                s.clip = entry.clip;
++            flagHead = (flagHead + 1u) % kFlagRing;
++            --flagCount;
++        }
++        else if (which == 1)
++        {
++            s.q = fdiv.value;
++            const uint32_t di = fdiv.di & 0x30u;
++            s.status = (s.status & 0xFCFu) | di | (di << 6);
++            fdiv.valid = false;
++        }
++        else
++        {
++            s.p = efu[which - 2].value;
++            efu[which - 2].valid = false;
++        }
++    }
++}
++
++void VuFastEngine::queueQ(float value, uint32_t latency, uint32_t di)
++{
++    commit(cycle);
++    fdiv.valid = true;
++    fdiv.ready = cycle + latency;
++    fdiv.value = normResult(value);
++    fdiv.di = di & 0x30u;
++}
++
++void VuFastEngine::queueP(float value, uint32_t latency)
++{
++    commit(cycle);
++    for (Scalar &entry : efu)
++    {
++        if (!entry.valid)
++        {
++            entry.valid = true;
++            entry.ready = cycle + latency;
++            entry.value = normResult(value);
++            efuResourceReady = cycle + (latency > 0u ? latency - 1u : 0u);
++            return;
++        }
++    }
++    reserved(false, 0xFFFFFFF9u);
++}
++
++void VuFastEngine::kick(uint32_t qwordAddress)
++{
++    if (vu.m_unit != VU1Interpreter::Unit::VU1 || dataSize < 16u)
++        return;
++
++    // The whole packet at once, walking the GIF tags as the interpreter's PATH1 transfer does.
++    auto &packet = vu.m_xgkick.packet;
++    const uint32_t source = (qwordAddress * 16u) % dataSize;
++    uint32_t copied = 0;
++    uint32_t tagEnd = 0;
++    bool eop = false;
++    for (;;)
++    {
++        if (copied > VU1Interpreter::XgkickPipeline::kBufferSize - 16u)
++        {
++            reserved(false, 0xFFFFFFFBu);
++            return;
++        }
++        const uint32_t from = (source + copied) % dataSize;
++        std::memcpy(packet.data() + copied, data + from, 16u);
++        const uint32_t qwordOffset = copied;
++        copied += 16u;
++        if (tagEnd == 0u)
++        {
++            uint64_t tagLo = 0;
++            std::memcpy(&tagLo, packet.data() + qwordOffset, sizeof(tagLo));
++            const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
++            const uint32_t format = static_cast<uint32_t>((tagLo >> 58) & 0x3u);
++            uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xFu);
++            if (nreg == 0u)
++                nreg = 16u;
++            uint64_t tagBytes = 16u;
++            if (format == 0u)
++                tagBytes += static_cast<uint64_t>(nloop) * nreg * 16u;
++            else if (format == 1u)
++                tagBytes += ((static_cast<uint64_t>(nloop) * nreg + 1u) & ~1ull) * 8u;
++            else
++                tagBytes += static_cast<uint64_t>(nloop) * 16u;
++            if (tagBytes > VU1Interpreter::XgkickPipeline::kBufferSize - qwordOffset)
++            {
++                reserved(false, 0xFFFFFFFBu);
++                return;
++            }
++            tagEnd = qwordOffset + static_cast<uint32_t>(tagBytes);
++            eop = ((tagLo >> 15) & 1u) != 0u;
++        }
++        if (copied >= tagEnd)
++        {
++            if (eop)
++                break;
++            tagEnd = 0u;
++        }
++    }
++
++    // GS code runs with the host's floating point mode.
++    const unsigned int vuCsr = _mm_getcsr();
++    _mm_setcsr(m_hostCsr);
++    vu.submitKick(packet.data(), copied);
++    _mm_setcsr(vuCsr);
++}
++
++VuFastEngine::Pair VuFastEngine::decode(const uint8_t *vuCode, uint32_t pc) const
++{
++    const VU1Interpreter::DecodedInstructionPair d = vu.decodeInstructionPair(vuCode, pc);
++    Pair p;
++    p.upperInstr = d.upper;
++    p.lowerInstr = d.lower;
++    p.u.fs = FS(d.upper);
++    p.u.ft = FT(d.upper);
++    p.u.fd = FD(d.upper);
++    p.u.dest = DEST(d.upper);
++    p.u.bc = BC(d.upper);
++
++    bool upperReadsQ = false;
++    bool lowerReads = false;
++    p.upper = selectUpper(d.upper, upperReadsQ);
++    if (d.iBit)
++    {
++        p.lower = &hNop;
++        std::memcpy(&p.immediate, &d.lower, sizeof(p.immediate));
++        p.flags |= kIBit;
++    }
++    else
++        p.lower = selectLower(d.lower, lowerReads);
++    if (upperReadsQ || lowerReads)
++        p.flags |= kCommit;
++    // NOP halves are skipped instead of called.
++    if (p.upper == &hNop)
++        p.upper = nullptr;
++    if (p.lower == &hNop)
++        p.lower = nullptr;
++
++    const VU1Interpreter::InstructionUsage *usages[2] = {&d.upperUsage, &d.lowerUsage};
++    for (const VU1Interpreter::InstructionUsage *usage : usages)
++    {
++        for (uint32_t n = 0; n < usage->vfReadCount && p.readCount < p.readReg.size(); ++n)
++        {
++            p.readReg[p.readCount] = usage->vfRead[n].reg;
++            p.readLanes[p.readCount] = usage->vfRead[n].lanes;
++            ++p.readCount;
++        }
++        p.viRead = static_cast<uint16_t>(p.viRead | (usage->viRead & 0xFFFEu));
++        p.accRead = static_cast<uint8_t>(p.accRead | usage->accRead);
++    }
++
++    if (d.upperUsage.vfWrite.reg != 0u)
++    {
++        p.upperWriteReg = d.upperUsage.vfWrite.reg;
++        p.upperWriteLanes = d.upperUsage.vfWrite.lanes;
++        p.upperLatency = d.upperUsage.vfLatency != 0u ? d.upperUsage.vfLatency : d.upperUsage.latency;
++    }
++    if (d.lowerUsage.vfWrite.reg != 0u && d.suppressedLowerVf != d.lowerUsage.vfWrite.reg)
++    {
++        p.lowerWriteReg = d.lowerUsage.vfWrite.reg;
++        p.lowerWriteLanes = d.lowerUsage.vfWrite.lanes;
++        p.lowerLatency = d.lowerUsage.vfLatency != 0u ? d.lowerUsage.vfLatency : d.lowerUsage.latency;
++    }
++    if (const uint32_t viWrites = d.lowerUsage.viWrite & 0xFFFEu; viWrites != 0u)
++    {
++        p.viWriteReg = static_cast<uint8_t>(std::countr_zero(viWrites));
++        p.viLatency = d.lowerUsage.viLatency != 0u ? d.lowerUsage.viLatency : d.lowerUsage.latency;
++        if (d.lowerUsage.delaysNextBranchRead)
++            p.flags |= kBranchBackup;
++    }
++    p.accWriteLanes = d.upperUsage.accWrite;
++    p.shadowReg = d.upperVfShadowReg;
++
++    if (d.lowerUsage.pipeline == VU1Interpreter::PipelineFdiv)
++        p.flags |= kFdiv;
++    if (d.lowerUsage.pipeline == VU1Interpreter::PipelineEfu)
++        p.flags |= kEfu;
++    if (d.lowerUsage.pipeline == VU1Interpreter::PipelineBranch)
++        p.flags |= kBranch;
++    if (d.lowerUsage.waitQ)
++        p.flags |= kWaitQ;
++    if (d.lowerUsage.waitP)
++        p.flags |= kWaitP;
++    if (d.eBit)
++        p.flags |= kEBit;
++    if (d.dBit)
++        p.flags |= kDBit;
++    if (d.tBit)
++        p.flags |= kTBit;
++    if (d.upperUsage.reserved || d.lowerUsage.reserved)
++        p.flags |= kReserved;
++    return p;
++}
++
++void VuFastEngine::rebuild(const uint8_t *vuCode, uint32_t codeSize, uint64_t generation)
++{
++    const uint32_t pairCount = std::min<uint32_t>(codeSize / 8u, kMaxPairs);
++    for (uint32_t n = 0; n < pairCount; ++n)
++        m_pairs[n] = decode(vuCode, n * 8u);
++    m_code = vuCode;
++    m_codeSize = codeSize;
++    m_generation = generation;
++    m_valid = true;
++}
++
++void VuFastEngine::flushAll()
++{
++    uint64_t last = cycle;
++    if (flagCount != 0u)
++        last = std::max(last, flagRing[(flagHead + flagCount - 1u) % kFlagRing].ready);
++    if (fdiv.valid)
++        last = std::max(last, fdiv.ready);
++    for (const Scalar &entry : efu)
++        if (entry.valid)
++            last = std::max(last, entry.ready);
++    cycle = last;
++    commit(cycle);
++}
++
++bool VuFastEngine::run(uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData, uint32_t vuDataSize, GS &gs,
++                       PS2Memory *memory, uint32_t maxCycles)
++{
++    if (memory == nullptr)
++        return false;
++    const bool vu1 = vu.m_unit == VU1Interpreter::Unit::VU1;
++    if (vuCode != (vu1 ? memory->getVU1Code() : memory->getVU0Code()))
++        return false;
++    const uint64_t generation = vu1 ? memory->getVU1CodeGeneration() : memory->getVU0CodeGeneration();
++    if (!m_valid || m_code != vuCode || m_codeSize != codeSize || m_generation != generation)
++        rebuild(vuCode, codeSize, generation);
++
++    vu.m_activeVuData = vuData;
++    vu.m_activeVuDataSize = vuDataSize;
++    vu.m_activeGs = &gs;
++    vu.m_activeMemory = memory;
++    data = vuData;
++    dataSize = vuDataSize;
++
++    // Round toward zero with all exceptions masked. No denormals-are-zero or flush-to-zero: operands are
++    // normalized explicitly (as the interpreter does), while the product inside a multiply-add must keep
++    // its denormal value, and a denormal result has to raise the underflow flag.
++    m_hostCsr = _mm_getcsr();
++    _mm_setcsr((m_hostCsr | 0x6000u | 0x1F80u) & ~0x8040u);
++
++    cycle = vu.m_cycle;
++    const uint64_t budgetEnd = cycle + maxCycles;
++    pcMask = vu.microAddressMask();
++    const uint32_t pairLimit = std::min<uint32_t>(codeSize / 8u, kMaxPairs);
++    bool programEnded = false;
++    uint64_t pairs = 0;
++
++    while (cycle < budgetEnd && !vu.m_stopRequested)
++    {
++        if (s.pc + 8u > codeSize || (s.pc >> 3) >= pairLimit)
++            break;
++        const Pair &p = m_pairs[s.pc >> 3];
++        if (p.flags & kReserved)
++        {
++            const bool upper = (p.upper == &hReservedUpper);
++            reserved(upper, upper ? p.upperInstr : p.lowerInstr);
++            break;
++        }
++
++        // Wait until everything the pair reads is ready (same rules as calculatePairReadyCycle).
++        uint64_t ready = cycle;
++        for (uint32_t n = 0; n < p.readCount; ++n)
++        {
++            const auto &laneReady = m_vfReady[p.readReg[n]];
++            const uint8_t lanes = p.readLanes[n];
++            if (lanes & 8u) ready = std::max(ready, laneReady[0]);
++            if (lanes & 4u) ready = std::max(ready, laneReady[1]);
++            if (lanes & 2u) ready = std::max(ready, laneReady[2]);
++            if (lanes & 1u) ready = std::max(ready, laneReady[3]);
++        }
++        for (uint32_t bits = p.viRead; bits != 0u; bits &= bits - 1u)
++            ready = std::max(ready, m_viReady[static_cast<uint32_t>(std::countr_zero(bits))]);
++        if (p.accRead)
++        {
++            if (p.accRead & 8u) ready = std::max(ready, m_accReady[0]);
++            if (p.accRead & 4u) ready = std::max(ready, m_accReady[1]);
++            if (p.accRead & 2u) ready = std::max(ready, m_accReady[2]);
++            if (p.accRead & 1u) ready = std::max(ready, m_accReady[3]);
++        }
++        if (p.flags & (kFdiv | kEfu | kWaitQ | kWaitP))
++        {
++            if ((p.flags & (kFdiv | kWaitQ)) && fdiv.valid)
++                ready = std::max(ready, fdiv.ready);
++            if (p.flags & kEfu)
++                ready = std::max(ready, efuResourceReady);
++            if (p.flags & kWaitP)
++                for (const Scalar &entry : efu)
++                    if (entry.valid)
++                        ready = std::max(ready, entry.ready);
++        }
++        if (ready > cycle)
++        {
++            if (ready >= budgetEnd)
++            {
++                cycle = budgetEnd;
++                break;
++            }
++            cycle = ready;
++        }
++        if (p.flags & kCommit)
++            commit(cycle);
++
++        const int32_t oldVi = p.viWriteReg != 0u ? s.vi[p.viWriteReg] : 0;
++
++        if (p.flags & kIBit)
++        {
++            if (p.upper)
++                p.upper(*this, p);
++            s.i = normOp(p.immediate);
++        }
++        else if (p.shadowReg != 0u)
++        {
++            float *shadow = s.vf[p.shadowReg];
++            const __m128 before = ld(shadow);
++            if (p.upper)
++                p.upper(*this, p);
++            const __m128 upperResult = ld(shadow);
++            st(shadow, before);
++            if (p.lower)
++                p.lower(*this, p);
++            st(shadow, upperResult);
++        }
++        else
++        {
++            if (p.upper)
++                p.upper(*this, p);
++            if (p.lower)
++                p.lower(*this, p);
++        }
++
++        vu.m_viBranchBackupValid = false;
++
++        if (p.upperWriteReg != 0u)
++        {
++            auto &laneReady = m_vfReady[p.upperWriteReg];
++            const uint64_t at = cycle + p.upperLatency;
++            if (p.upperWriteLanes & 8u) laneReady[0] = at;
++            if (p.upperWriteLanes & 4u) laneReady[1] = at;
++            if (p.upperWriteLanes & 2u) laneReady[2] = at;
++            if (p.upperWriteLanes & 1u) laneReady[3] = at;
++        }
++        if (p.lowerWriteReg != 0u)
++        {
++            auto &laneReady = m_vfReady[p.lowerWriteReg];
++            const uint64_t at = cycle + p.lowerLatency;
++            if (p.lowerWriteLanes & 8u) laneReady[0] = at;
++            if (p.lowerWriteLanes & 4u) laneReady[1] = at;
++            if (p.lowerWriteLanes & 2u) laneReady[2] = at;
++            if (p.lowerWriteLanes & 1u) laneReady[3] = at;
++        }
++        if (p.viWriteReg != 0u)
++        {
++            m_viReady[p.viWriteReg] = cycle + p.viLatency;
++            if (p.flags & kBranchBackup)
++            {
++                vu.m_viBranchBackupValue = oldVi;
++                vu.m_viBranchBackupReg = p.viWriteReg;
++                vu.m_viBranchBackupValid = true;
++            }
++        }
++        if (p.accWriteLanes)
++        {
++            const uint64_t at = cycle + VU1Interpreter::kAccForwardLatency;
++            if (p.accWriteLanes & 8u) m_accReady[0] = at;
++            if (p.accWriteLanes & 4u) m_accReady[1] = at;
++            if (p.accWriteLanes & 2u) m_accReady[2] = at;
++            if (p.accWriteLanes & 1u) m_accReady[3] = at;
++        }
++
++        st(s.vf[0], _mm_setr_ps(0.0f, 0.0f, 0.0f, 1.0f));
++        s.vi[0] = 0;
++
++        uint32_t nextPc = s.pc + 8u;
++        if (nextPc >= codeSize)
++            nextPc = 0u;
++        s.pc = nextPc;
++        if (s.branchPending)
++        {
++            if (s.branchDelay == 0u)
++            {
++                s.pc = s.branchTarget & pcMask;
++                s.branchPending = false;
++            }
++            else
++                --s.branchDelay;
++        }
++
++        if ((p.flags & (kEBit | kDBit | kTBit)) || s.haltAfterDelaySlot || s.ebit)
++        {
++            const bool dHalt = (p.flags & kDBit) && s.dBitEnabled;
++            const bool tHalt = (p.flags & kTBit) && s.tBitEnabled;
++            const bool haltBit = dHalt || tHalt;
++            const bool haltBranch = haltBit && (p.flags & kBranch);
++            if (s.haltAfterDelaySlot)
++            {
++                s.stoppedByD = vu.m_pendingHaltD;
++                s.stoppedByT = vu.m_pendingHaltT;
++                programEnded = true;
++            }
++            else if (s.ebit)
++                programEnded = true;
++            else if (haltBit && !haltBranch)
++            {
++                s.stoppedByD = dHalt;
++                s.stoppedByT = tHalt;
++                programEnded = true;
++            }
++            else if (p.flags & kEBit)
++                s.ebit = true;
++            else if (haltBranch)
++            {
++                s.haltAfterDelaySlot = true;
++                vu.m_pendingHaltD = dHalt;
++                vu.m_pendingHaltT = tHalt;
++            }
++        }
++
++        ++cycle;
++        ++pairs;
++        if (programEnded)
++            break;
++    }
++
++    vu.m_lastRunFinished = programEnded;
++    if (programEnded)
++    {
++        flushAll();
++        s.ebit = false;
++        s.haltAfterDelaySlot = false;
++        vu.m_pendingHaltD = false;
++        vu.m_pendingHaltT = false;
++    }
++    vu.m_cycle = cycle;
++    s.cycles = cycle;
++    m_lastRunPairs = pairs;
++    _mm_setcsr(m_hostCsr);
++    return true;
++}
++
++#else // !PS2X_VU_FAST_AVAILABLE
++
++std::unique_ptr<VuFastEngine> VuFastEngine::create(VU1Interpreter &) { return nullptr; }
++VuFastEngine::VuFastEngine(VU1Interpreter &owner) : vu(owner), s(owner.m_state) {}
++void VuFastEngine::reset() {}
++uint32_t &VuFastEngine::workingClip() { return vu.m_workingClip; }
++int32_t VuFastEngine::branchVi(uint8_t) const { return 0; }
++bool VuFastEngine::idle() const { return true; }
++bool VuFastEngine::run(uint8_t *, uint32_t, uint8_t *, uint32_t, GS &, PS2Memory *, uint32_t) { return false; }
++void VuFastEngine::commit(uint64_t) {}
++void VuFastEngine::pushFlags(uint32_t, uint32_t, uint8_t, uint32_t) {}
++void VuFastEngine::queueQ(float, uint32_t, uint32_t) {}
++void VuFastEngine::queueP(float, uint32_t) {}
++void VuFastEngine::kick(uint32_t) {}
++void VuFastEngine::reserved(bool, uint32_t) {}
++
++#endif
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu_fast.h b/ps2xRuntime/src/lib/vu/ps2_vu_fast.h
+new file mode 100644
+index 0000000..e2b16d3
+--- /dev/null
++++ b/ps2xRuntime/src/lib/vu/ps2_vu_fast.h
+@@ -0,0 +1,174 @@
++#ifndef PS2_VU_FAST_H
++#define PS2_VU_FAST_H
++
++#include "runtime/ps2_vu1.h"
++
++#include <array>
++#include <cstdint>
++#include <memory>
++
++// Fast execution engine for VU0/VU1 microprograms.
++//
++// Each instruction pair is decoded once per microcode upload into a handler for the upper and the lower
++// instruction plus the registers it reads and writes. Execution follows the model of PCSX2's microVU:
++// - VF, VI and ACC results are written at once. A pair still waits until the registers it reads are
++//   ready (same latencies as VU1Interpreter), so it sees the same values and the cycle count matches.
++// - MAC/status/clip flags, Q and P become visible after their latency, in the order they complete.
++// - Stores are immediate and XGKICK sends the whole GIF packet when it issues.
++// Floating point runs with SSE under round-toward-zero; operands with the all-ones exponent are clamped
++// to +-max, denormal operands read as zero, and results get the same normalization and flags as the
++// interpreter's fast mode.
++class VuFastEngine
++{
++public:
++    // Null when the engine is unavailable (non-x86 build) or disabled with PS2X_VU_FAST=0.
++    static std::unique_ptr<VuFastEngine> create(VU1Interpreter &vu);
++
++    explicit VuFastEngine(VU1Interpreter &vu);
++
++    // Runs like VU1Interpreter::run. Returns false, without running anything, when the code is not one
++    // of the tracked micro memories (the interpreter handles that case).
++    bool run(uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory,
++             uint32_t maxCycles);
++
++    void reset();
++    // No result is waiting in a pipeline.
++    bool idle() const;
++    uint64_t lastRunPairs() const { return m_lastRunPairs; }
++
++    struct Pair;
++    using Handler = void (*)(VuFastEngine &, const Pair &);
++
++    struct UpperFields
++    {
++        uint8_t fs = 0;
++        uint8_t ft = 0;
++        uint8_t fd = 0;
++        uint8_t dest = 0;
++        uint8_t bc = 0;
++    };
++
++    struct LowerFields
++    {
++        uint8_t fs = 0;    // VF source (FS)
++        uint8_t ft = 0;    // VF target (FT)
++        uint8_t is = 0;    // VI source (VIS)
++        uint8_t it = 0;    // VI target (VIT)
++        uint8_t id = 0;    // VI destination (VID)
++        uint8_t dest = 0;  // bits 24:21
++        uint8_t fsf = 0;   // bits 22:21
++        uint8_t ftf = 0;   // bits 24:23
++        int32_t imm = 0;   // decoded immediate (meaning depends on the instruction)
++    };
++
++    struct Pair
++    {
++        Handler upper = nullptr;
++        Handler lower = nullptr;
++        uint32_t upperInstr = 0;
++        uint32_t lowerInstr = 0;
++        UpperFields u{};
++        LowerFields l{};
++        float immediate = 0.0f;  // I bit: the lower word
++
++        // Stall inputs: VF registers read (lane bits x=8 y=4 z=2 w=1), VI and ACC reads.
++        std::array<uint8_t, 4> readReg{};
++        std::array<uint8_t, 4> readLanes{};
++        uint8_t readCount = 0;
++        uint16_t viRead = 0;
++        uint8_t accRead = 0;
++
++        // Writes, for the readiness of later reads.
++        uint8_t upperWriteReg = 0;
++        uint8_t upperWriteLanes = 0;
++        uint8_t upperLatency = 0;
++        uint8_t lowerWriteReg = 0;
++        uint8_t lowerWriteLanes = 0;
++        uint8_t lowerLatency = 0;
++        uint8_t viWriteReg = 0;
++        uint8_t viLatency = 0;
++        uint8_t accWriteLanes = 0;
++        uint8_t shadowReg = 0;
++
++        uint16_t flags = 0;
++    };
++
++    enum PairFlag : uint16_t
++    {
++        kFdiv = 1u << 0,        // DIV/SQRT/RSQRT: waits for the previous one
++        kEfu = 1u << 1,         // EFU instruction: waits for the unit
++        kWaitQ = 1u << 2,
++        kWaitP = 1u << 3,
++        kCommit = 1u << 4,      // reads Q, P or a flag register: bring the pipelines up to date first
++        kBranchBackup = 1u << 5, // its VI write is seen as the old value by a conditional branch right after
++        kIBit = 1u << 6,
++        kEBit = 1u << 7,
++        kDBit = 1u << 8,
++        kTBit = 1u << 9,
++        kBranch = 1u << 10,
++        kReserved = 1u << 11,
++    };
++
++    // --- execution state used by the handlers -------------------------------------------------------
++    VU1Interpreter &vu;
++    VU1State &s;
++    uint8_t *data = nullptr;
++    uint32_t dataSize = 0;
++    uint64_t cycle = 0;
++
++    struct FlagEntry
++    {
++        uint64_t ready = 0;
++        uint64_t issue = 0;
++        uint32_t mac = 0;
++        uint32_t status = 0;
++        uint32_t clip = 0;
++        uint8_t kind = 0;  // 1 mac, 2 status, 4 sticky, 8 clip
++    };
++    static constexpr uint32_t kFlagRing = 64u;
++    std::array<FlagEntry, kFlagRing> flagRing{};
++    uint32_t flagHead = 0;  // oldest
++    uint32_t flagCount = 0;
++
++    struct Scalar
++    {
++        uint64_t ready = 0;
++        float value = 0.0f;
++        uint32_t di = 0;
++        bool valid = false;
++    };
++    Scalar fdiv{};
++    std::array<Scalar, 2> efu{};
++    uint64_t efuResourceReady = 0;
++
++    uint32_t pcMask = 0;
++    uint32_t &workingClip();
++    int32_t branchVi(uint8_t reg) const;
++
++    void commit(uint64_t now);
++    void pushFlags(uint32_t mac, uint32_t status, uint8_t kind, uint32_t clip = 0u);
++    void queueQ(float value, uint32_t latency, uint32_t di);
++    void queueP(float value, uint32_t latency);
++    void kick(uint32_t qwordAddress);
++    void reserved(bool upper, uint32_t instruction);
++
++private:
++    void rebuild(const uint8_t *vuCode, uint32_t codeSize, uint64_t generation);
++    Pair decode(const uint8_t *vuCode, uint32_t pc) const;
++    void flushAll();
++
++    static constexpr uint32_t kMaxPairs = 0x4000u / 8u;
++    std::array<Pair, kMaxPairs> m_pairs{};
++    const uint8_t *m_code = nullptr;
++    uint32_t m_codeSize = 0;
++    uint64_t m_generation = ~0ull;
++    bool m_valid = false;
++
++    std::array<std::array<uint64_t, 4>, 32> m_vfReady{};
++    std::array<uint64_t, 16> m_viReady{};
++    std::array<uint64_t, 4> m_accReady{};
++    uint64_t m_lastRunPairs = 0;
++    unsigned int m_hostCsr = 0;
++};
++
++#endif

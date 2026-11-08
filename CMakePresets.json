@@ -38,7 +38,11 @@
       "name": "win-clang-relwithdebinfo",
       "displayName": "Windows x64 clang-cl RelWithDebInfo",
       "inherits": "clang-base",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_C_FLAGS_RELWITHDEBINFO": "/O2 /Ob2 /DNDEBUG -Zi",
+        "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "/O2 /Ob2 /DNDEBUG -Zi"
+      }
     },
     {
       "name": "win-clang-release",

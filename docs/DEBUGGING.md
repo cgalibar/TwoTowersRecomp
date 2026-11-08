@@ -2,8 +2,9 @@
 
 [Inicio](../README.md) · [Compilación](BUILDING.md) · [Estado](STATUS.md)
 
-Usa la build `win-clang-relwithdebinfo` para depurar y perfilar: tiene símbolos y va casi tan rápida como la
-`Release` (un 15-25 % más lenta); la `Debug` es unas 10 veces más lenta. Los logs por registro del GS del
+Usa la build `win-clang-relwithdebinfo` para depurar y perfilar: tiene símbolos y el mismo inlining que la
+`Release` (`/Ob2`, en `CMakePresets.json`), así que el perfil refleja lo que ve el jugador; la `Debug` es unas
+10 veces más lenta. Los logs por registro del GS del
 runtime están desactivados por defecto (`-DTTR_VERBOSE_RUNTIME_LOGS=ON` los activa).
 
 ## Variables de entorno
@@ -30,7 +31,14 @@ runtime están desactivados por defecto (`-DTTR_VERBOSE_RUNTIME_LOGS=ON` los act
 | `PS2X_WATCH=<lo>-<hi>` | Avisa (con el origen) cuando el runtime escribe en ese rango de la RAM del EE: stubs de libc, DMA SIF/IOP, lecturas de fichero, copias RPC, `sceMpegGetPicture`. No cubre los `sw`/`sq` del código recompilado |
 | `PS2X_VU_STATS=1` | Cada segundo: ejecuciones de microprogramas, ciclos y pares de instrucciones de VU0 y VU1 (parche `0009`). Mide la carga de VU y la velocidad del intérprete |
 | `PS2X_VU_DUMP=<carpeta>` | Guarda cada imagen distinta de la memoria de microcódigo que ejecuta una VU como `vu<n>_<fnv64>.bin` (para `tools/vu_disasm.py`) |
+| `PS2X_VU_FAST=0` | Desactiva el motor rápido de VU (parche `0010`) y usa el intérprete ciclo a ciclo |
+| `PS2X_VU_VERIFY=1` | Ejecuta cada microprograma en el motor rápido y, desde el mismo estado, en el intérprete; informa de diferencias en registros, flags, memoria de datos y paquetes XGKICK (`[vu-verify]`) y se queda con el resultado del intérprete. Lento |
 | `PS2X_VU_ACCURATE=1` | Vuelve al modelo de VU con colas de escritura y flags FMAC exactos (más lento; para comparar si se sospecha del modo rápido) |
+| `PS2X_VU_FLAGS_ALWAYS=1` | El motor rápido calcula todos los flags MAC/estado/clip, aunque el microcódigo no pueda leerlos |
+| `PS2X_VU_CAPTURE=<fichero>` | Guarda el estado inicial, el código y los datos de `PS2X_VU_CAPTURE_COUNT` ejecuciones de VU1 (3000) tras saltarse `PS2X_VU_CAPTURE_SKIP` (20 000), para `ttr_vu_bench` |
+| `PS2X_VIF1_ASYNC=0` | VIF1, VU1, PATH1 y PATH2 vuelven al hilo del EE (parche `0011`); por defecto corren en su propio hilo |
+| `PS2X_VIF1_STATS=1` | Cada segundo: ocupación del hilo de VIF1 (y qué parte es VU1 y envío al GS), bloques procesados y cuántas veces y cuánto tiempo esperó el EE, por motivo (`[vif1-stats]`) |
+| `PS2X_GS_STATS=1` | Cada segundo: píxeles que llegan al pipeline del GS y primitivas por tipo (`[gs-stats]`), y los sprites de más de 60 000 píxeles (`[gs-big]`) |
 | `PS2X_AUDIO=0` | Sin salida de audio del SPU2 |
 | `PS2X_AUDIO_DUMP=<fichero>` | Vuelca toda la mezcla del SPU2 en PCM crudo (estéreo, 16 bits, 48 kHz) |
 | `PS2X_PROFILE_CALLS=<n>` | Cada `n` llamadas entre funciones del juego, imprime las 30 más llamadas (`tools/disasm.py --sym` las traduce) |
@@ -59,6 +67,7 @@ Start durante la misión abre la pausa (Opciones / Salir a Menú).
 | `tools/disasm.py <símbolo|dirección>` | Desensamblado R5900 del ELF; `--sym <dir>` resuelve a símbolo, `--find <texto>` busca símbolos, `--gpref=-0x7120` lista los accesos a una global relativa a `$gp` |
 | `tools/vu_disasm.py <volcado> [--start <dir>] [--count <n>]` | Desensamblado de microcódigo VU0/VU1 (pares upper/lower) de un volcado de memoria de código |
 | `tools/irx_disasm.py <IRX> --base <dir> <dir>` | Desensamblado R3000 de un módulo IOP tal como se carga; `--imports`, `--strings` |
+| `ttr_vu_bench <captura> [pasadas]` | Junto a `TwoTowersRecomp.exe` (`cmake --build --preset ... --target ttr_vu_bench`). Reproduce una captura de `PS2X_VU_CAPTURE`: compara el motor rápido con el intérprete ejecución a ejecución y mide ns por par de instrucciones. Para iterar sobre el motor de VU sin arrancar el juego |
 | `TwoTowersRecomp/game/sles_51256_trace.cpp` | Wrappers de funciones del juego: registra y llama a la función generada |
 
 Para envolver otra función: declara un wrapper con la firma `void(uint8_t*, R5900Context*, PS2Runtime*)`
