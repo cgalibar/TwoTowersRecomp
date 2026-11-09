@@ -11,8 +11,10 @@ runtime están desactivados por defecto (`-DTTR_VERBOSE_RUNTIME_LOGS=ON` los act
 
 | Variable | Efecto |
 | --- | --- |
-| `TTR_FRAME_DUMP=<carpeta>` | Guarda el frame presentado como PNG cada `TTR_FRAME_DUMP_EVERY` VBlanks (50 por defecto) y registra el tiempo real transcurrido (`t=`, sirve para medir VBlanks por segundo), el modo de `ClGame` y los hilos del EE y del IOP |
+| `TTR_FRAME_DUMP=<carpeta>` | Guarda el frame presentado como PNG cada `TTR_FRAME_DUMP_EVERY` VBlanks (50 por defecto) y registra el tiempo real transcurrido (`t=`), desde el volcado anterior los fotogramas que el juego ha terminado por segundo (`fps=`, llamadas a `ClDisplay::end`), los VBlanks por segundo (`vbps=`) y la parte del tiempo del EE que el reloj real ha saltado (`rt-skip=`), el modo de `ClGame` y los hilos del EE y del IOP |
 | `TTR_PROFILE=<segundos>[,<n>]` | Perfilador por muestreo (Windows): toma el puntero de instrucción de todos los hilos cada milisegundo y, cada `<segundos>`, imprime las funciones más calientes y, por hilo, su ocupación y sus `<n>` funciones principales (8 por defecto). Necesita los símbolos de la build `RelWithDebInfo` o `Debug` |
+| `PS2X_REALTIME=0` | Sin reloj real (parche `0013`): el tiempo del EE (VBlanks, temporizadores, IOP) solo avanza con los ciclos que cobra el código generado, así que el juego va a cámara lenta cuando el PC no llega |
+| `PS2X_VIF1_QUEUE=<n>` | Transferencias de VIF1 sin procesar a partir de las cuales lanzar otra espera (2 por defecto; `0` sin límite) |
 | `PS2X_GS_THREADS=<n>` | Hilos extra del rasterizador del GS (parches `0005`/`0006`; por defecto, los de la CPU menos 3); `0` lo dibuja todo en el hilo del GS |
 | `PS2X_GS_ASYNC=0` | Desactiva el hilo del GS (parche `0006`): el rasterizador vuelve a ejecutarse en el hilo del EE |
 | `TTR_TRACE=dma` | Cola de cadenas DMA de VBlank y `ClGfxDmaBuffer` |
@@ -41,8 +43,8 @@ runtime están desactivados por defecto (`-DTTR_VERBOSE_RUNTIME_LOGS=ON` los act
 | `PS2X_VU_JIT_STATS=1` | Al salir: pares ejecutados por bloques compilados y por el bucle, bloques compilados y tamaño medio (`[vu-jit]`) |
 | `PS2X_VU_STALL_SKIP=0` | El motor rápido comprueba la disponibilidad de registros en todos los pares (sin `kNoStall`) |
 | `PS2X_VIF1_ASYNC=0` | VIF1, VU1, PATH1 y PATH2 vuelven al hilo del EE (parche `0011`); por defecto corren en su propio hilo |
-| `PS2X_VIF1_STATS=1` | Cada segundo: ocupación del hilo de VIF1 (y qué parte es VU1 y envío al GS, y cuánto de ese envío esperó con la cola del GS llena), bloques procesados y cuántas veces y cuánto tiempo esperó el EE, por motivo (`[vif1-stats]`) |
-| `PS2X_GS_STATS=1` | Cada segundo: píxeles y primitivas por tipo (`[gs-stats]`), sprites de más de 60 000 píxeles (`[gs-big]`) y, en `[gs-flush]`, lotes del pipeline de franjas, espera por huecos, CLUT leídas de la VRAM sombra, casos de lectura tras escritura y esperas del hilo del GS por motivo |
+| `PS2X_VIF1_STATS=1` | Cada segundo: ocupación del hilo de VIF1 y tiempo sin trabajo (`idle=`), qué parte es VU1 y envío al GS, y cuánto de ese envío esperó con la cola del GS llena, bloques procesados y cuántas veces y cuánto tiempo esperó el EE, por motivo (`[vif1-stats]`; `queue=` es la espera para lanzar una transferencia con la cola de VIF1 llena) |
+| `PS2X_GS_STATS=1` | Cada segundo: píxeles y primitivas por tipo (`[gs-stats]`), sprites de más de 60 000 píxeles (`[gs-big]`) y, en `[gs-flush]`, lotes del pipeline de franjas, espera por huecos, CLUT leídas de la VRAM sombra, casos de lectura tras escritura y esperas del hilo del GS por motivo; en `[gs-time]`, el tiempo de los hilos de rasterizado (dibujando, en barreras, sin trabajo), el del hilo del GS en `Submit`, los lotes por tipo (subida en serie, barrera, normales) con su espera y el tiempo de las operaciones en serie del hilo 0 y de los demás esperándolas; `[gs-thread]`, el tiempo que el hilo del GS esperó comandos |
 | `PS2X_GS_SHADOW_CLUT=0`, `PS2X_GS_IMMEDIATE_UPLOAD=0` | Diagnóstico del pipeline del GS (parche `0012`): las cargas de CLUT no leen la VRAM sombra; las subidas host→local siempre van en cola |
 | `PS2X_GS_SELF_NOW=0`, `PS2X_GS_SELF_COPY=0` | Las primitivas que leen páginas que escriben no se dibujan al momento en el hilo del GS / no se dibujan desde una copia congelada (esperan a todo y se dibujan en el hilo del GS) |
 | `PS2X_GS_RAW_BARRIER=0`, `PS2X_GS_RAW_TRIM=1`, `PS2X_GS_UV_READS=1` | Sin barrera cuando una primitiva lee páginas que dibuja un lote en curso; barrera solo si el que escribe va después de la última barrera; páginas leídas según las coordenadas en vez de la textura entera |
@@ -57,8 +59,8 @@ pasan de 50 a ~2 VBlanks/s); úsala en tramos cortos.
 ### Llegar a la batalla del prólogo
 
 Sin partida guardada, los vídeos de logos solo se saltan con el hack. Con esta secuencia se salta el de logos
-y la misión del prólogo arranca con su cinemática en el motor; la batalla empieza hacia el VBlank 2700 (a la
-velocidad actual, ~10 min de reloj):
+y la misión del prólogo arranca con su cinemática en el motor; la batalla empieza hacia el VBlank 2700 (~1 min de
+reloj con el reloj real; con `PS2X_REALTIME=0`, unos 3 min):
 
 ```powershell
 $env:TTR_HACK_SKIPPABLE_FMV = '1'
@@ -72,6 +74,7 @@ Start durante la misión abre la pausa (Opciones / Salir a Menú).
 
 | Herramienta | Uso |
 | --- | --- |
+| `tools/purple_scan.ps1 <carpeta> [vblank]` | Cuenta en los PNG de `TTR_FRAME_DUMP` (desde un VBlank, 1100 por defecto) los píxeles morados de las carreras del pipeline del GS; tras cualquier cambio del GS, comparar varias ejecuciones con la referencia |
 | `tools/disasm.py <símbolo|dirección>` | Desensamblado R5900 del ELF; `--sym <dir>` resuelve a símbolo, `--find <texto>` busca símbolos, `--gpref=-0x7120` lista los accesos a una global relativa a `$gp` |
 | `tools/vu_disasm.py <volcado> [--start <dir>] [--count <n>]` | Desensamblado de microcódigo VU0/VU1 (pares upper/lower) de un volcado de memoria de código |
 | `tools/irx_disasm.py <IRX> --base <dir> <dir>` | Desensamblado R3000 de un módulo IOP tal como se carga; `--imports`, `--strings` |

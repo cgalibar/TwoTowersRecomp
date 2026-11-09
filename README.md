@@ -5,9 +5,9 @@ Windows executable, following the approach of [Lost Odyssey Recomp](https://gith
 and built on top of [PS2Recomp](https://github.com/ran-j/PS2Recomp).
 
 > [!WARNING]
-> Work in progress. The game boots, plays the intro movie and enters the prologue level (3D world,
-> characters, sky and HUD render), but it is **not playable yet**: it runs far below real time, there is
-> no audio output, and gameplay has not been verified. See [docs/STATUS.md](docs/STATUS.md).
+> Work in progress. The game boots, plays the intro movies and the prologue mission can be played: the
+> game runs at full speed with sound, but draws only ~10 frames per second in the battle on a 6-core CPU,
+> and gameplay beyond the prologue has not been tested. See [docs/STATUS.md](docs/STATUS.md).
 
 ## What it is
 
@@ -52,21 +52,27 @@ Run it with:
 out\build\win-clang-release\TwoTowersRecomp\TwoTowersRecomp.exe
 ```
 
-Keyboard controls: WASD = left stick, IJKL = right stick, arrows = D-pad, X = Cross, C = Circle,
-Z = Square, V = Triangle, Enter = Start. A connected gamepad is used when present.
+Keyboard controls: WASD = left stick, IJKL = right stick, arrows = D-pad, X or Space = Cross,
+C or Escape = Circle, Z = Square, V = Triangle, Q/E = L1/R1, Left/Right Shift = L2/R2, Enter = Start,
+Tab = Select. A connected gamepad is used when present. F11 toggles fullscreen.
+
+Without a memory card save the intro movie cannot be skipped; `TTR_HACK_SKIPPABLE_FMV=1` lets any button
+skip the movies.
 
 See [docs/BUILDING.md](docs/BUILDING.md) for details and [docs/DEBUGGING.md](docs/DEBUGGING.md) for the
 tracing, profiling and scripted-input tools.
 
 ## Current status
 
-- Boots, runs the legal screens, loading screen, intro FMV (video only) and the prologue level.
+- Boots, runs the legal screens, loading screen, intro FMV and the prologue mission, with SPU2 audio.
+- Real-time clock: when the host cannot keep up, the emulated clock jumps forward instead of falling
+  behind, so the game (which measures its frame time) plays at full speed with fewer frames.
 - Fixed recompiler bugs that blocked rendering: VU0 macro-mode MAC flags, `SQRT.S` operand, VU0
   quadword load/store addressing (`VSQI`/`VLQI`), `VDIV`/`VRSQRT` by zero.
-- Performance: roughly 30 of 60 VBlanks per second in the prologue on a 12-thread CPU (asynchronous,
-  multi-threaded software GS rasterizer; batched IOP catch-up).
-- Missing: audio output, character shadow volumes (disabled with `TTR_HACK_NO_SHADOW_VOLUMES=1`),
-  gameplay verification, more speed.
+- Performance: ~10 frames per second in the prologue battle on a Ryzen 5 3600X (VU1 block compiler,
+  VIF1/VU1 and GS on their own threads, multi-threaded software GS rasterizer). The limits are the GS
+  pipeline (texture uploads serialize the raster threads) and VU1.
+- Missing: more speed, gameplay verification beyond the prologue, main menu flow.
 
 ## License
 

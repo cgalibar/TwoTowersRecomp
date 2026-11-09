@@ -1,0 +1,600 @@
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index 8a71c09..fa03709 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -271,6 +271,15 @@ public:
+     // The EE timers and the IOP catch up with the EE clock in batches of this many cycles (~14 us):
+     // generated code charges 8-32 cycles per call or loop edge, far too little to run the IOP scheduler for.
+     static constexpr uint64_t kDeviceCatchUpCycles = 4096ull;
++    // Real-time clock (PS2X_REALTIME, on by default). The EE clock normally only moves when generated code
++    // charges cycles, so time stands still while the EE thread waits for the VIF1/GS threads or runs slower
++    // than the console: VBlanks, the EE timers and the IOP slow down with it and the game runs in slow
++    // motion. Instead, when the EE clock falls more than kRealtimeSlackCycles behind the host clock it jumps
++    // forward, as if the EE had spent that time waiting (on the console it would be polling the DMAC). A game
++    // that measures its frame time (timer 0 HBLANKs here) then plays at full speed with fewer frames.
++    static constexpr uint64_t kRealtimeSlackCycles = kEeClockHz / 1000u;   // 1 ms
++    // A longer stall (debugger, window drag) is forgotten instead of replayed as a burst of VBlanks.
++    static constexpr uint64_t kRealtimeMaxJumpCycles = kEeClockHz / 5u;    // 200 ms
+ 
+     explicit EeScheduler(PS2Runtime &runtime);
+     ~EeScheduler();
+@@ -286,6 +295,9 @@ public:
+     void accountCycles(uint32_t cycles) noexcept;
+     // Applies the cycles accountCycles() has not yet passed to the EE timers and the IOP.
+     void catchUpDevices() noexcept;
++    // EE cycles added so far to keep up with the host clock (PS2X_REALTIME).
++    [[nodiscard]] uint64_t realtimeSkippedCycles() const noexcept { return m_realtimeSkipped.load(std::memory_order_relaxed); }
++    [[nodiscard]] uint64_t eeCycle() const noexcept { return m_eeCycle; }
+     [[nodiscard]] bool isExecutingGuest() const noexcept;
+ 
+     // Kernel object API. All calls except postEvent/requestStop execute on the
+@@ -400,6 +412,10 @@ private:
+     static int waitObjectId(const EeWaitState &wait);
+     void writeGuestU32(uint32_t address, uint32_t value);
+     void waitForEvent();
++    // PS2X_REALTIME: moves the EE clock forward to the host clock when it has fallen behind.
++    void catchUpToHostClock() noexcept;
++    // Host time at which `deadlineCycle` is due: `delay` from now, or earlier when the EE clock is behind the host clock.
++    [[nodiscard]] std::chrono::steady_clock::time_point hostDeadlineFor(uint64_t deadlineCycle, std::chrono::nanoseconds delay) const;
+     void scheduleEvent(uint64_t deadlineCycle, std::chrono::steady_clock::time_point hostDeadline, EeEvent event);
+     void updateNextDeadline();
+     [[nodiscard]] bool hasReadyAtOrAbovePriority(int priority) const;
+@@ -439,6 +455,12 @@ private:
+     uint32_t m_pendingEeTimerInterrupts = 0;
+     uint64_t m_eeCycle = 0;
+     uint64_t m_deviceCyclesPending = 0;
++    // PS2X_REALTIME: EE cycle m_cycleAnchor corresponds to host time m_hostAnchor (moved forward when a
++    // stall is forgotten), so cycle c is due at m_hostAnchor + (c - m_cycleAnchor) / kEeClockHz.
++    bool m_realtime = true;
++    std::chrono::steady_clock::time_point m_hostAnchor{};
++    uint64_t m_cycleAnchor = 0;
++    std::atomic<uint64_t> m_realtimeSkipped{0};
+     std::atomic<uint64_t> m_vblankPeriodMicroseconds{16667u};
+     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
+     std::thread::id m_executorThread{};
+diff --git a/ps2xRuntime/include/runtime/gs/gs_async_backend.h b/ps2xRuntime/include/runtime/gs/gs_async_backend.h
+index edacca8..b41b555 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_async_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_async_backend.h
+@@ -68,10 +68,14 @@ private:
+         std::vector<uint8_t> data;
+     };
+ 
+-    static constexpr uint64_t kCapacity = 8192u;
++    // About a frame and a half of the prologue battle: VIF1 alternates between VU1-heavy stretches that send
++    // little and stretches that flood the GS, and a fifth of a frame (8192) could not absorb them.
++    static constexpr uint64_t kCapacity = 65536u;
+     // Primitives are published to the GS thread in groups (and at the end of every GIF packet, by Kick),
+     // so the shared counters change once per group instead of once per primitive.
+     static constexpr uint64_t kPublishBatch = 32u;
++    // Upload buffers up to this size stay with their ring slot for reuse; larger ones are freed once drawn.
++    static constexpr size_t kKeptUploadCapacity = 1024u;
+ 
+     template <typename Fill>
+     void push(Fill &&fill, bool publishNow = true);
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+index 29e0fdd..054c06d 100644
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -318,6 +318,8 @@ public:
+     uint32_t advanceEeTimers(uint64_t eeCycles) noexcept;
+     [[nodiscard]] uint64_t cyclesUntilNextEeTimerInterrupt() const noexcept;
+     void resetEeTimers() noexcept;
++    // Timers clocked by HBLANK count PAL (15 625 Hz) or NTSC (15 734 Hz) lines, from the GS output mode.
++    void setEeTimerHBlankRate(uint32_t vblankHz) noexcept;
+ 
+     using GifPacketCallback = std::function<void(const uint8_t *, uint32_t)>;
+     void setGifPacketCallback(GifPacketCallback cb) { m_gifPacketCallback = std::move(cb); }
+@@ -435,12 +437,16 @@ public:
+     std::vector<PendingTransfer> m_pendingVif1Transfers;
+     std::unique_ptr<ps2x::Vif1Worker> m_vif1Worker;
+     // EE accesses to the GIF/VIF1/GS registers, the GIF FIFO and VU1 memory wait for the VIF1 worker.
++    // The VIF0 registers (0x10003800-0x10003BFF) do not: VIF0 and VU0 run on the EE thread, and games
++    // poll VIF0_STAT after every VU0 batch (ClVif0DmaBuffer::Sync here), which made the EE wait for the
++    // whole frame that VIF1 was drawing.
+     void syncForAddress(uint32_t address)
+     {
+         if (!m_vif1Worker || (address >> 28) == 7u)
+             return;
+         const uint32_t phys = address & 0x1FFFFFFFu;
+-        if ((phys >= 0x10003000u && phys < 0x10004000u) || (phys >= 0x10006000u && phys < 0x10007000u))
++        if ((phys >= 0x10003000u && phys < 0x10003800u) || (phys >= 0x10003C00u && phys < 0x10004000u) ||
++            (phys >= 0x10006000u && phys < 0x10007000u))
+             syncVif1(0u);
+         else if (phys >= 0x1000A000u && phys < 0x1000B000u) // GIF DMA channel: native PATH3 paths read GIF state
+             syncVif1(3u);
+@@ -477,6 +483,8 @@ public:
+     };
+ 
+     std::array<EeTimer, 4> m_eeTimers{};
++    uint32_t m_hblankHz = 15734u;
++    [[nodiscard]] uint64_t eeTimerClockHz(uint32_t mode) const noexcept;
+     bool tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr);
+     void completeDmacChannel(uint32_t channelBase, uint32_t cause);
+     void queueCompletedDmacCause(uint32_t cause);
+diff --git a/ps2xRuntime/include/runtime/ps2_vif1_worker.h b/ps2xRuntime/include/runtime/ps2_vif1_worker.h
+index dfb4bf6..6df3d2d 100644
+--- a/ps2xRuntime/include/runtime/ps2_vif1_worker.h
++++ b/ps2xRuntime/include/runtime/ps2_vif1_worker.h
+@@ -28,6 +28,10 @@ namespace ps2x
+         Vif1Worker(const Vif1Worker &) = delete;
+         Vif1Worker &operator=(const Vif1Worker &) = delete;
+ 
++        // Waits first while PS2X_VIF1_QUEUE (2) transfers are still unprocessed: the DMA controller reports a
++        // VIF1 transfer complete as soon as it is queued, so without a limit the EE could build frames far
++        // faster than VIF1/VU1/GS draw them. With 2, the EE builds frame N+1 while frame N is drawn, and
++        // kicking frame N+2 waits for frame N, as EndChain waits for the previous DMA on the console.
+         void enqueue(std::vector<uint8_t> &&data);
+         // Why a sync waited (PS2X_VIF1_STATS).
+         enum SyncReason : uint32_t
+@@ -39,6 +43,7 @@ namespace ps2x
+             SyncGsFrontend,
+             SyncPath3,
+             SyncOther,
++            SyncQueueFull,
+             SyncReasonCount
+         };
+ 
+@@ -57,6 +62,7 @@ namespace ps2x
+         std::condition_variable m_idle;
+         std::deque<std::vector<uint8_t>> m_queue;
+         std::atomic<uint32_t> m_pending{0u};
++        uint32_t m_maxPending = 2u;
+         bool m_stop = false;
+         std::thread m_thread;
+     };
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 24dbb4c..eff9b87 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include <algorithm>
+ #include <cassert>
++#include <cstdlib>
+ #include <cstring>
+ #include <iostream>
+ #include <limits>
+@@ -148,9 +149,14 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+     main.status = EeThreadStatus::Ready;
+     m_threads.emplace(main.id, std::move(main));
+     m_readyQueues[0].push_back(kMainThreadId);
++    const char *realtimeEnv = std::getenv("PS2X_REALTIME");
++    m_realtime = !(realtimeEnv && realtimeEnv[0] == '0');
++    m_hostAnchor = std::chrono::steady_clock::now();
++    m_cycleAnchor = m_eeCycle;
++    m_realtimeSkipped.store(0u, std::memory_order_relaxed);
+     const uint64_t vblankPeriod = m_vblankPeriodMicroseconds.load(std::memory_order_relaxed);
+     scheduleEvent(m_eeCycle + microsecondsToEeCycles(vblankPeriod),
+-                  std::chrono::steady_clock::now() + std::chrono::microseconds(vblankPeriod),
++                  m_hostAnchor + std::chrono::microseconds(vblankPeriod),
+                   EeEvent{EeEventType::VBlankStart, 0, 0});
+     publishSnapshot();
+ }
+@@ -402,8 +408,77 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+     }
+ }
+ 
++void EeScheduler::catchUpToHostClock() noexcept
++{
++    const auto now = std::chrono::steady_clock::now();
++    if (now <= m_hostAnchor)
++    {
++        return;
++    }
++    constexpr uint64_t kNanosecondsPerSecond = 1000000000ull;
++    const uint64_t hostNs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - m_hostAnchor).count());
++    const uint64_t target = m_cycleAnchor + hostNs / kNanosecondsPerSecond * kEeClockHz +
++                            hostNs % kNanosecondsPerSecond * kEeClockHz / kNanosecondsPerSecond;
++    if (target <= m_eeCycle + kRealtimeSlackCycles)
++    {
++        return;
++    }
++
++    uint64_t jump = target - m_eeCycle;
++    if (jump > kRealtimeMaxJumpCycles)
++    {
++        // Forget the rest of the stall: the host side of the clock and of every pending deadline moves
++        // forward by it, so the VBlanks after it are paced from now instead of all being overdue.
++        const auto forgotten = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
++            eeCyclesToHostDuration(jump - kRealtimeMaxJumpCycles));
++        m_hostAnchor += forgotten;
++        {
++            std::lock_guard lock(m_eventMutex);
++            for (ScheduledEvent &item : m_deadlines)
++            {
++                item.hostDeadline += forgotten;
++            }
++        }
++        jump = kRealtimeMaxJumpCycles;
++    }
++    {
++        // Deferred invocations (no-wait RPC end functions) stand for EE code that must run first, not for
++        // hardware time: EA's ClSound::tick reads the reply sequence after FlushIOPCommand returns, and an
++        // end function that ran inside tick because of a jump stalled the stream handshake (the bard
++        // preload then waited forever on "CARGANDO..."). They keep their distance in executed cycles.
++        std::lock_guard lock(m_eventMutex);
++        for (ScheduledEvent &item : m_deadlines)
++        {
++            if (item.event.type == EeEventType::DeferredInvocation)
++            {
++                item.deadlineCycle += jump;
++            }
++        }
++        updateNextDeadline();
++    }
++    m_eeCycle += jump;
++    m_deviceCyclesPending += jump;
++    m_realtimeSkipped.fetch_add(jump, std::memory_order_relaxed);
++}
++
++std::chrono::steady_clock::time_point EeScheduler::hostDeadlineFor(uint64_t deadlineCycle, std::chrono::nanoseconds delay) const
++{
++    const auto fromNow = std::chrono::steady_clock::now() + delay;
++    if (!m_realtime || deadlineCycle < m_cycleAnchor)
++    {
++        return fromNow;
++    }
++    const auto anchored = m_hostAnchor + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
++                                             eeCyclesToHostDuration(deadlineCycle - m_cycleAnchor));
++    return std::min(fromNow, anchored);
++}
++
+ void EeScheduler::catchUpDevices() noexcept
+ {
++    if (m_realtime)
++    {
++        catchUpToHostClock();
++    }
+     const uint64_t elapsed = m_deviceCyclesPending;
+     if (elapsed == 0u)
+     {
+@@ -429,6 +504,7 @@ void EeScheduler::setVBlankRate(uint32_t hz) noexcept
+     {
+         std::cout << "[ee] VBlank rate " << hz << " Hz" << std::endl;
+     }
++    m_runtime.memory().setEeTimerHBlankRate(hz);
+ }
+ 
+ bool EeScheduler::isExecutingGuest() const noexcept
+@@ -1107,7 +1183,7 @@ int EeScheduler::setAlarm(uint16_t ticks,
+     m_alarms.emplace(id, EeAlarm{id, ticks, handler, argument, gp, sp});
+     const uint64_t tickCount = ticks == 0u ? 1u : static_cast<uint64_t>(ticks);
+     scheduleEvent(m_eeCycle + tickCount * kAlarmTickCycles,
+-                  std::chrono::steady_clock::now() + std::chrono::microseconds(tickCount * kAlarmTickMicroseconds),
++                  hostDeadlineFor(m_eeCycle + tickCount * kAlarmTickCycles, std::chrono::microseconds(tickCount * kAlarmTickMicroseconds)),
+                   EeEvent{EeEventType::Alarm, static_cast<uint32_t>(id), 0});
+     return id;
+ }
+@@ -1147,7 +1223,7 @@ void EeScheduler::queueInvocationAfter(uint64_t delayCycles, GuestInvocation inv
+     }
+     m_deferredInvocations.emplace(id, std::move(invocation));
+     scheduleEvent(m_eeCycle + delayCycles,
+-                  std::chrono::steady_clock::now() + eeCyclesToHostDuration(delayCycles),
++                  hostDeadlineFor(m_eeCycle + delayCycles, eeCyclesToHostDuration(delayCycles)),
+                   EeEvent{EeEventType::DeferredInvocation, id, 0});
+ }
+ 
+diff --git a/ps2xRuntime/src/lib/gs/gs_async_backend.cpp b/ps2xRuntime/src/lib/gs/gs_async_backend.cpp
+index 2a03f3c..7f46637 100644
+--- a/ps2xRuntime/src/lib/gs/gs_async_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_async_backend.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include <chrono>
+ 
++#include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+ #if defined(_M_X64) || defined(__x86_64__)
+@@ -107,10 +108,39 @@ void GSAsyncBackend::waitIdle() const
+ 
+ void GSAsyncBackend::run()
+ {
++    // PS2X_GS_STATS=1: once a second, how long the GS thread waited for commands.
++    static const bool stats = []
++    {
++        const char *env = std::getenv("PS2X_GS_STATS");
++        return env && env[0] == '1';
++    }();
++    uint64_t idleNs = 0u;
++    auto lastReport = std::chrono::steady_clock::now();
+     uint64_t executed = m_executed.load(std::memory_order_relaxed);
+     for (;;)
+     {
+         uint64_t queued = m_queued.load(std::memory_order_acquire);
++        if (stats && queued == executed)
++        {
++            const auto start = std::chrono::steady_clock::now();
++            while (queued == executed)
++            {
++                m_threadSleeping.store(true, std::memory_order_seq_cst);
++                if (m_queued.load(std::memory_order_seq_cst) == executed)
++                    m_queued.wait(executed, std::memory_order_acquire);
++                m_threadSleeping.store(false, std::memory_order_relaxed);
++                queued = m_queued.load(std::memory_order_acquire);
++            }
++            const auto now = std::chrono::steady_clock::now();
++            idleNs += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count());
++            if (now - lastReport >= std::chrono::seconds(1))
++            {
++                std::fprintf(stderr, "[gs-thread] waiting for commands %.0f%%\n",
++                             100.0 * static_cast<double>(idleNs) / static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - lastReport).count()));
++                idleNs = 0u;
++                lastReport = now;
++            }
++        }
+         for (uint32_t spin = 0u; queued == executed && spin < kSpinIterations; ++spin)
+         {
+             cpuRelax();
+@@ -155,6 +185,10 @@ void GSAsyncBackend::execute(Command &command)
+         break;
+     case CommandType::UploadImage:
+         m_inner->UploadImage(command.data.data(), static_cast<uint32_t>(command.data.size()));
++        // Every ring slot would otherwise keep the largest upload it ever carried: with thousands of slots
++        // and texture/FMV uploads of up to a few hundred KiB, the process grew by ~18 MB/s up to several GB.
++        if (command.data.capacity() > kKeptUploadCapacity)
++            std::vector<uint8_t>().swap(command.data);
+         break;
+     case CommandType::Flush:
+         m_inner->Flush();
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index c3072de..9889324 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -111,6 +111,20 @@ namespace
+     std::atomic<uint64_t> g_clutShadowLoads{0};
+     std::atomic<uint64_t> g_clutDeferred{0};
+     std::atomic<uint64_t> g_rawSelf{0}, g_rawSelfNow{0}, g_rawSelfCopy{0}, g_rawPending{0}, g_rawInflight{0};
++    // Band workers (summed over workers): drawing, waiting at barrier/serial slots, waiting for work.
++    std::atomic<uint64_t> g_bandDrawNs{0}, g_bandBarrierNs{0}, g_bandIdleNs{0};
++    // By slot kind (0 serial barrier, 1 barrier, 2 none): time waiting before the slot, slots seen by worker 0.
++    std::atomic<uint64_t> g_bandWaitNs[3]{}, g_bandSlotKinds[3]{};
++    // Serial operations: [0] worker 0 running them, [1] the other workers waiting for them.
++    std::atomic<uint64_t> g_bandSerialNs[2]{};
++    // GS thread: time inside Submit (classification, hazards, publishing).
++    std::atomic<uint64_t> g_submitNs{0};
++    uint64_t statNowNs()
++    {
++        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                         std::chrono::steady_clock::now().time_since_epoch())
++                                         .count());
++    }
+     // Diagnostics switches: PS2X_GS_SHADOW_CLUT=0 (CLUT loads never read the shadow VRAM), PS2X_GS_IMMEDIATE_UPLOAD=0
+     // (host-to-local transfers are always queued).
+     const bool g_gsShadowClut = []
+@@ -186,6 +200,14 @@ namespace
+                                      kFlushReasonNames[r], static_cast<unsigned long long>(count), static_cast<double>(ns) / 1e6);
+         }
+         std::fprintf(stderr, "%s\n", line);
++        std::fprintf(stderr, "[gs-time] band workers (summed): draw=%.0fms barrier=%.0fms idle=%.0fms; gs thread: submit=%.0fms\n",
++                     static_cast<double>(g_bandDrawNs.exchange(0)) / 1e6, static_cast<double>(g_bandBarrierNs.exchange(0)) / 1e6,
++                     static_cast<double>(g_bandIdleNs.exchange(0)) / 1e6, static_cast<double>(g_submitNs.exchange(0)) / 1e6);
++        std::fprintf(stderr, "[gs-time] slots: serial-barrier=%llu (wait %.0fms) barrier=%llu (wait %.0fms) plain=%llu (wait %.0fms); serial ops run=%.0fms waited-for=%.0fms\n",
++                     static_cast<unsigned long long>(g_bandSlotKinds[0].exchange(0)), static_cast<double>(g_bandWaitNs[0].exchange(0)) / 1e6,
++                     static_cast<unsigned long long>(g_bandSlotKinds[1].exchange(0)), static_cast<double>(g_bandWaitNs[1].exchange(0)) / 1e6,
++                     static_cast<unsigned long long>(g_bandSlotKinds[2].exchange(0)), static_cast<double>(g_bandWaitNs[2].exchange(0)) / 1e6,
++                     static_cast<double>(g_bandSerialNs[0].exchange(0)) / 1e6, static_cast<double>(g_bandSerialNs[1].exchange(0)) / 1e6);
+     }
+ }
+ 
+@@ -385,9 +407,11 @@ private:
+                 Slot &slot = m_slots[next % kSlots];
+                 // A barrier slot starts once every worker has drawn all the slots before it.
+                 const bool serial = !slot.serial.empty();
++                const uint64_t barrierStart = g_gsStats ? statNowNs() : 0u;
+                 if (slot.barrier || slot.serialBarrier)
+                     waitUntil([&]()
+                               { return minDone() >= next; });
++                const uint64_t serialStart = g_gsStats ? statNowNs() : 0u;
+                 if (serial || slot.clutFromWorker)
+                 {
+                     // Worker 0 runs the slot's transfers and CLUT loads, takes the worker CLUT, and lets the
+@@ -406,7 +430,19 @@ private:
+                         waitUntil([&]()
+                                   { return m_serialDone.load(std::memory_order_acquire) > next; });
+                 }
++                const uint64_t drawStart = g_gsStats ? statNowNs() : 0u;
+                 m_draw(slot, k, stride);
++                if (g_gsStats)
++                {
++                    const uint64_t end = statNowNs();
++                    const int kind = slot.serialBarrier ? 0 : (slot.barrier ? 1 : 2);
++                    g_bandWaitNs[kind].fetch_add(serialStart - barrierStart, std::memory_order_relaxed);
++                    g_bandSerialNs[k == 0u ? 0 : 1].fetch_add(drawStart - serialStart, std::memory_order_relaxed);
++                    if (k == 0u)
++                        g_bandSlotKinds[kind].fetch_add(1u, std::memory_order_relaxed);
++                    g_bandBarrierNs.fetch_add(drawStart - barrierStart, std::memory_order_relaxed);
++                    g_bandDrawNs.fetch_add(end - drawStart, std::memory_order_relaxed);
++                }
+                 ++next;
+                 m_done[k].store(next, std::memory_order_release);
+                 m_progress.fetch_add(1u, std::memory_order_acq_rel);
+@@ -415,6 +451,7 @@ private:
+             }
+             if (m_stop.load(std::memory_order_acquire))
+                 return;
++            const uint64_t idleStart = g_gsStats ? statNowNs() : 0u;
+             const uint32_t wake = m_wake.load(std::memory_order_acquire);
+             bool more = false;
+             for (uint32_t spin = 0u; spin < kSpinIterations; ++spin)
+@@ -428,6 +465,8 @@ private:
+             }
+             if (!more && next >= m_published.load(std::memory_order_acquire))
+                 m_wake.wait(wake, std::memory_order_acquire);
++            if (g_gsStats)
++                g_bandIdleNs.fetch_add(statNowNs() - idleStart, std::memory_order_relaxed);
+         }
+     }
+ 
+@@ -1101,6 +1140,15 @@ void GSCpuBackend::ResetUnlocked()
+ 
+ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
+ {
++    struct SubmitTimer
++    {
++        uint64_t start = g_gsStats ? statNowNs() : 0u;
++        ~SubmitTimer()
++        {
++            if (start != 0u)
++                g_submitNs.fetch_add(statNowNs() - start, std::memory_order_relaxed);
++        }
++    } submitTimer;
+     std::lock_guard<std::mutex> lock(m_mutex);
+     if (!m_vram || batch.vertexCount == 0u)
+         return;
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index 5a4b46d..8878bcd 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -421,6 +421,18 @@ void PS2Memory::resetEeTimers() noexcept
+     m_eeTimers = {};
+ }
+ 
++void PS2Memory::setEeTimerHBlankRate(uint32_t vblankHz) noexcept
++{
++    // PAL: 625 lines at 25 frames/s; NTSC: 525 lines at 29.97 frames/s.
++    m_hblankHz = vblankHz == 50u ? 15625u : 15734u;
++}
++
++uint64_t PS2Memory::eeTimerClockHz(uint32_t mode) const noexcept
++{
++    const uint32_t clks = mode & kEeTimerModeClksMask;
++    return clks == 3u ? m_hblankHz : kEeTimerClockHz[clks];
++}
++
+ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
+ {
+     if (eeCycles == 0u)
+@@ -443,7 +455,7 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
+             continue;
+         }
+ 
+-        const uint64_t clockHz = kEeTimerClockHz[timer.mode & kEeTimerModeClksMask];
++        const uint64_t clockHz = eeTimerClockHz(timer.mode);
+         const uint64_t wholeSeconds = eeCycles / kEeClockHz;
+         const uint64_t remainingCycles = eeCycles % kEeClockHz;
+         const uint64_t scaled = remainingCycles * clockHz + timer.clockRemainder;
+@@ -531,7 +543,7 @@ uint64_t PS2Memory::cyclesUntilNextEeTimerInterrupt() const noexcept
+             continue;
+         }
+ 
+-        const uint64_t clockHz = kEeTimerClockHz[timer.mode & kEeTimerModeClksMask];
++        const uint64_t clockHz = eeTimerClockHz(timer.mode);
+         const uint64_t numerator = eventTicks * kEeClockHz - timer.clockRemainder;
+         const uint64_t cycles = (numerator + clockHz - 1u) / clockHz;
+         nearest = std::min(nearest, std::max<uint64_t>(1u, cycles));
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 1bac467..ce82374 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -1002,6 +1002,8 @@ bool PS2Runtime::initialize(const char *title)
+         m_audioBackend.setAudioReady(IsAudioDeviceReady());
+ #endif
+         SetTargetFPS(60);
++        // Escape is a pad button (Circle), not "close the window".
++        SetExitKey(KEY_NULL);
+         if (m_debugUiInitCallback)
+         {
+             m_debugUiInitCallback(*this, m_debugUiUserData);
+@@ -2730,6 +2732,12 @@ void PS2Runtime::run()
+         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
+         UploadFrame(frameTex, this, presentWidth, presentHeight);
+ 
++#if !defined(PLATFORM_VITA)
++        if (IsKeyPressed(KEY_F11))
++        {
++            ToggleBorderlessWindowed();
++        }
++#endif
+         BeginDrawing();
+         ClearBackground(BLACK);
+         const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_worker.cpp b/ps2xRuntime/src/lib/ps2_vif1_worker.cpp
+index e4b65c1..2043fc8 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_worker.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_worker.cpp
+@@ -29,6 +29,7 @@ namespace ps2x
+         std::atomic<uint64_t> g_workNs{0};
+         std::atomic<uint64_t> g_partNs[4]{};
+         std::atomic<uint64_t> g_items{0};
++        std::atomic<uint64_t> g_idleNs{0};
+         std::chrono::steady_clock::time_point g_statsLast = std::chrono::steady_clock::now();
+         std::mutex g_statsMutex;
+ 
+@@ -40,10 +41,11 @@ namespace ps2x
+             if (seconds < 1.0)
+                 return;
+             g_statsLast = now;
+-            static const char *names[] = {"gifvif", "vu1mem", "gspriv", "gifchan", "gsfront", "path3", "other"};
++            static const char *names[] = {"gifvif", "vu1mem", "gspriv", "gifchan", "gsfront", "path3", "other", "queue"};
+             char line[512];
+-            int len = std::snprintf(line, sizeof(line), "[vif1-stats] %.1fs worker=%.0f%% (vu1 %.0f%%, gs %.0f%% of which gs-queue-full %.0f%%) items=%llu waits:", seconds,
++            int len = std::snprintf(line, sizeof(line), "[vif1-stats] %.1fs worker=%.0f%% idle=%.0f%% (vu1 %.0f%%, gs %.0f%% of which gs-queue-full %.0f%%) items=%llu waits:", seconds,
+                                     100.0 * static_cast<double>(g_workNs.exchange(0)) / (seconds * 1e9),
++                                    100.0 * static_cast<double>(g_idleNs.exchange(0)) / (seconds * 1e9),
+                                     100.0 * static_cast<double>(g_partNs[0].exchange(0) + g_partNs[3].exchange(0)) / (seconds * 1e9),
+                                     100.0 * static_cast<double>(g_partNs[1].exchange(0)) / (seconds * 1e9),
+                                     100.0 * static_cast<double>(g_partNs[2].exchange(0)) / (seconds * 1e9),
+@@ -74,6 +76,8 @@ namespace ps2x
+     Vif1Worker::Vif1Worker(Process process)
+         : m_process(std::move(process))
+     {
++        if (const char *env = std::getenv("PS2X_VIF1_QUEUE"))
++            m_maxPending = static_cast<uint32_t>(std::strtoul(env, nullptr, 10));
+         m_thread = std::thread([this]()
+                                { run(); });
+     }
+@@ -98,6 +102,23 @@ namespace ps2x
+     {
+         if (data.empty())
+             return;
++        if (m_maxPending != 0u && !t_onVif1Worker && m_pending.load(std::memory_order_acquire) >= m_maxPending)
++        {
++            const auto start = std::chrono::steady_clock::now();
++            {
++                std::unique_lock<std::mutex> lock(m_mutex);
++                m_idle.wait(lock, [this]()
++                            { return m_pending.load(std::memory_order_acquire) < m_maxPending; });
++            }
++            if (g_stats)
++            {
++                g_calls[SyncQueueFull].fetch_add(1, std::memory_order_relaxed);
++                g_waits[SyncQueueFull].fetch_add(1, std::memory_order_relaxed);
++                g_waitNs[SyncQueueFull].fetch_add(
++                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()),
++                    std::memory_order_relaxed);
++            }
++        }
+         m_pending.fetch_add(1u, std::memory_order_acq_rel);
+         {
+             std::lock_guard<std::mutex> lock(m_mutex);
+@@ -151,9 +172,15 @@ namespace ps2x
+         {
+             std::vector<uint8_t> item;
+             {
++                const auto idleStart = g_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                 std::unique_lock<std::mutex> lock(m_mutex);
+                 m_workReady.wait(lock, [this]()
+                                  { return m_stop || !m_queue.empty(); });
++                if (g_stats)
++                    g_idleNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                                                 std::chrono::steady_clock::now() - idleStart)
++                                                                 .count()),
++                                       std::memory_order_relaxed);
+                 if (m_queue.empty())
+                     return;
+                 item = std::move(m_queue.front());
+@@ -179,8 +206,11 @@ namespace ps2x
+                                                              .count()),
+                                    std::memory_order_relaxed);
+                 g_items.fetch_add(1, std::memory_order_relaxed);
++                reportStats();
+             }
+-            if (m_pending.fetch_sub(1u, std::memory_order_acq_rel) == 1u)
++            // Wakes sync() (queue empty) and enqueue() (back under the limit).
++            const uint32_t left = m_pending.fetch_sub(1u, std::memory_order_acq_rel) - 1u;
++            if (left == 0u || left + 1u == m_maxPending)
+             {
+                 std::lock_guard<std::mutex> lock(m_mutex);
+                 m_idle.notify_all();

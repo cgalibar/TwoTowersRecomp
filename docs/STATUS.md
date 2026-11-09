@@ -2,11 +2,12 @@
 
 [Inicio](../README.md) · [Compilación](BUILDING.md) · [Depuración](DEBUGGING.md)
 
-Fase: **en progreso**. Arranca, reproduce los vídeos y entra en la misión del prólogo: la cinemática en el
-motor y la batalla se dibujan con personajes, el mando mueve a Isildur y el tutorial avanza ("Atacar
-Rápido" → "Atacar Fiero"). Los menús (pausa, opciones, "Salir a Menú") responden y el SPU2 suena por el
-host. **Bloqueo actual: velocidad.** En la batalla del prólogo va a ~17-18 VBlanks/s en la build `Release`
-(~35 % de la velocidad real; eran 3-4 antes del motor rápido de VU y del GS por lotes). Ver *Rendimiento*.
+Fase: **en progreso, el prólogo se puede jugar**. Arranca, reproduce los vídeos y entra en la misión del
+prólogo: la cinemática en el motor y la batalla se dibujan con personajes, el mando o el teclado mueven a
+Isildur y el tutorial avanza ("Atacar Rápido" → "Atacar Fiero"). Los menús (pausa, opciones, "Salir a Menú")
+responden y el SPU2 suena por el host. El juego va a **velocidad real** (50 VBlanks/s, el tiempo del juego
+sigue al reloj del PC) con menos fotogramas: ~10 fps en la batalla y ~7-9 en la cinemática del motor, en un
+Ryzen 5 3600X con la build `Release`. Ver *Rendimiento*.
 
 ## Progreso del arranque
 
@@ -23,13 +24,49 @@ host. **Bloqueo actual: velocidad.** En la batalla del prólogo va a ~17-18 VBla
 | Nivel: cielo y HUD (espada, "Defender", luna) | ✅ |
 | Nivel: terreno, campo de batalla y cielo (plano de apertura del prólogo) | ✅ |
 | Nivel: personajes (cinemática en el motor y batalla) | ✅ |
-| Control con el mando: Isildur avanza con el stick, ataques y tutorial | ✅ (con `TTR_PAD_SCRIPT`) |
+| Control con el mando: Isildur avanza con el stick, ataques y tutorial | ✅ (con `TTR_PAD_SCRIPT`; teclado y mando del PC por raylib) |
 | Menú de pausa de la misión, opciones, confirmación de "Salir a Menú" | ✅ |
 | Sonido: mezcla del SPU2 al host (raylib, 48 kHz) | ✅ (falta escucharlo con calma: AutoDMA, efectos, reverb) |
-| Velocidad jugable con personajes | ⚠️ ~17-18 VBlanks/s en batalla, ~14-15 en la cinemática del motor, ~8 con humo a pantalla completa |
+| Velocidad del juego | ✅ tiempo real (reloj del EE anclado al del PC, parche `0013`) |
+| Fotogramas por segundo con personajes | ⚠️ ~10 fps en batalla, ~7-9 en la cinemática del motor (el juego apunta a 25) |
 | Menú principal y nueva partida desde cero | pendiente |
 
 ## Problemas resueltos
+
+### El juego iba a cámara lenta (reloj del EE, parche `0013`)
+
+El juego mide el tiempo de cada frame con el temporizador 0 del EE en modo HBLANK (`ClClock::tick` lee y pone
+a cero `T0_COUNT` y divide entre 15 600), así que su lógica es de paso variable. Pero el runtime solo avanzaba
+el reloj del EE con los ciclos que cobra el código generado: mientras el hilo del EE esperaba al de VIF1 o al
+GS, o ejecutaba más despacio que la consola, no pasaba el tiempo para los VBlanks, los temporizadores ni el
+IOP, y el juego iba al ~35 % de su velocidad. Ahora, cuando el reloj del EE se queda más de 1 ms por detrás
+del del PC, salta hacia delante (como si el EE hubiera estado esperando al DMAC, que es lo que haría en la
+consola): VBlanks a 50 Hz reales, el juego a su velocidad con menos fotogramas y el audio del SPU2 al ritmo
+correcto. Un parón de más de 200 ms (depurador, arrastrar la ventana) se olvida en vez de reproducirse como
+una ráfaga de VBlanks. `PS2X_REALTIME=0` vuelve al reloj anterior. Los temporizadores en modo HBLANK cuentan
+15 625 líneas/s en PAL (antes, siempre las 15 734 de NTSC).
+
+Los fines de RPC sin espera que se aplazan ~100 µs (parche `0002`) no avanzan con esos saltos: representan
+código del EE que debe ejecutarse antes. Si se cumplían por un salto a mitad de `ClSound::tick`, el apretón de
+manos de EA MultiStream se paraba y la precarga del narrador (`ClBard::preloadCinematicAndWait`) se quedaba
+para siempre en "CARGANDO...".
+
+### El EE esperaba a VIF1 al leer `VIF0_STAT`
+
+El runtime trataba los registros de VIF0 (`0x10003800`) como los de VIF1/GIF y esperaba a que el hilo de VIF1
+vaciara su cola. `ClVif0DmaBuffer::Sync` lee `VIF0_STAT` tras cada lote de VU0 (física y colisiones), así que
+el frame siguiente no podía empezar hasta que VIF1/VU1/GS terminaban de dibujar el anterior. VIF0 y VU0 corren
+en el hilo del EE: ya no esperan. Para que el EE no se adelante sin límite (el DMA de VIF1 se da por terminado
+al encolarlo), lanzar una transferencia de VIF1 espera mientras haya dos sin procesar (`PS2X_VIF1_QUEUE`), como
+`ClGfxDmaBuffer::EndChain` espera en la consola a la cadena anterior.
+
+### Fuga de memoria de ~18 MB/s (cola del GS)
+
+Cada hueco del anillo de comandos del hilo del GS conservaba el búfer de la mayor subida de imagen que había
+llevado; con miles de huecos, el proceso crecía ~18 MB/s desde el arranque hasta varios GB. Los búferes de más
+de 1 KiB se liberan al ejecutar la subida; la memoria se queda en ~300 MB. La cola pasa de 8192 a 65 536
+comandos: en la batalla hay fases en que VU1 trabaja y el GS está libre y otras al revés, y una cola de un
+quinto de frame no las solapaba (+20 % de fps).
 
 ### Puntero nulo en `ClGame::tick()` (mapa de funciones)
 
@@ -225,7 +262,7 @@ Ahora el límite es el GS: el nivel dibuja unos 3,2 M píxeles por VBlank (unas 
 completa por frame: posproceso en franjas de sprites, triángulos aditivos gigantes y la cúpula del cielo con
 filtrado bilineal) a ~100 ns por píxel y hilo.
 
-Medido con la build `Release` (Ryzen 5 3600X, 6 núcleos/12 hilos) tras el parche `0012`:
+Medido con la build `Release` (Ryzen 5 3600X, 6 núcleos/12 hilos) tras el parche `0012`, antes del reloj real:
 
 | Escena | VBlanks/s | Límite |
 | --- | --- | --- |
@@ -234,25 +271,50 @@ Medido con la build `Release` (Ryzen 5 3600X, 6 núcleos/12 hilos) tras el parch
 | Plano con humo a pantalla completa | ~8 | GS (~16 M píxeles por frame) |
 | Batalla del prólogo | ~17-18 (eran ~14,5) | hilo de VIF1: VU1 y espera a la cola del GS (~25 %) |
 
-Ningún hilo está saturado: en la batalla el EE trabaja un ~20 % (espera al hilo de VIF1), el hilo de VIF1 un ~60 %
-(la mitad en VU1), el del GS un ~60 % y los de rasterizado un ~40-50 %. Cada etapa espera a la siguiente: para
-50 VBlanks/s el hilo de VIF1 tendría que hacer el trabajo de cada frame unas 2,5 veces más deprisa y el
-rasterizado no debería frenar su cola.
+Antes del parche `0013` los VBlanks/s eran también la velocidad del juego (~35 % de la real en la batalla).
+Desde el `0013` el juego va a 50 VBlanks/s reales y lo que cae son los fotogramas que dibuja (`fps=` en el
+registro de `TTR_FRAME_DUMP`, contados en `ClDisplay::end`; `rt-skip=` es la parte del tiempo del EE que el
+reloj real ha tenido que saltar):
+
+| Escena | fps (`0013`) | Límite |
+| --- | --- | --- |
+| Vídeos FMV | 25 (los del vídeo) | ninguno |
+| Cinemática del prólogo en el motor | ~7-9 | hilo de VIF1 y GS |
+| Batalla del prólogo | ~10 (8,5 con la cola del GS de 8192) | GS (rasterizado con barreras) y VU1 |
+
+Reparto en la batalla (`PS2X_VIF1_STATS=1`, `PS2X_GS_STATS=1`):
+
+- **EE**: ~20 % ocupado; el resto espera a poder lanzar el frame siguiente a VIF1 (`queue=`).
+- **Hilo de VIF1**: 100 % ocupado: ~33 % VU1, ~11 % enviando primitivas al GS, ~11 % UNPACK y demás, y ~45 %
+  bloqueado con la cola del GS llena. Aunque el GS fuera infinitamente rápido, VU1 limitaría a ~18 fps.
+- **Hilo del GS**: siempre con trabajo; ~0,3 s/s en `Submit`, ~0,3 s/s esperando hueco en el pipeline de franjas
+  y ~0,3 s/s en ~45 cargas de CLUT por segundo de paletas que el juego acaba de dibujar (dependencia real: hay
+  que esperar a que se dibujen).
+- **Hilos de rasterizado** (9): ~57 % dibujando, ~34 % parados en barreras, ~9 % sin trabajo. Unos 4400 lotes
+  por segundo, de los que ~2500 llevan una subida de textura en serie (el juego sube ~2100 texturas/s a un área
+  de VRAM que reutiliza): cada una espera a que todos los hilos terminen lo anterior (escritura tras lectura de
+  la textura vieja) y los demás esperan a que el hilo 0 la haga (la usan los lotes siguientes). Hacer esas
+  dependencias exactas no ganó nada: es la propia secuencia subir → dibujar → subir en las mismas páginas.
 
 ## Siguiente
 
-1. **VU1 en el hilo de VIF1**: emitir en línea las FMAC con flags, las cargas/almacenamientos y la aritmética de
-   VI (hoy son llamadas), y abaratar `commit` y las esperas de Q/P; `ttr_vu_bench` lo comprueba sin arrancar el
-   juego.
-2. **Rasterizado**: coste por píxel (direcciones de VRAM por fila/columna, bucles de sprite especializados) y
-   reparto de las subidas en cola, que hoy hace solo el hilo 0 mientras los demás esperan.
-3. **Envío de primitivas al GS**: cada triángulo copia el estado completo del GS al montarse y al encolarse.
-4. Llegar al menú principal sin pasar por la misión y empezar una partida nueva; escuchar el audio.
+1. **Subidas de textura sin barreras**: versiones de página. Si solo hay lectores en vuelo de la textura vieja,
+   el hilo del GS escribiría la subida en una copia de las páginas y los lotes siguientes leerían de esa copia
+   (la caché de páginas de cada hilo ya copia páginas de 8 KiB: bastaría con resolver la página por lote); el
+   hilo 0 la volcaría a la VRAM cuando los lectores terminen. Libera ~1/3 del tiempo de rasterizado.
+2. **VU1 en el hilo de VIF1** (límite de ~18 fps): emitir en línea las FMAC con flags, las cargas/almacenamientos y
+   la aritmética de VI, y abaratar `commit` y las esperas de Q/P; `ttr_vu_bench` lo comprueba sin el juego.
+3. **Rasterizado**: coste por píxel (direcciones de VRAM por fila/columna, bucles de sprite especializados).
+4. **Envío de primitivas al GS**: cada triángulo copia el estado completo del GS al montarse y al encolarse.
+5. Latencia del mando: con ~10 fps hay hasta ~2 frames en la cola de VIF1/GS.
+6. Llegar al menú principal sin pasar por la misión y empezar una partida nueva; escuchar el audio.
 
 ## Observaciones
 
-- Pipeline del GS: en raras ocasiones (1 frame de cada ~50 en algunas ejecuciones) aparecen unos pocos píxeles
-  morados en rejilla; con las barreras actuales no se ha podido reproducir a voluntad. `PS2X_GS_SELF_NOW=0`,
+- Pipeline del GS: en la batalla, ~3-4 % de los frames volcados tienen bloques morados de 8×8 (de unos cientos a
+  varios miles de píxeles, a veces media pantalla); pasa igual con la build del parche `0012`, así que es una
+  carrera anterior del pipeline de franjas, no del reloj real. `tools/purple_scan.ps1` (umbral `b > g+25`, `r > g+15`,
+  `g < 10` sobre los PNG de `TTR_FRAME_DUMP`) los cuenta; el frame 1100 tiene 4 píxeles de contenido real. `PS2X_GS_SELF_NOW=0`,
   `PS2X_GS_SELF_COPY=0`, `PS2X_GS_IMMEDIATE_UPLOAD=0` y `PS2X_GS_SHADOW_CLUT=0` desactivan cada optimización para
   aislarlo.
 

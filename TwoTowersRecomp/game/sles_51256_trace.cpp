@@ -20,6 +20,7 @@
 #include "runtime/ps2_memory.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -160,6 +161,17 @@ namespace ttr::sles51256
 
         void logAnimPasses();
 
+        // Frames the game has finished drawing (ClDisplay::end), for the frame-dump log.
+        std::atomic<uint32_t> g_gameFrames{0};
+
+#if TTR_HAS_GENERATED_CODE
+        void countDisplayEnd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            g_gameFrames.fetch_add(1u, std::memory_order_relaxed);
+            end__9ClDisplayFv_0x17cf10(rdram, ctx, runtime);
+        }
+#endif
+
         void dumpFrameIfDue(uint8_t *rdram, PS2Runtime *runtime)
         {
             static uint32_t vblanks = 0;
@@ -169,12 +181,31 @@ namespace ttr::sles51256
             {
                 return;
             }
+            // Since the previous dump: game frames and VBlanks per second of host time, and the share of
+            // EE time that PS2X_REALTIME added to keep up with the host clock.
+            static auto lastTime = start;
+            static uint32_t lastFrames = 0u;
+            static uint64_t lastSkipped = 0u;
+            static uint64_t lastCycle = 0u;
+            const auto now = std::chrono::steady_clock::now();
+            const double interval = std::max(1e-6, std::chrono::duration<double>(now - lastTime).count());
+            const uint32_t frames = g_gameFrames.load(std::memory_order_relaxed);
+            const uint64_t skipped = runtime->eeScheduler().realtimeSkippedCycles();
+            const uint64_t cycle = runtime->eeScheduler().eeCycle();
+            char rates[96];
+            std::snprintf(rates, sizeof(rates), " fps=%.1f vbps=%.1f rt-skip=%.0f%%", (frames - lastFrames) / interval,
+                          config.every / interval,
+                          cycle > lastCycle ? 100.0 * static_cast<double>(skipped - lastSkipped) / static_cast<double>(cycle - lastCycle) : 0.0);
+            lastTime = now;
+            lastFrames = frames;
+            lastSkipped = skipped;
+            lastCycle = cycle;
             char name[32];
             std::snprintf(name, sizeof(name), "frame_%06u.png", vblanks);
             const bool saved = ttr::debug::dumpPresentedFrame(*runtime, config.directory / name);
             const uint32_t current = ram32(rdram, kTheGame + 4u);
             const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-            std::cout << "[ttr:frame] vblank=" << vblanks << " t=" << static_cast<int>(seconds) << "s " << name
+            std::cout << "[ttr:frame] vblank=" << vblanks << " t=" << static_cast<int>(seconds) << "s" << rates << ' ' << name
                       << (saved ? "" : " (no frame)")
                       << " game.mode=" << ram32(rdram, kTheGame) << std::hex
                       << " game.current=0x" << current
@@ -1078,6 +1109,7 @@ namespace ttr::sles51256
         }
         if (frameDumpConfig().enabled)
         {
+            runtime.replaceFunction(0x0017CF10u, &countDisplayEnd);
             std::cout << "[ttr] dumping a frame every " << frameDumpConfig().every << " VBlanks to "
                       << frameDumpConfig().directory.string() << std::endl;
         }
