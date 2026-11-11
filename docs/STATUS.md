@@ -298,6 +298,10 @@ Reparto en la batalla (`PS2X_VIF1_STATS=1`, `PS2X_GS_STATS=1`):
 
 ## Siguiente
 
+**Objetivo actual: el juego tal cual en PS2 pero a 60 fps.** El plan detallado, con las medidas por hilo, el
+rediseño del GS y las tareas en orden, está en [PLAN_60FPS.md](PLAN_60FPS.md); los puntos 1-5 de esta lista
+quedan desarrollados allí.
+
 1. **Subidas de textura sin barreras**: versiones de página. Si solo hay lectores en vuelo de la textura vieja,
    el hilo del GS escribiría la subida en una copia de las páginas y los lotes siguientes leerían de esa copia
    (la caché de páginas de cada hilo ya copia páginas de 8 KiB: bastaría con resolver la página por lote); el

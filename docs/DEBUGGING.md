@@ -12,7 +12,7 @@ runtime están desactivados por defecto (`-DTTR_VERBOSE_RUNTIME_LOGS=ON` los act
 | Variable | Efecto |
 | --- | --- |
 | `TTR_FRAME_DUMP=<carpeta>` | Guarda el frame presentado como PNG cada `TTR_FRAME_DUMP_EVERY` VBlanks (50 por defecto) y registra el tiempo real transcurrido (`t=`), desde el volcado anterior los fotogramas que el juego ha terminado por segundo (`fps=`, llamadas a `ClDisplay::end`), los VBlanks por segundo (`vbps=`) y la parte del tiempo del EE que el reloj real ha saltado (`rt-skip=`), el modo de `ClGame` y los hilos del EE y del IOP |
-| `TTR_PROFILE=<segundos>[,<n>]` | Perfilador por muestreo (Windows): toma el puntero de instrucción de todos los hilos cada milisegundo y, cada `<segundos>`, imprime las funciones más calientes y, por hilo, su ocupación y sus `<n>` funciones principales (8 por defecto). Necesita los símbolos de la build `RelWithDebInfo` o `Debug` |
+| `TTR_PROFILE=<segundos>[,<n>]` | Perfilador por muestreo (Windows): suspende cada hilo, recorre su pila y, cada `<segundos>`, imprime por cada hilo con más de un 5 % de ocupación: `[profile] thread <id> busy x% of <n> samples`, las `<n>` funciones principales como `self x% incl y% <función>`, las principales por tiempo inclusivo (`incl`) y hasta 24 líneas `from x% <hoja> <- <llamante>` para las hojas compartidas (`memmove`, montón, código del JIT). Los porcentajes son sobre todas las muestras del hilo, esperas incluidas; la pila se corta en el código del JIT de VU. Necesita los símbolos de la build `RelWithDebInfo` o `Debug`. Para leerlo: `tools/perf/prof_report.py` |
 | `PS2X_REALTIME=0` | Sin reloj real (parche `0013`): el tiempo del EE (VBlanks, temporizadores, IOP) solo avanza con los ciclos que cobra el código generado, así que el juego va a cámara lenta cuando el PC no llega |
 | `PS2X_VIF1_QUEUE=<n>` | Transferencias de VIF1 sin procesar a partir de las cuales lanzar otra espera (2 por defecto; `0` sin límite) |
 | `PS2X_GS_THREADS=<n>` | Hilos extra del rasterizador del GS (parches `0005`/`0006`; por defecto, los de la CPU menos 3); `0` lo dibuja todo en el hilo del GS |
@@ -74,6 +74,8 @@ Start durante la misión abre la pausa (Opciones / Salir a Menú).
 
 | Herramienta | Uso |
 | --- | --- |
+| `tools/perf/run_battle.sh <carpeta> <segundos> [preset]` | Arranca el juego, entra en la batalla del prólogo con un guion de mando, vuelca frames y deja `run.log` y `mem.log` en la carpeta; al acabar mata el proceso. Las variables de entorno puestas delante pasan al juego. Detalles en `docs/PLAN_60FPS.md`, sección 3 |
+| `tools/perf/prof_report.py <run.log> [informe] [regex] [líneas]` | Extrae de un `run.log` el informe de `TTR_PROFILE` (`-1` = el último) de los hilos cuyo bloque case con la expresión regular: EE `dispatchGuestBranch`, VIF1 `Vif1Worker::run`, GS `GSAsyncBackend::run`, raster `GSBandPipeline::workerLoop` |
 | `tools/purple_scan.ps1 <carpeta> [vblank]` | Cuenta en los PNG de `TTR_FRAME_DUMP` (desde un VBlank, 1100 por defecto) los píxeles morados de las carreras del pipeline del GS; tras cualquier cambio del GS, comparar varias ejecuciones con la referencia |
 | `tools/disasm.py <símbolo|dirección>` | Desensamblado R5900 del ELF; `--sym <dir>` resuelve a símbolo, `--find <texto>` busca símbolos, `--gpref=-0x7120` lista los accesos a una global relativa a `$gp` |
 | `tools/vu_disasm.py <volcado> [--start <dir>] [--count <n>]` | Desensamblado de microcódigo VU0/VU1 (pares upper/lower) de un volcado de memoria de código |
