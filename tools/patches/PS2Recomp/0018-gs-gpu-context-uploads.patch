@@ -1,0 +1,612 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 29e9fba..700ce5e 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -386,6 +386,8 @@ add_library(ps2_runtime STATIC
+     src/lib/gs/gs_async_backend.cpp
+     src/lib/gs/gs_capture.cpp
+     src/lib/gs/gs_swizzle.cpp
++    src/lib/gs/gs_gpu_context.cpp
++    src/lib/gs/gs_gpu_backend.cpp
+     src/lib/ps2_iop_host.cpp
+     src/lib/ps2_memory.cpp
+     src/lib/ps2_pad.cpp
+diff --git a/ps2xRuntime/include/runtime/gs/gs_gpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_gpu_backend.h
+new file mode 100644
+index 0000000..ba4b7d1
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/gs/gs_gpu_backend.h
+@@ -0,0 +1,49 @@
++#pragma once
++
++#include "runtime/gs/gs_gpu_context.h"
++#include "runtime/gs/gs_types.h"
++
++#include <cstdint>
++#include <memory>
++#include <string>
++#include <vector>
++
++// The GS on the GPU (docs/PLAN_60FPS.md, section 6.3): GS local memory is a 4 MiB shader storage buffer and
++// every command runs as a compute dispatch with the same addressing and per-pixel rules as GSCpuBackend.
++// Built up milestone by milestone; so far (G1) host-to-local transfers. The caller makes the context current.
++class GSGpuBackend
++{
++public:
++    // Null (and `error` set) without an OpenGL 4.3 context or when a shader does not compile.
++    static std::unique_ptr<GSGpuBackend> Create(std::string &error);
++    ~GSGpuBackend();
++
++    GSGpuContext &Context() { return *m_gpu; }
++
++    // VRAM from / to host memory (4 MiB).
++    void LoadVram(const uint8_t *vram, size_t bytes);
++    void ReadVram(std::vector<uint8_t> &out);
++
++    // Host-to-local transfers, as GSCpuBackend::BeginTransfer / UploadImage (direction 0 only).
++    void BeginTransfer(const GSTransferCommand &command);
++    void UploadImage(const uint8_t *data, uint32_t sizeBytes);
++
++private:
++    GSGpuBackend() = default;
++    bool Build(std::string &error);
++
++    std::unique_ptr<GSGpuContext> m_gpu;
++    uint32_t m_vram = 0;      // 1 Mi uint words
++    uint32_t m_swizzle = 0;   // GSSwizzle tables of every layout
++    uint32_t m_staging = 0;   // upload data
++    size_t m_stagingSize = 0;
++    uint32_t m_uploadProgram = 0;
++    // Where each layout's tables start in m_swizzle (in words), by layout index.
++    std::vector<uint32_t> m_layoutOffset;
++
++    // The host-to-local transfer in progress (as GSCpuBackend's m_transfer / m_transferState).
++    GSTransferCommand m_transfer{};
++    uint32_t m_copied = 0;
++    uint32_t m_total = 0;
++    bool m_active = false;
++};
+diff --git a/ps2xRuntime/include/runtime/gs/gs_gpu_context.h b/ps2xRuntime/include/runtime/gs/gs_gpu_context.h
+new file mode 100644
+index 0000000..ce3212f
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/gs/gs_gpu_context.h
+@@ -0,0 +1,49 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++#include <string>
++
++// OpenGL 4.3 compute context for the GPU GS (docs/PLAN_60FPS.md, section 6.3): a hidden GLFW window whose
++// context the GS thread makes current, the few GL functions it needs (loaded here, independent of raylib's
++// loader) and small helpers for storage buffers and compute programs.
++//
++// GLFW creates windows only on the main thread: Create() must run there; MakeCurrent() then binds the context
++// to the calling thread (one thread at a time).
++class GSGpuContext
++{
++public:
++    // Null (and `error` set) when OpenGL 4.3 is not available.
++    static std::unique_ptr<GSGpuContext> Create(std::string &error);
++    ~GSGpuContext();
++
++    void MakeCurrent();
++    void ReleaseCurrent();
++    const std::string &Renderer() const { return m_renderer; }
++
++    // Shader storage buffers.
++    uint32_t CreateBuffer(size_t bytes, const void *data = nullptr);
++    void DeleteBuffer(uint32_t buffer);
++    void Upload(uint32_t buffer, size_t offset, size_t bytes, const void *data);
++    void Download(uint32_t buffer, size_t offset, size_t bytes, void *data);
++    void BindStorage(uint32_t binding, uint32_t buffer);
++
++    // Compute programs (GLSL 4.30 source without the #version line). Returns 0 and sets `error` on failure.
++    uint32_t CreateProgram(const std::string &source, std::string &error);
++    void UseProgram(uint32_t program);
++    void SetUniform(uint32_t program, const char *name, uint32_t value);
++    void SetUniform(uint32_t program, const char *name, int32_t value);
++    void Dispatch(uint32_t groupsX, uint32_t groupsY = 1, uint32_t groupsZ = 1);
++    // Shader storage writes become visible to later dispatches and buffer reads.
++    void Barrier();
++    void Finish();
++
++    struct Functions;
++
++private:
++    GSGpuContext() = default;
++    void *m_window = nullptr;
++    std::unique_ptr<Functions> m_gl;
++    std::string m_renderer;
++};
+diff --git a/ps2xRuntime/src/lib/gs/gs_gpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_gpu_backend.cpp
+new file mode 100644
+index 0000000..e462048
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_gpu_backend.cpp
+@@ -0,0 +1,249 @@
++#include "runtime/gs/gs_gpu_backend.h"
++
++#include "runtime/gs/gs_swizzle.h"
++#include "runtime/gs/ps2_gs_memory.h"
++
++#include <algorithm>
++#include <cstring>
++
++namespace
++{
++    // Layouts with their own GSSwizzle tables, in the order they are stored on the GPU.
++    constexpr uint8_t kLayouts[] = {GS_PSM_CT32, GS_PSM_Z32, GS_PSM_CT16, GS_PSM_CT16S, GS_PSM_Z16, GS_PSM_Z16S, GS_PSM_T8, GS_PSM_T4};
++    constexpr uint32_t kHeaderWords = 8u;
++    constexpr uint32_t kRowWords = 128u;
++    constexpr uint32_t kColumns = 2048u;
++
++    int layoutIndex(uint32_t psm)
++    {
++        switch (psm)
++        {
++        case GS_PSM_CT32: case GS_PSM_CT24: case GS_PSM_T8H: case GS_PSM_T4HL: case GS_PSM_T4HH: return 0;
++        case GS_PSM_Z32: case GS_PSM_Z24: return 1;
++        case GS_PSM_CT16: return 2;
++        case GS_PSM_CT16S: return 3;
++        case GS_PSM_Z16: return 4;
++        case GS_PSM_Z16S: return 5;
++        case GS_PSM_T8: return 6;
++        case GS_PSM_T4: return 7;
++        default: return -1;
++        }
++    }
++
++    // How a format's pixels are written: 1 32-bit, 2 24-bit, 3 16-bit, 4 8-bit, 5 4-bit, 6 8H, 7 4HL, 8 4HH.
++    uint32_t writeKind(uint32_t psm)
++    {
++        switch (psm)
++        {
++        case GS_PSM_CT32: case GS_PSM_Z32: return 1u;
++        case GS_PSM_CT24: case GS_PSM_Z24: return 2u;
++        case GS_PSM_CT16: case GS_PSM_CT16S: case GS_PSM_Z16: case GS_PSM_Z16S: return 3u;
++        case GS_PSM_T8: return 4u;
++        case GS_PSM_T4: return 5u;
++        case GS_PSM_T8H: return 6u;
++        case GS_PSM_T4HL: return 7u;
++        case GS_PSM_T4HH: return 8u;
++        default: return 0u;
++        }
++    }
++
++    // Shared GLSL: VRAM, the swizzle tables (GSSwizzle::AddressFast) and partial word writes.
++    const char *const kCommonGlsl = R"(
++layout(std430, binding = 0) buffer Vram { uint vram[]; };
++layout(std430, binding = 1) readonly buffer Swizzle { uint sw[]; };
++
++// GSSwizzle::AddressFast for the layout whose tables start at word `tables`.
++uint swAddress(uint tables, uint base, uint rowStride, uint x, uint y)
++{
++    uint pageHShift = sw[tables + 1u];
++    uint pageHMask = sw[tables + 2u];
++    uint periodMask = sw[tables + 3u];
++    uint inPage = y & pageHMask;
++    return base + (y >> pageHShift) * rowStride + sw[tables + 8u + inPage] +
++           sw[tables + 8u + 128u + (inPage & periodMask) * 2048u + (x & 2047u)];
++}
++
++// bits [shift, shift + width) of the byte at `byteAddress` (inside one word) = value; other threads may write
++// the other bits of the word at the same time.
++void writeBits(uint byteAddress, uint shift, uint width, uint value)
++{
++    uint word = byteAddress >> 2u;
++    uint bitShift = (byteAddress & 3u) * 8u + shift;
++    uint mask = (width == 32u ? 0xFFFFFFFFu : ((1u << width) - 1u)) << bitShift;
++    atomicAnd(vram[word], ~mask);
++    atomicOr(vram[word], (value << bitShift) & mask);
++}
++)";
++
++    // GSCpuBackend::UploadImageUnlocked for `count` pixels from `first` (one thread per pixel).
++    const char *const kUploadGlsl = R"(
++layout(local_size_x = 256) in;
++layout(std430, binding = 2) readonly buffer Data { uint data[]; };
++uniform uint tables;
++uniform uint base;
++uniform uint rowStride;
++uniform uint kind;
++uniform uint dsax;
++uniform uint dsay;
++uniform uint rrw;
++uniform uint first;
++uniform uint count;
++
++uint dataByte(uint i) { return (data[i >> 2u] >> ((i & 3u) * 8u)) & 0xFFu; }
++
++void main()
++{
++    uint k = gl_GlobalInvocationID.x;
++    if (k >= count)
++        return;
++    uint g = first + k;
++    uint x = dsax + g % rrw;
++    uint y = dsay + g / rrw;
++    uint pixel = swAddress(tables, base, rowStride, x, y);
++    if (kind == 1u)
++    {
++        vram[pixel & 0xFFFFFu] = dataByte(4u * k) | (dataByte(4u * k + 1u) << 8u) | (dataByte(4u * k + 2u) << 16u) |
++                                 (dataByte(4u * k + 3u) << 24u);
++    }
++    else if (kind == 2u)
++    {
++        uint value = dataByte(3u * k) | (dataByte(3u * k + 1u) << 8u) | (dataByte(3u * k + 2u) << 16u);
++        uint word = pixel & 0xFFFFFu;
++        vram[word] = (vram[word] & 0xFF000000u) | value;
++    }
++    else if (kind == 3u)
++        writeBits((pixel * 2u) & 0x3FFFFEu, 0u, 16u, dataByte(2u * k) | (dataByte(2u * k + 1u) << 8u));
++    else if (kind == 4u)
++        writeBits(pixel & 0x3FFFFFu, 0u, 8u, dataByte(k));
++    else if (kind == 6u)
++        writeBits((pixel * 4u + 3u) & 0x3FFFFFu, 0u, 8u, dataByte(k));
++    else
++    {
++        uint nibble = (dataByte(k >> 1u) >> ((k & 1u) * 4u)) & 0xFu;
++        if (kind == 5u)
++            writeBits((pixel >> 1u) & 0x3FFFFFu, (pixel & 1u) * 4u, 4u, nibble);
++        else
++            writeBits((pixel * 4u + 3u) & 0x3FFFFFu, kind == 8u ? 4u : 0u, 4u, nibble);
++    }
++}
++)";
++}
++
++std::unique_ptr<GSGpuBackend> GSGpuBackend::Create(std::string &error)
++{
++    std::unique_ptr<GSGpuBackend> backend(new GSGpuBackend());
++    backend->m_gpu = GSGpuContext::Create(error);
++    if (!backend->m_gpu)
++        return nullptr;
++    backend->m_gpu->MakeCurrent();
++    if (!backend->Build(error))
++        return nullptr;
++    return backend;
++}
++
++GSGpuBackend::~GSGpuBackend()
++{
++    if (m_gpu)
++    {
++        m_gpu->DeleteBuffer(m_vram);
++        m_gpu->DeleteBuffer(m_swizzle);
++        if (m_staging)
++            m_gpu->DeleteBuffer(m_staging);
++    }
++}
++
++bool GSGpuBackend::Build(std::string &error)
++{
++    GSMem::InitLookupTables();
++    // Swizzle tables: per layout a header (shifts, masks, sizes), the row parts and the column parts.
++    std::vector<uint32_t> tables;
++    for (uint8_t psm : kLayouts)
++    {
++        const GSSwizzle::Format &f = *GSSwizzle::Get(psm);
++        m_layoutOffset.push_back(static_cast<uint32_t>(tables.size()));
++        const uint32_t header[kHeaderWords] = {f.pageWShift, f.pageHShift, f.pageHMask, f.periodMask,
++                                               f.pixelsPerPage, f.pixelsPerBlock, f.period, 0u};
++        tables.insert(tables.end(), header, header + kHeaderWords);
++        tables.insert(tables.end(), f.rowIn, f.rowIn + kRowWords);
++        tables.insert(tables.end(), f.col, f.col + static_cast<size_t>(f.period) * kColumns);
++    }
++    m_swizzle = m_gpu->CreateBuffer(tables.size() * 4u, tables.data());
++    m_vram = m_gpu->CreateBuffer(GSMem::MEMORY_SIZE);
++    m_uploadProgram = m_gpu->CreateProgram(std::string(kCommonGlsl) + kUploadGlsl, error);
++    return m_uploadProgram != 0u;
++}
++
++void GSGpuBackend::LoadVram(const uint8_t *vram, size_t bytes)
++{
++    m_gpu->Upload(m_vram, 0, std::min<size_t>(bytes, GSMem::MEMORY_SIZE), vram);
++}
++
++void GSGpuBackend::ReadVram(std::vector<uint8_t> &out)
++{
++    out.resize(GSMem::MEMORY_SIZE);
++    m_gpu->Barrier();
++    m_gpu->Download(m_vram, 0, out.size(), out.data());
++}
++
++void GSGpuBackend::BeginTransfer(const GSTransferCommand &command)
++{
++    m_transfer = command;
++    m_copied = 0u;
++    m_total = static_cast<uint32_t>(command.trxreg.rrw) * static_cast<uint32_t>(command.trxreg.rrh);
++    m_active = command.direction == 0u && m_total != 0u;
++}
++
++void GSGpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
++{
++    // The pixels this chunk carries, as UploadImageUnlocked consumes them (an incomplete last pixel is dropped).
++    if (!m_active || !data || sizeBytes == 0u)
++        return;
++    const uint32_t psm = m_transfer.bitbltbuf.dpsm;
++    const uint32_t kind = writeKind(psm);
++    const int layout = layoutIndex(psm);
++    if (kind == 0u || layout < 0)
++        return;
++    const uint32_t remaining = m_total - m_copied;
++    uint32_t count = 0u;
++    switch (kind)
++    {
++    case 1u: count = std::min(remaining, sizeBytes / 4u); break;
++    case 2u: count = std::min(remaining, sizeBytes / 3u); break;
++    case 3u: count = std::min(remaining, sizeBytes / 2u); break;
++    case 4u:
++    case 6u: count = std::min(remaining, sizeBytes); break;
++    default: count = static_cast<uint32_t>(std::min<uint64_t>(remaining, static_cast<uint64_t>(sizeBytes) * 2u)); break;
++    }
++    if (count != 0u)
++    {
++        const size_t bytes = (static_cast<size_t>(sizeBytes) + 3u) & ~size_t{3u};
++        if (bytes > m_stagingSize)
++        {
++            if (m_staging)
++                m_gpu->DeleteBuffer(m_staging);
++            m_stagingSize = std::max<size_t>(bytes, 64u * 1024u);
++            m_staging = m_gpu->CreateBuffer(m_stagingSize);
++        }
++        m_gpu->Upload(m_staging, 0, sizeBytes, data);
++        const GSSwizzle::Format &format = *GSSwizzle::Get(kLayouts[layout]);
++        const uint32_t dbw = std::max<uint32_t>(m_transfer.bitbltbuf.dbw, 1u);
++        m_gpu->UseProgram(m_uploadProgram);
++        m_gpu->SetUniform(m_uploadProgram, "tables", m_layoutOffset[static_cast<size_t>(layout)]);
++        m_gpu->SetUniform(m_uploadProgram, "base", GSSwizzle::Base(format, m_transfer.bitbltbuf.dbp));
++        m_gpu->SetUniform(m_uploadProgram, "rowStride", GSSwizzle::RowStride(format, dbw));
++        m_gpu->SetUniform(m_uploadProgram, "kind", kind);
++        m_gpu->SetUniform(m_uploadProgram, "dsax", static_cast<uint32_t>(m_transfer.trxpos.dsax));
++        m_gpu->SetUniform(m_uploadProgram, "dsay", static_cast<uint32_t>(m_transfer.trxpos.dsay));
++        m_gpu->SetUniform(m_uploadProgram, "rrw", static_cast<uint32_t>(m_transfer.trxreg.rrw));
++        m_gpu->SetUniform(m_uploadProgram, "first", m_copied);
++        m_gpu->SetUniform(m_uploadProgram, "count", count);
++        m_gpu->BindStorage(0, m_vram);
++        m_gpu->BindStorage(1, m_swizzle);
++        m_gpu->BindStorage(2, m_staging);
++        m_gpu->Dispatch((count + 255u) / 256u);
++        m_gpu->Barrier();
++    }
++    m_copied += count;
++    if (m_copied >= m_total)
++        m_active = false;
++}
+diff --git a/ps2xRuntime/src/lib/gs/gs_gpu_context.cpp b/ps2xRuntime/src/lib/gs/gs_gpu_context.cpp
+new file mode 100644
+index 0000000..8e656ee
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_gpu_context.cpp
+@@ -0,0 +1,228 @@
++#include "runtime/gs/gs_gpu_context.h"
++
++#define GLFW_INCLUDE_NONE
++#include "GLFW/glfw3.h"
++
++#include <vector>
++
++namespace
++{
++    using GLenum = unsigned int;
++    using GLuint = unsigned int;
++    using GLint = int;
++    using GLsizei = int;
++    using GLbitfield = unsigned int;
++    using GLchar = char;
++    using GLintptr = std::ptrdiff_t;
++    using GLsizeiptr = std::ptrdiff_t;
++    using GLubyte = unsigned char;
++
++    constexpr GLenum GL_SHADER_STORAGE_BUFFER = 0x90D2;
++    constexpr GLenum GL_DYNAMIC_DRAW = 0x88E8;
++    constexpr GLenum GL_COMPUTE_SHADER = 0x91B9;
++    constexpr GLenum GL_COMPILE_STATUS = 0x8B81;
++    constexpr GLenum GL_LINK_STATUS = 0x8B82;
++    constexpr GLenum GL_INFO_LOG_LENGTH = 0x8B84;
++    constexpr GLenum GL_RENDERER = 0x1F01;
++    constexpr GLenum GL_VERSION = 0x1F02;
++    constexpr GLbitfield GL_SHADER_STORAGE_BARRIER_BIT = 0x00002000;
++    constexpr GLbitfield GL_BUFFER_UPDATE_BARRIER_BIT = 0x00000200;
++}
++
++#define GS_GL_FUNCTIONS(X)                                                                          \
++    X(void, GenBuffers, (GLsizei n, GLuint * buffers))                                              \
++    X(void, DeleteBuffers, (GLsizei n, const GLuint *buffers))                                      \
++    X(void, BindBuffer, (GLenum target, GLuint buffer))                                             \
++    X(void, BindBufferBase, (GLenum target, GLuint index, GLuint buffer))                           \
++    X(void, BufferData, (GLenum target, GLsizeiptr size, const void *data, GLenum usage))           \
++    X(void, BufferSubData, (GLenum target, GLintptr offset, GLsizeiptr size, const void *data))     \
++    X(void, GetBufferSubData, (GLenum target, GLintptr offset, GLsizeiptr size, void *data))        \
++    X(GLuint, CreateShader, (GLenum type))                                                          \
++    X(void, ShaderSource, (GLuint shader, GLsizei count, const GLchar *const *string, const GLint *length)) \
++    X(void, CompileShader, (GLuint shader))                                                         \
++    X(void, GetShaderiv, (GLuint shader, GLenum pname, GLint * params))                             \
++    X(void, GetShaderInfoLog, (GLuint shader, GLsizei bufSize, GLsizei * length, GLchar * infoLog)) \
++    X(void, DeleteShader, (GLuint shader))                                                          \
++    X(GLuint, CreateProgram, (void))                                                                \
++    X(void, AttachShader, (GLuint program, GLuint shader))                                          \
++    X(void, LinkProgram, (GLuint program))                                                          \
++    X(void, GetProgramiv, (GLuint program, GLenum pname, GLint * params))                           \
++    X(void, GetProgramInfoLog, (GLuint program, GLsizei bufSize, GLsizei * length, GLchar * infoLog)) \
++    X(void, UseProgram, (GLuint program))                                                           \
++    X(GLint, GetUniformLocation, (GLuint program, const GLchar *name))                              \
++    X(void, Uniform1ui, (GLint location, GLuint v0))                                                \
++    X(void, Uniform1i, (GLint location, GLint v0))                                                  \
++    X(void, DispatchCompute, (GLuint x, GLuint y, GLuint z))                                        \
++    X(void, MemoryBarrier, (GLbitfield barriers))                                                   \
++    X(void, Finish, (void))                                                                         \
++    X(const GLubyte *, GetString, (GLenum name))
++
++struct GSGpuContext::Functions
++{
++#define GS_GL_DECLARE(ret, name, args) ret (*name) args = nullptr;
++    GS_GL_FUNCTIONS(GS_GL_DECLARE)
++#undef GS_GL_DECLARE
++};
++
++std::unique_ptr<GSGpuContext> GSGpuContext::Create(std::string &error)
++{
++    if (!glfwInit())
++    {
++        error = "glfwInit failed";
++        return nullptr;
++    }
++    glfwDefaultWindowHints();
++    glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
++    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
++    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
++    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
++    GLFWwindow *previous = glfwGetCurrentContext();
++    GLFWwindow *window = glfwCreateWindow(16, 16, "ps2x-gs", nullptr, nullptr);
++    glfwDefaultWindowHints();
++    if (!window)
++    {
++        error = "no OpenGL 4.3 context";
++        return nullptr;
++    }
++    std::unique_ptr<GSGpuContext> context(new GSGpuContext());
++    context->m_window = window;
++    context->m_gl = std::make_unique<Functions>();
++    glfwMakeContextCurrent(window);
++    Functions &gl = *context->m_gl;
++    bool missing = false;
++#define GS_GL_LOAD(ret, name, args)                                                                  \
++    gl.name = reinterpret_cast<ret(*) args>(glfwGetProcAddress("gl" #name));               \
++    if (!gl.name)                                                                                   \
++    {                                                                                               \
++        error = "missing gl" #name;                                                                 \
++        missing = true;                                                                             \
++    }
++    GS_GL_FUNCTIONS(GS_GL_LOAD)
++#undef GS_GL_LOAD
++    if (!missing)
++    {
++        const GLubyte *renderer = gl.GetString(GL_RENDERER);
++        const GLubyte *version = gl.GetString(GL_VERSION);
++        context->m_renderer = std::string(renderer ? reinterpret_cast<const char *>(renderer) : "?") + ", OpenGL " +
++                              (version ? reinterpret_cast<const char *>(version) : "?");
++    }
++    glfwMakeContextCurrent(previous);
++    if (missing)
++        return nullptr;
++    return context;
++}
++
++GSGpuContext::~GSGpuContext()
++{
++    if (m_window)
++        glfwDestroyWindow(static_cast<GLFWwindow *>(m_window));
++}
++
++void GSGpuContext::MakeCurrent()
++{
++    glfwMakeContextCurrent(static_cast<GLFWwindow *>(m_window));
++}
++
++void GSGpuContext::ReleaseCurrent()
++{
++    glfwMakeContextCurrent(nullptr);
++}
++
++uint32_t GSGpuContext::CreateBuffer(size_t bytes, const void *data)
++{
++    GLuint buffer = 0;
++    m_gl->GenBuffers(1, &buffer);
++    m_gl->BindBuffer(GL_SHADER_STORAGE_BUFFER, buffer);
++    m_gl->BufferData(GL_SHADER_STORAGE_BUFFER, static_cast<GLsizeiptr>(bytes), data, GL_DYNAMIC_DRAW);
++    return buffer;
++}
++
++void GSGpuContext::DeleteBuffer(uint32_t buffer)
++{
++    const GLuint id = buffer;
++    m_gl->DeleteBuffers(1, &id);
++}
++
++void GSGpuContext::Upload(uint32_t buffer, size_t offset, size_t bytes, const void *data)
++{
++    m_gl->BindBuffer(GL_SHADER_STORAGE_BUFFER, buffer);
++    m_gl->BufferSubData(GL_SHADER_STORAGE_BUFFER, static_cast<GLintptr>(offset), static_cast<GLsizeiptr>(bytes), data);
++}
++
++void GSGpuContext::Download(uint32_t buffer, size_t offset, size_t bytes, void *data)
++{
++    m_gl->MemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
++    m_gl->BindBuffer(GL_SHADER_STORAGE_BUFFER, buffer);
++    m_gl->GetBufferSubData(GL_SHADER_STORAGE_BUFFER, static_cast<GLintptr>(offset), static_cast<GLsizeiptr>(bytes), data);
++}
++
++void GSGpuContext::BindStorage(uint32_t binding, uint32_t buffer)
++{
++    m_gl->BindBufferBase(GL_SHADER_STORAGE_BUFFER, binding, buffer);
++}
++
++uint32_t GSGpuContext::CreateProgram(const std::string &source, std::string &error)
++{
++    const std::string full = "#version 430\n" + source;
++    const GLchar *text = full.c_str();
++    const GLuint shader = m_gl->CreateShader(GL_COMPUTE_SHADER);
++    m_gl->ShaderSource(shader, 1, &text, nullptr);
++    m_gl->CompileShader(shader);
++    GLint ok = 0;
++    m_gl->GetShaderiv(shader, GL_COMPILE_STATUS, &ok);
++    if (!ok)
++    {
++        GLint length = 0;
++        m_gl->GetShaderiv(shader, GL_INFO_LOG_LENGTH, &length);
++        std::vector<GLchar> log(static_cast<size_t>(length > 0 ? length : 1), 0);
++        m_gl->GetShaderInfoLog(shader, static_cast<GLsizei>(log.size()), nullptr, log.data());
++        error = std::string("compute shader: ") + log.data();
++        m_gl->DeleteShader(shader);
++        return 0;
++    }
++    const GLuint program = m_gl->CreateProgram();
++    m_gl->AttachShader(program, shader);
++    m_gl->LinkProgram(program);
++    m_gl->DeleteShader(shader);
++    m_gl->GetProgramiv(program, GL_LINK_STATUS, &ok);
++    if (!ok)
++    {
++        GLint length = 0;
++        m_gl->GetProgramiv(program, GL_INFO_LOG_LENGTH, &length);
++        std::vector<GLchar> log(static_cast<size_t>(length > 0 ? length : 1), 0);
++        m_gl->GetProgramInfoLog(program, static_cast<GLsizei>(log.size()), nullptr, log.data());
++        error = std::string("link: ") + log.data();
++        return 0;
++    }
++    return program;
++}
++
++void GSGpuContext::UseProgram(uint32_t program)
++{
++    m_gl->UseProgram(program);
++}
++
++void GSGpuContext::SetUniform(uint32_t program, const char *name, uint32_t value)
++{
++    m_gl->Uniform1ui(m_gl->GetUniformLocation(program, name), value);
++}
++
++void GSGpuContext::SetUniform(uint32_t program, const char *name, int32_t value)
++{
++    m_gl->Uniform1i(m_gl->GetUniformLocation(program, name), value);
++}
++
++void GSGpuContext::Dispatch(uint32_t groupsX, uint32_t groupsY, uint32_t groupsZ)
++{
++    m_gl->DispatchCompute(groupsX, groupsY, groupsZ);
++}
++
++void GSGpuContext::Barrier()
++{
++    m_gl->MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
++}
++
++void GSGpuContext::Finish()
++{
++    m_gl->Finish();
++}

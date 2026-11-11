@@ -816,6 +816,7 @@ fase B, ms por frame del banco con 9 hilos.
 | E1 VBlank a 60 Hz | pendiente | | |
 | E2 Latencia y regularidad | pendiente | | |
 | F1 Cierre | pendiente | | |
+| G0-G7 GS en la GPU | G0 y G1 hechos (ver 6.3) | subidas: 78 813 transferencias, VRAM idéntica | `0018` |
 
 ### 6.1 Notas de lo hecho (2026-11-11)
 
@@ -931,6 +932,80 @@ Lo que queda en VU1 (perfil): el código emitido es ~53 % del motor (bloques de 
 despacho desde `execute()`, comprobaciones de los primeros pares de cada bloque), `commit` ~10 %, `execute` ~8 %,
 `kick` ~7 %, `jitStall` ~6 %, ITOF/FTOI/DIV/saltos por llamada. Siguiente idea: enlazar bloques (saltar al
 bloque siguiente sin volver a `execute()`), y emitir en línea ITOF/FTOI y los saltos condicionales.
+
+### 6.3 Fase G: el GS en la GPU (decidido el 2026-11-12)
+
+**Por qué.** Con el GS por software el raster no escala más de ~3,7 veces en 6 núcleos y la batalla escribe ~16 M
+de píxeles por frame (sección 6.1). La máquina tiene una GTX 1080 (OpenGL 4.6, compute shaders, `double`).
+
+**Enfoque elegido: GS en compute shaders sobre la VRAM** (como ParaLLEl-GS), no un renderizador clásico por
+hardware. Los 4 MB de VRAM viven en un *shader storage buffer* y cada orden del GS se ejecuta en la GPU con la
+misma tubería por píxel que `GSCpuBackend` y las mismas direcciones entrelazadas (`GSSwizzle`). Así:
+
+- La imagen sigue siendo la de PS2 y se comprueba bit a bit con `ttr_gs_bench` (hashes de VRAM e imagen).
+- No hay caché de texturas ni de *render targets* que adivinar: las vistas CT16 sobre el framebuffer CT32, las
+  lecturas T8 del canal alfa o el Z como textura salen solas porque todo es la misma memoria.
+- Un renderizador clásico sería más rápido de escribir para casos simples, pero en este juego daría diferencias
+  justo en el posproceso (lo que PCSX2 resuelve con heurísticas).
+
+**Exactitud en la GPU (reglas para los shaders):**
+
+- Toda la aritmética de coma flotante con `precise` (GLSL 4.0+): sin FMA implícita ni reordenación.
+- La división de GLSL no está redondeada correctamente: emularla (aproximación + corrección del residuo con
+  `fma` explícita) donde el código de CPU divide por píxel (`tx / spriteW`, `1 / q`, `u / 16` es exacta).
+- Z en `double` como en la CPU (la GTX 1080 hace `double` a 1/32, suficiente para 3 productos y 2 sumas por píxel).
+- Conversiones float→int con truncamiento (`int()` en GLSL trunca) y los mismos *clamps*.
+
+**Arquitectura.**
+
+- `GSGpuBackend` (nuevo `GSRasterBackend`) en el hilo del GS: contexto OpenGL 4.3 propio (ventana GLFW oculta
+  creada en el hilo principal y compartida con el hilo del GS; cargador propio de las ~40 funciones que usa).
+- VRAM: un SSBO de 4 MB. Tablas de `GSSwizzle` y CLUT en SSBO pequeños.
+- Primitivas: se acumulan en lotes en un SSBO (vértices + índice de estado; estados deduplicados). Un pase de
+  *binning* reparte las primitivas por teselas del framebuffer y otro pase dibuja: un grupo de trabajo por
+  tesela recorre en orden las primitivas de su tesela (orden por píxel garantizado, como las franjas de la CPU).
+- Subidas host→local, local→local, cargas de CLUT y borrados: *kernels* propios, en orden, con barreras de
+  memoria entre lotes que dependen unos de otros (lectura tras escritura).
+- Presentación: el *kernel* convierte el rectángulo mostrado a RGBA y se lee de vuelta (~1,3 MB por frame), o se
+  comparte con raylib más adelante. Lecturas de VRAM desde el EE (raras): lectura de vuelta síncrona.
+
+**Hitos** (cada uno verificable con `ttr_gs_bench --gpu`):
+
+| Hito | Qué | Cómo se comprueba |
+| --- | --- | --- |
+| G0 | Contexto de cómputo en el banco, VRAM inicial subida y leída de vuelta | la VRAM leída es igual a la subida |
+| G1 | Subidas host→local en la GPU (todos los formatos) | modo híbrido (abajo): hashes iguales |
+| G2 | Sprites sin textura (relleno, mezcla, Z, máscara) | híbrido |
+| G3 | Sprites con textura (todos los formatos, CLUT, filtro) | híbrido |
+| G4 | Triángulos | híbrido |
+| G5 | Local→local, CLUT desde VRAM, presentación en la GPU | sin híbrido: hashes iguales en las 100 presentaciones |
+| G6 | Integración en el juego (`PS2X_GS_GPU=1`), lecturas del EE | juego + `purple_scan` + capturas |
+| G7 | Rendimiento: *binning*, lotes grandes, sin lecturas de vuelta en el camino | ms por frame en el banco |
+
+**Cómo se comprueba cada hito:** el juego intercala ~800 subidas por frame con el dibujo, así que un modo híbrido
+(leer la VRAM de vuelta y subirla en cada cambio de CPU a GPU) sería inviable. En su lugar, el banco reproduce de
+la captura solo las órdenes que el hito cubre, a la vez en `GSCpuBackend` de un hilo (la referencia) y en la GPU,
+y compara las dos VRAM. Cuando la GPU haga todas las órdenes (G5), la comparación pasa a ser con `ref2.hashes`.
+
+**Estado (2026-11-12):**
+
+- **G0 hecho.** `GSGpuContext` (`src/lib/gs/gs_gpu_context.cpp`): ventana GLFW oculta con contexto OpenGL 4.3
+  propio y cargador propio de las funciones que usa (independiente del de raylib). En la GTX 1080: "OpenGL 4.3.0
+  NVIDIA 582.78". `ttr_gs_bench <captura> --gpu-selftest` sube la VRAM, la copia con un compute shader y la lee de
+  vuelta: idéntica.
+- **G1 hecho.** `GSGpuBackend` (`src/lib/gs/gs_gpu_backend.cpp`): VRAM en un SSBO de 4 MB, tablas de
+  `GSSwizzle` de los 8 diseños de memoria en otro SSBO (`swAddress` en GLSL = `GSSwizzle::AddressFast`), y el
+  *kernel* de subida host→local de todos los formatos, un hilo por píxel, con las mismas reglas que
+  `UploadImageUnlocked` (píxel incompleto al final de un trozo descartado, RMW de 24 bits, escrituras de 16/8/4 bits
+  con `atomicAnd`/`atomicOr` porque comparten palabra con otros píxeles). `ttr_gs_bench <captura> --gpu-uploads`:
+  78 813 transferencias y 724 MB de la batalla, VRAM idéntica a la de la CPU.
+- **Siguiente: G2** (sprites sin textura). Plan: un SSBO con las primitivas del lote (vértices + índice de
+  estado), un SSBO de estados decodificados (`PixelPipe`), y un *kernel* de dibujo con un grupo por tesela de
+  8×8 píxeles del framebuffer que recorre en orden las primitivas que la tocan (primero por fuerza bruta: todas
+  las del lote; el *binning* llega en G7). La prueba: `--gpu-sprites`, reproduciendo subidas + sprites sin textura.
+  Ojo con `writePixelFast`: Z primero, niebla, prueba alfa y sus modos de fallo, DATE, mezcla con `pabe`, `fba`,
+  `fbmsk`, conversión a 16 bits y RMW de 24 bits; todo con enteros salvo nada (sin coma flotante en sprites sin
+  textura salvo `(int)v.x`).
 
 ## 7. Riesgos y avisos
 

@@ -4,6 +4,8 @@
 //   ttr_gs_bench <capture> --hashes <file>        also write one VRAM hash per presentation (flushes there)
 //   ttr_gs_bench --compare-hashes <a> <b>         first presentation whose hashes differ
 //   ttr_gs_bench <capture> --dump-vram <file>     write VRAM after the replay
+//   ttr_gs_bench <capture> --gpu-uploads         host-to-local transfers only, on the CPU and the GPU: same VRAM?
+//   ttr_gs_bench <capture> --gpu-selftest        OpenGL compute context: VRAM through the GPU and back
 //   ttr_gs_bench --selftest                      check the row/column swizzle tables against GSMem
 //   ttr_gs_bench --compare-vram <a> <b>           differing bytes and pages of two VRAM dumps
 //   ttr_gs_bench <capture> --png <prefix>         write every presented frame as <prefix><n>.png
@@ -17,6 +19,8 @@
 // deterministic reference). TTR_PROFILE works as in the game.
 #include "runtime/gs/gs_capture.h"
 #include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/gs/gs_gpu_backend.h"
+#include "runtime/gs/gs_gpu_context.h"
 #include "runtime/gs/gs_swizzle.h"
 #include "debug/sampling_profiler.h"
 
@@ -233,6 +237,8 @@ namespace
         std::string pngPrefix;
         bool stats = false;
         bool listPresents = false;
+        bool gpuSelfTest = false;
+        bool gpuUploads = false;
         uint64_t maxPresents = 0;
         std::string checkHashesPath;
         uint64_t dumpAt = ~0ull;
@@ -297,6 +303,10 @@ int main(int argc, char **argv)
             options.touchingPage = static_cast<int>(std::strtol(argv[++i], nullptr, 10));
         else if (arg == "--from" && i + 1 < argc)
             options.fromPresent = std::strtoull(argv[++i], nullptr, 10);
+        else if (arg == "--gpu-uploads")
+            options.gpuUploads = true;
+        else if (arg == "--gpu-selftest")
+            options.gpuSelfTest = true;
         else if (arg == "--list-presents")
             options.listPresents = true;
         else if (!options.capture && arg[0] != '-')
@@ -323,6 +333,134 @@ int main(int argc, char **argv)
     }
     std::printf("capture: VBlank %u, %.1f MB of records\n", capture.header.firstVblank,
                 static_cast<double>(capture.stream.size()) / 1048576.0);
+
+    if (options.gpuUploads)
+    {
+        // G1: only the host-to-local transfers of the capture, on the CPU (reference) and on the GPU.
+        struct UploadsOnly final : GSRasterBackend
+        {
+            GSCpuBackend *cpu = nullptr;
+            GSGpuBackend *gpu = nullptr;
+            uint64_t transfers = 0, chunks = 0, bytes = 0;
+            void Initialize(uint8_t *, uint32_t) override {}
+            void Reset() override {}
+            void Submit(const GSPrimitiveBatch &) override {}
+            void LoadClut(const GSTex0Reg &, const GSTexClutReg &) override {}
+            void BeginTransfer(const GSTransferCommand &command) override
+            {
+                if (command.direction != 0u)
+                    return; // local-to-local or local-to-host: left out on both sides
+                ++transfers;
+                cpu->BeginTransfer(command);
+                gpu->BeginTransfer(command);
+            }
+            void UploadImage(const uint8_t *data, uint32_t size) override
+            {
+                ++chunks;
+                bytes += size;
+                cpu->UploadImage(data, size);
+                gpu->UploadImage(data, size);
+            }
+            void Flush() override {}
+            void TextureFlush() override {}
+            void Sync(GSSyncReason) override {}
+            PresentationFrame Present(const GSPresentationRequest &) override { return {}; }
+            bool ClearFramebuffer(const GSContext &, uint32_t) override { return false; }
+            uint32_t ConsumeLocalToHostBytes(uint8_t *, uint32_t) override { return 0u; }
+            uint32_t ReadVram(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) const override { return 0u; }
+            void WriteVram(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) override {}
+            void SnapshotVram(std::vector<uint8_t> &) const override {}
+            GSTransferSnapshot GetTransferSnapshot() const override { return {}; }
+        };
+        std::string error;
+        std::unique_ptr<GSGpuBackend> gpu = GSGpuBackend::Create(error);
+        if (!gpu)
+        {
+            std::printf("no GPU backend: %s\n", error.c_str());
+            return 1;
+        }
+        std::printf("GPU: %s\n", gpu->Context().Renderer().c_str());
+        std::vector<uint8_t> cpuVram = capture.vram;
+        GSCpuBackend cpu(false);
+        cpu.Initialize(cpuVram.data(), static_cast<uint32_t>(cpuVram.size()));
+        gpu->LoadVram(capture.vram.data(), capture.vram.size());
+        UploadsOnly uploads;
+        uploads.cpu = &cpu;
+        uploads.gpu = gpu.get();
+        GSCapture::ReplayHooks hooks;
+        hooks.maxPresents = options.maxPresents;
+        const auto start = std::chrono::steady_clock::now();
+        GSCapture::Replay(capture, &uploads, hooks);
+        std::vector<uint8_t> gpuVram;
+        gpu->ReadVram(gpuVram);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        cpu.Flush();
+        size_t differing = 0, first = SIZE_MAX;
+        for (size_t i = 0; i < cpuVram.size(); ++i)
+            if (cpuVram[i] != gpuVram[i])
+            {
+                ++differing;
+                first = std::min(first, i);
+            }
+        std::printf("%llu transfers, %llu chunks, %.1f MB in %.0f ms (CPU and GPU together): ",
+                    static_cast<unsigned long long>(uploads.transfers), static_cast<unsigned long long>(uploads.chunks),
+                    static_cast<double>(uploads.bytes) / 1048576.0, ms);
+        if (differing == 0u)
+            std::printf("VRAM identical\n");
+        else
+            std::printf("%zu bytes DIFFER, first at 0x%zx (page %zu)\n", differing, first, first / 8192u);
+        return differing == 0u ? 0 : 1;
+    }
+
+    if (options.gpuSelfTest)
+    {
+        // G0 (docs/PLAN_60FPS.md 6.3): compute context, the capture's VRAM through the GPU and back.
+        std::string error;
+        std::unique_ptr<GSGpuContext> gpu = GSGpuContext::Create(error);
+        if (!gpu)
+        {
+            std::printf("no GPU context: %s\n", error.c_str());
+            return 1;
+        }
+        gpu->MakeCurrent();
+        std::printf("GPU: %s\n", gpu->Renderer().c_str());
+        const uint32_t words = static_cast<uint32_t>(capture.vram.size() / 4u);
+        const uint32_t source = gpu->CreateBuffer(capture.vram.size(), capture.vram.data());
+        const uint32_t target = gpu->CreateBuffer(capture.vram.size());
+        const uint32_t program = gpu->CreateProgram(R"(
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer Source { uint source[]; };
+layout(std430, binding = 1) writeonly buffer Target { uint target[]; };
+uniform uint words;
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i < words)
+        target[i] = source[i];
+}
+)",
+                                                    error);
+        if (!program)
+        {
+            std::printf("%s\n", error.c_str());
+            return 1;
+        }
+        gpu->UseProgram(program);
+        gpu->SetUniform(program, "words", words);
+        gpu->BindStorage(0, source);
+        gpu->BindStorage(1, target);
+        const auto start = std::chrono::steady_clock::now();
+        gpu->Dispatch((words + 255u) / 256u);
+        gpu->Barrier();
+        std::vector<uint8_t> back(capture.vram.size());
+        gpu->Download(target, 0, back.size(), back.data());
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        const bool same = back == capture.vram;
+        std::printf("VRAM through the GPU: %s (dispatch + 4 MB read back: %.2f ms)\n", same ? "identical" : "DIFFERENT", ms);
+        gpu->DeleteBuffer(source);
+        gpu->DeleteBuffer(target);
+        return same ? 0 : 1;
+    }
 
     if (options.touchingPage >= 0)
     {
