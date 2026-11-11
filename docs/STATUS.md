@@ -303,7 +303,9 @@ desaparecen los bloques morados. Las texturas se leen de copias de sus páginas 
 lotes ya no esperan unos a otros por lo que muestrean; direcciones de VRAM por tablas fila + columna. Con
 `ttr_gs_bench` sobre una captura de la batalla (`PS2X_GS_CAPTURE`): 173 → 101 ms por frame de juego con 9 hilos,
 idéntico bit a bit a la ruta de un hilo. Con `0016` el límite del juego pasa a ser el hilo de VIF1 (99 % ocupado,
-VU1 88 %); el raster sigue cerca (no escala más de ~3,7 veces en 6 núcleos). Detalle y siguientes pasos en [PLAN_60FPS.md](PLAN_60FPS.md), sección 6.1.
+VU1 88 %); el raster sigue cerca (no escala más de ~3,7 veces en 6 núcleos). Parche `0017` (VU1 en línea):
+11,6 → 8,8 ns por par en `ttr_vu_bench` y batalla **~15,8 fps**; el hilo de VIF1 sigue lleno, ahora a partes
+iguales por VU1 y por la cola del GS llena. Detalle y siguientes pasos en [PLAN_60FPS.md](PLAN_60FPS.md), sección 6.1.
 
 ## Siguiente
 

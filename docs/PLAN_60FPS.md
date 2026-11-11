@@ -805,9 +805,9 @@ fase B, ms por frame del banco con 9 hilos.
 | B6 AVX2 | empezado (ver 6.1) | 1 hilo: 527 → 413 ms/frame; 9 hilos ~101 ms/frame; batalla 15,4 fps | `0016` |
 | B7 Camino hasta la cola | pendiente | | |
 | B8 Sprites con realimentación | solo si hace falta | | |
-| C1 Coste fijo por par | pendiente | | |
-| C2 Inferiores en línea | pendiente | | |
-| C3 FMAC con banderas | pendiente | | |
+| C1 Coste fijo por par | hecho en parte (ver 6.2) | 11,6 → 10,0 ns/par | `0017` |
+| C2 Inferiores en línea | hecho (ver 6.2) | 10,6 ns/par | `0017` |
+| C3 FMAC con banderas | hecho (ver 6.2) | 8,8 ns/par; batalla 15,8 fps | `0017` |
 | C4 `vifUnpack` | pendiente | | |
 | C5 XGKICK sin copias | pendiente | | |
 | D1 Búferes DMA | pendiente | | |
@@ -897,6 +897,40 @@ carreras no salen siempre.
    página se usa a la vez como framebuffer y como Z.
 3. **Preparación duplicada (B4)**: con 9 hilos la CPU total es ~1,8 veces la de un hilo (cada hilo repite
    `BuildPixelPipe`, `BuildSampler`, la paleta y la preparación del triángulo o de las columnas del sprite).
+
+### 6.2 Notas de la fase C (2026-11-12)
+
+Banco: `out/vucap/battle.vuc` (3 000 ejecuciones de VU1 de la batalla, 2,57 M pares). `ttr_vu_bench` mide ahora
+solo el tiempo dentro del motor (antes contaba la copia de 16 KB de datos por ejecución, un 18 %) e imprime el
+total de ciclos del motor rápido: **tiene que ser igual con y sin compilador de bloques** (`PS2X_VU_JIT=0`, el
+bucle, es la referencia de ciclos; el intérprete cuenta el final de programa de otra forma y no sirve para eso).
+
+```bash
+out/build/win-clang-release/TwoTowersRecomp/ttr_vu_bench.exe out/vucap/battle.vuc 20
+PS2X_VU_JIT=0 out/build/win-clang-release/TwoTowersRecomp/ttr_vu_bench.exe out/vucap/battle.vuc 1
+```
+
+Hecho (parche `0017`), con 0 de 3 000 diferencias y los mismos ciclos (2 636 418) en cada paso:
+
+- **C2:** LQ, SQ, LQI, SQI, ILW, IADDIU, ISUBIU, IADDI, IADD, ISUB, IAND, IOR, MOVE, MR32, MFIR y MTIR emitidas en
+  línea con la semántica exacta de su manejador (memoria de datos de tamaño potencia de dos): 11,6 → 10,6 ns/par.
+- **C1:** no se registra la disponibilidad de una escritura que ninguna comprobación puede ver (sin comprobación
+  en las `m_stallWindow` posiciones siguientes del bloque y no cerca de su final): → 10,0. El ciclo se suma en
+  tiempo de compilación y solo se escribe antes de lo que lo lee (sin ganancia medible por sí solo). Los pares
+  que leen Q, P o banderas ya no pasan siempre por `jitStall`: comprueban sus registros como los demás y luego
+  hacen `commit`; si solo leen Q y no hay división en vuelo, se lo saltan (Q ya es definitivo y las banderas
+  pendientes se aplican después en el mismo orden): → 9,4.
+- **C3:** FMAC con banderas en línea: banderas MAC/estado calculadas con SSE (máscaras en orden de carriles VU
+  invirtiendo los carriles antes de `movmskps`) y entrada en el anillo de banderas escrita en línea (la llamada a
+  `pushFlags` solo cuando el anillo está casi lleno): → 8,8 ns/par.
+
+En el juego: batalla 15,4 → **15,8 fps**. El hilo de VIF1 sigue al 99 %: VU1 ~48 %, envío al GS ~16 % y ~20 %
+esperando con la cola del GS llena, así que ahora limitan a la vez VU1 y el raster del GS.
+
+Lo que queda en VU1 (perfil): el código emitido es ~53 % del motor (bloques de 10,8 pares de media: prólogo,
+despacho desde `execute()`, comprobaciones de los primeros pares de cada bloque), `commit` ~10 %, `execute` ~8 %,
+`kick` ~7 %, `jitStall` ~6 %, ITOF/FTOI/DIV/saltos por llamada. Siguiente idea: enlazar bloques (saltar al
+bloque siguiente sin volver a `execute()`), y emitir en línea ITOF/FTOI y los saltos condicionales.
 
 ## 7. Riesgos y avisos
 

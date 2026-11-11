@@ -1,0 +1,730 @@
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu_fast.cpp b/ps2xRuntime/src/lib/vu/ps2_vu_fast.cpp
+index 8687790..e0cf4e7 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu_fast.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu_fast.cpp
+@@ -361,21 +361,21 @@ namespace
+         return flags ? selectUpperT<true>(instr, readsQ) : selectUpperT<false>(instr, readsQ);
+     }
+ 
+-    // The FMAC handlers without flags, for the block compiler to emit them inline.
++    // The FMAC handlers, for the block compiler to emit them inline (`flags`: finishFmac<true>).
+     struct FmacInfo
+     {
+         VuFastEngine::Handler handler;
+         int kind;
+         int source;
+         bool toAcc;
++        bool flags;
+     };
+     template <int K, int S, bool A>
+     void addFmacInfo(std::vector<FmacInfo> &table)
+     {
+-        table.push_back({&hFmac<K, S, A, false>, K, S, A});
++        table.push_back({&hFmac<K, S, A, false>, K, S, A, false});
+         // MAX and MIN never write flags: the variant with flags is the same operation.
+-        if constexpr (K == kMax || K == kMin)
+-            table.push_back({&hFmac<K, S, A, true>, K, S, A});
++        table.push_back({&hFmac<K, S, A, true>, K, S, A, !(K == kMax || K == kMin)});
+     }
+     template <int K>
+     void addFmacKind(std::vector<FmacInfo> &table)
+@@ -1103,6 +1103,20 @@ uint64_t VuFastEngine::readyFor(const Pair &p) const
+     return ready;
+ }
+ 
++namespace
++{
++    // Compiled blocks: commit(cycle) for a pair that reads Q, P or a flag register and has nothing to wait for.
++    void jitCommit(VuFastEngine *engine)
++    {
++        engine->commit(engine->cycle);
++    }
++    // Compiled blocks: pushFlags when the flag ring is nearly full (it commits first).
++    void jitPushFlags(VuFastEngine *engine, uint32_t mac, uint32_t status, uint32_t kind)
++    {
++        engine->pushFlags(mac, status, static_cast<uint8_t>(kind));
++    }
++}
++
+ uint32_t VuFastEngine::jitStall(VuFastEngine *engine, const Pair *pair)
+ {
+     VuFastEngine &e = *engine;
+@@ -1149,8 +1163,25 @@ void VuFastEngine::compileBlock(uint32_t index, uint32_t pairLimit, uint32_t cod
+     { return static_cast<int32_t>(reinterpret_cast<const uint8_t *>(member) - engineBase); };
+     auto soff = [&](const void *member)
+     { return static_cast<int32_t>(reinterpret_cast<const uint8_t *>(member) - stateBase); };
++    // Pairs issued since `cycle` was last brought up to date in memory: the emitted code adds them only before
++    // something reads `cycle` (a handler, jitStall, a readiness check or record, the end of the block).
++    uint32_t pendingCycles = 0;
++    auto flushCycles = [&]()
++    {
++        if (pendingCycles != 0u)
++            e.add64MImm(RBX, off(&cycle), static_cast<int32_t>(pendingCycles));
++        pendingCycles = 0;
++    };
++    auto rawCall = [&](const void *fn, const void *arg)
++    {
++        e.movRR(RCX, RBX);
++        e.movImm64(RDX, reinterpret_cast<uint64_t>(arg));
++        e.movImm64(RAX, reinterpret_cast<uint64_t>(fn));
++        e.callR(RAX);
++    };
+     auto call = [&](const void *fn, const void *arg)
+     {
++        flushCycles();
+         e.movRR(RCX, RBX);
+         e.movImm64(RDX, reinterpret_cast<uint64_t>(arg));
+         e.movImm64(RAX, reinterpret_cast<uint64_t>(fn));
+@@ -1212,7 +1243,109 @@ void VuFastEngine::compileBlock(uint32_t index, uint32_t pairLimit, uint32_t cod
+         e.pand(a, u);
+         e.por(a, t);
+     };
+-    // hFmac<K, S, ToAcc, false> as inline SSE (same operations in the same order).
++    // finishFmac<true>'s flags from the raw FMAC result in xmm `raw` (before normalization): r9d = MAC,
++    // r10d = status (kept until emitFlagPush). Uses xmm0, 2, 4, 5 and rax, rcx, rdx, r8, r11.
++    // MAC (VU lane order, x = bit 3): Z = exponent 0, S = sign, U = exponent 0 with a non-zero magnitude,
++    // O = exponent 255; lane masks come out of movmskps in VU order after reversing the lanes.
++    auto emitFlagBits = [&](uint8_t raw, uint8_t dest)
++    {
++        e.movaps(4, raw);
++        e.pandM(4, RBX, off(m_jitConst[1])); // magnitude
++        e.movaps(5, 4);
++        e.pcmpgtdM(5, RBX, off(m_jitConst[3])); // exponent != 0
++        e.movaps(0, 4);
++        e.pcmpgtdM(0, RBX, off(m_jitConst[2])); // exponent 255
++        e.pxor(2, 2);
++        e.pcmpeqd(2, 4); // magnitude 0
++        e.pshufd(5, 5, 0x1B);
++        e.movmskps(RAX, 5);
++        e.pshufd(2, 2, 0x1B);
++        e.movmskps(RCX, 2);
++        e.pshufd(0, 0, 0x1B);
++        e.movmskps(RDX, 0);
++        e.pshufd(4, raw, 0x1B);
++        e.movmskps(R8, 4); // sign (the normalized result keeps it)
++        e.or32RR(RCX, RAX);
++        e.xor32Imm(RAX, 0xFu);
++        e.and32Imm(RAX, dest); // Z
++        e.xor32Imm(RCX, 0xFu);
++        e.and32Imm(RCX, dest); // U
++        e.and32Imm(RDX, dest); // O
++        e.and32Imm(R8, dest);  // S
++        e.movRR(R9, RAX);
++        const uint8_t parts[3] = {R8, RCX, RDX};
++        for (uint32_t k = 0; k < 3u; ++k)
++        {
++            e.movRR(R10, parts[k]);
++            e.shl32Imm(R10, static_cast<uint8_t>(4u * (k + 1u)));
++            e.or32RR(R9, R10);
++        }
++        // status bit k = (field k != 0): (v + 15) >> 4 for a 4-bit v.
++        const uint8_t fields[4] = {RAX, R8, RCX, RDX};
++        for (uint32_t k = 0; k < 4u; ++k)
++        {
++            const uint8_t target = k == 0u ? R10 : R11;
++            e.lea32(target, fields[k], 15);
++            e.shr32Imm(target, 4);
++            if (k != 0u)
++            {
++                e.shl32Imm(R11, static_cast<uint8_t>(k));
++                e.or32RR(R10, R11);
++            }
++        }
++    };
++    // pushFlags(r9d, r10d, kind) at the current cycle; the call (and its commit) only when the ring is
++    // nearly full.
++    auto emitFlagPush = [&]()
++    {
++        const uint8_t kind = m_statusLive ? 3u : 1u;
++        const uint8_t *ring = reinterpret_cast<const uint8_t *>(&flagRing[0]);
++        const int32_t ringOff = off(&flagRing[0]);
++        const int32_t readyOff = static_cast<int32_t>(reinterpret_cast<const uint8_t *>(&flagRing[0].ready) - ring);
++        const int32_t issueOff = static_cast<int32_t>(reinterpret_cast<const uint8_t *>(&flagRing[0].issue) - ring);
++        const int32_t macOff = static_cast<int32_t>(reinterpret_cast<const uint8_t *>(&flagRing[0].mac) - ring);
++        const int32_t statusOff = static_cast<int32_t>(reinterpret_cast<const uint8_t *>(&flagRing[0].status) - ring);
++        const int32_t clipOff = static_cast<int32_t>(reinterpret_cast<const uint8_t *>(&flagRing[0].clip) - ring);
++        const int32_t kindOff = static_cast<int32_t>(reinterpret_cast<const uint8_t *>(&flagRing[0].kind) - ring);
++        static_assert(sizeof(FlagEntry) == 32u, "flag entries are indexed with a shift by 5");
++        static_assert(kFlagRing == 64u, "the flag ring index is masked with 63");
++        e.load32(RAX, RBX, off(&flagCount));
++        e.cmp32Imm(RAX, kFlagRing - 4u);
++        const size_t slow = e.jccRel32(0x83); // jae
++        e.load32(RCX, RBX, off(&flagHead));
++        e.add32RR(RCX, RAX);
++        e.and32Imm(RCX, kFlagRing - 1u);
++        e.shl32Imm(RCX, 5);
++        e.add64RR(RCX, RBX);
++        e.load64(RDX, RBX, off(&cycle));
++        if (pendingCycles != 0u)
++            e.add64Imm(RDX, static_cast<int32_t>(pendingCycles));
++        e.store64(RCX, ringOff + issueOff, RDX);
++        e.add64Imm(RDX, 4);
++        e.store64(RCX, ringOff + readyOff, RDX);
++        e.store32(RCX, ringOff + macOff, R9);
++        e.store32(RCX, ringOff + statusOff, R10);
++        e.store32Imm(RCX, ringOff + clipOff, 0u);
++        e.store8Imm(RCX, ringOff + kindOff, kind);
++        e.add32Imm(RAX, 1);
++        e.store32(RBX, off(&flagCount), RAX);
++        const size_t done = e.jmpRel32();
++        e.patchRel32(slow, e.size());
++        const uint32_t pendingHere = pendingCycles;
++        if (pendingHere != 0u)
++            e.add64MImm(RBX, off(&cycle), static_cast<int32_t>(pendingHere));
++        e.movRR(RCX, RBX);
++        e.movRR(RDX, R9);
++        e.movRR(R8, R10);
++        e.movImm32(R9, kind);
++        e.movImm64(RAX, reinterpret_cast<uint64_t>(&jitPushFlags));
++        e.callR(RAX);
++        if (pendingHere != 0u)
++            e.add64MImm(RBX, off(&cycle), -static_cast<int32_t>(pendingHere));
++        e.patchRel32(done, e.size());
++    };
++
++    // hFmac<K, S, ToAcc, F> as inline SSE (same operations in the same order).
+     auto emitFmac = [&](const Pair &p) -> bool
+     {
+         const FmacInfo *info = findFmac(p.upper);
+@@ -1241,6 +1374,8 @@ void VuFastEngine::compileBlock(uint32_t index, uint32_t pairLimit, uint32_t cod
+         }
+         clamp(2, 4, 5);
+         uint8_t result = 1;
++        const uint8_t destLanes = u.dest & 0xFu;
++        const bool flags = info->flags && destLanes != 0u;
+         switch (info->kind)
+         {
+         case kAdd:
+@@ -1270,6 +1405,8 @@ void VuFastEngine::compileBlock(uint32_t index, uint32_t pairLimit, uint32_t cod
+             e.minps(1, 2);
+             break;
+         }
++        if (flags)
++            emitFlagBits(result, destLanes);
+         if (info->kind != kMax && info->kind != kMin)
+             clamp(result, 4, 5);
+         const uint8_t dest = u.dest & 0xFu;
+@@ -1282,9 +1419,215 @@ void VuFastEngine::compileBlock(uint32_t index, uint32_t pairLimit, uint32_t cod
+             e.blendps(0, result, static_cast<uint8_t>(laneBits(dest)));
+             e.movupsStore(RSI, target, 0);
+         }
++        if (flags)
++            emitFlagPush();
+         return true;
+     };
+ 
++    // Lower instructions without pipelines or flags, as inline code doing what their handlers do. Data
++    // accesses rely on dataAddress never running past the end, true for a power-of-two data memory.
++    const bool inlineData = dataSize >= 16u && (dataSize & (dataSize - 1u)) == 0u;
++    // [base + disp] lanes in `dest` (VU lane order) = xmm `value`.
++    auto blendStore = [&](uint8_t base, int32_t disp, uint8_t value, uint8_t dest)
++    {
++        if (dest == 0xFu)
++            e.movupsStore(base, disp, value);
++        else if (dest != 0u)
++        {
++            e.movupsLoad(0, base, disp);
++            e.blendps(0, value, static_cast<uint8_t>(laneBits(dest)));
++            e.movupsStore(base, disp, 0);
++        }
++    };
++    // rcx = data + dataAddress(vi[reg] (as uint16 when `unsigned16`) + imm); clobbers rax.
++    auto dataPointer = [&](uint8_t reg, int32_t imm, bool unsigned16)
++    {
++        e.load32(RAX, RSI, soff(&s.vi[reg]));
++        if (unsigned16)
++            e.movzx16(RAX, RAX);
++        if (imm != 0)
++            e.add32Imm(RAX, imm);
++        e.shl32Imm(RAX, 4);
++        e.load32(RCX, RBX, off(&dataSize));
++        e.add32Imm(RCX, -1);
++        e.and32RR(RAX, RCX);
++        e.load64(RCX, RBX, off(&data));
++        e.add64RR(RCX, RAX);
++    };
++    // setVi(reg, eax), as int16 when `truncate`.
++    auto setViEax = [&](uint8_t reg, bool truncate)
++    {
++        if (reg == 0u)
++            return;
++        if (truncate)
++            e.movsx16(RAX, RAX);
++        e.store32(RSI, soff(&s.vi[reg]), RAX);
++    };
++    auto incrementVi = [&](uint8_t reg, int32_t delta)
++    {
++        if (reg == 0u)
++            return;
++        e.load32(RAX, RSI, soff(&s.vi[reg]));
++        e.add32Imm(RAX, delta);
++        setViEax(reg, true);
++    };
++    auto emitLower = [&](const Pair &p) -> bool
++    {
++        const uint32_t i = p.lowerInstr;
++        const Handler h = p.lower;
++        if (h == &hNop)
++            return true;
++        if (h == &hLq || h == &hSq || h == &hLqi || h == &hSqi || h == &hIlw)
++        {
++            if (!inlineData)
++                return false;
++            if (h == &hLq)
++            {
++                dataPointer(VIS(i), IMM11(i), false);
++                e.movupsLoad(1, RCX, 0);
++                blendStore(RSI, soff(s.vf[FT(i)]), 1, DEST(i));
++            }
++            else if (h == &hSq)
++            {
++                dataPointer(VIT(i), IMM11(i), false);
++                e.movupsLoad(1, RSI, soff(s.vf[FS(i)]));
++                blendStore(RCX, 0, 1, DEST(i));
++            }
++            else if (h == &hLqi)
++            {
++                dataPointer(VIS(i), 0, true);
++                e.movupsLoad(1, RCX, 0);
++                blendStore(RSI, soff(s.vf[FT(i)]), 1, DEST(i));
++                incrementVi(VIS(i), 1);
++            }
++            else if (h == &hSqi)
++            {
++                dataPointer(VIT(i), 0, true);
++                e.movupsLoad(1, RSI, soff(s.vf[FS(i)]));
++                blendStore(RCX, 0, 1, DEST(i));
++                incrementVi(VIT(i), 1);
++            }
++            else if (VIT(i) != 0u) // ILW
++            {
++                dataPointer(VIS(i), IMM11(i), false);
++                e.load32(RAX, RCX, destComponent(DEST(i)) * 4);
++                setViEax(VIT(i), true);
++            }
++            return true;
++        }
++        if (h == &hIaddiu || h == &hIsubiu || h == &hIaddi)
++        {
++            if (VIT(i) != 0u)
++            {
++                int32_t imm = imm15(i);
++                if (h == &hIsubiu)
++                    imm = -imm;
++                else if (h == &hIaddi)
++                    imm = static_cast<int16_t>(static_cast<int32_t>((i >> 6) & 0x1Fu) << 27 >> 27);
++                e.load32(RAX, RSI, soff(&s.vi[VIS(i)]));
++                e.add32Imm(RAX, imm);
++                setViEax(VIT(i), true);
++            }
++            return true;
++        }
++        if (h == &hIadd || h == &hIsub || h == &hIand || h == &hIor)
++        {
++            if (VID(i) != 0u)
++            {
++                e.load32(RAX, RSI, soff(&s.vi[VIS(i)]));
++                e.load32(RCX, RSI, soff(&s.vi[VIT(i)]));
++                if (h == &hIadd)
++                    e.add32RR(RAX, RCX);
++                else if (h == &hIsub)
++                    e.sub32RR(RAX, RCX);
++                else if (h == &hIand)
++                    e.and32RR(RAX, RCX);
++                else
++                    e.or32RR(RAX, RCX);
++                setViEax(VID(i), h == &hIadd || h == &hIsub);
++            }
++            return true;
++        }
++        if (h == &hMove || h == &hMr32)
++        {
++            e.movupsLoad(1, RSI, soff(s.vf[FS(i)]));
++            if (h == &hMr32)
++                e.shufps(1, 1, 0x39); // _MM_SHUFFLE(0, 3, 2, 1)
++            blendStore(RSI, soff(s.vf[FT(i)]), 1, DEST(i));
++            return true;
++        }
++        if (h == &hMfir)
++        {
++            e.load32(RAX, RSI, soff(&s.vi[VIS(i)]));
++            e.movsx16(RAX, RAX);
++            e.movdXR(1, RAX);
++            e.pshufd(1, 1, 0);
++            blendStore(RSI, soff(s.vf[FT(i)]), 1, DEST(i));
++            return true;
++        }
++        if (h == &hMtir)
++        {
++            if (VIT(i) != 0u)
++            {
++                e.load32(RAX, RSI, soff(&s.vf[FS(i)][(i >> 21) & 3u]));
++                setViEax(VIT(i), true);
++            }
++            return true;
++        }
++        return false;
++    };
++
++    auto inRange = [&](uint32_t n)
++    { return n < pairLimit && n * 8u + 8u <= codeSize; };
++
++    // The block's pairs: a straight run up to a branch and its delay slot. A delay slot the block cannot take
++    // (or another branch) is left to the loop, with the branch.
++    std::vector<uint32_t> order;
++    bool blockEndsWithBranch = false;
++    for (uint32_t n = index; inRange(n) && order.size() < kMaxBlockPairs; ++n)
++    {
++        const Pair &p = m_pairs[n];
++        if (!jitable(p))
++            break;
++        if (p.flags & kBranch)
++        {
++            const uint32_t slot = n + 1u;
++            if (!inRange(slot) || !jitable(m_pairs[slot]) || (m_pairs[slot].flags & kBranch))
++                break;
++            order.push_back(n);
++            order.push_back(slot);
++            blockEndsWithBranch = true;
++            break;
++        }
++        order.push_back(n);
++    }
++    // Same issue rules as execute(): the readiness check is needed in the first m_stallWindow pairs of the
++    // block (the pairs before them may not have run in a line) and where a read can still be pending.
++    // Pairs that wait for FDIV/EFU/Q/P always go through jitStall (which also commits); a pair that only
++    // reads Q, P or a flag register checks its registers like any other and then commits.
++    auto alwaysChecks = [](const Pair &p)
++    { return (p.flags & (kFdiv | kEfu | kWaitQ | kWaitP)) != 0u; };
++    std::vector<uint8_t> checks(order.size(), 0u);
++    for (uint32_t pos = 0; pos < order.size(); ++pos)
++    {
++        const Pair &p = m_pairs[order[pos]];
++        const bool reads = p.readCount != 0u || p.accRead != 0u || p.viRead != 0u;
++        checks[pos] = alwaysChecks(p) || (reads && ((p.flags & kNoStall) == 0u || pos < m_stallWindow));
++    }
++    // The readiness of a write only matters to a check that can run before every write still pending then
++    // has completed: one in the next m_stallWindow pairs of the block, or after the block (its last
++    // m_stallWindow pairs). Any other check runs at least m_stallWindow cycles after both this write and
++    // every earlier one, whatever the recorded values (stalls only add cycles).
++    auto recordNeeded = [&](uint32_t pos)
++    {
++        if (pos + m_stallWindow >= order.size())
++            return true;
++        for (uint32_t q = pos + 1u; q <= pos + m_stallWindow; ++q)
++            if (checks[q])
++                return true;
++        return false;
++    };
++
+     auto emitPair = [&](uint32_t n)
+     {
+         const Pair &p = m_pairs[n];
+@@ -1292,12 +1635,11 @@ void VuFastEngine::compileBlock(uint32_t index, uint32_t pairLimit, uint32_t cod
+         // Branch handlers compute their target from s.pc; everything else gets it at the block's exits.
+         if (p.flags & kBranch)
+             e.store32Imm(RSI, soff(&s.pc), n * 8u);
+-        // Same issue rules as execute(): the readiness check is needed in the first m_stallWindow pairs of
+-        // the block (the pairs before them may not have run in a line) and where a read can still be pending.
+-        // It is done inline; jitStall only runs when something is not ready (or for FDIV/EFU/Q/P/flag reads).
+-        const bool always = (p.flags & (kFdiv | kEfu | kWaitQ | kWaitP | kCommit)) != 0u;
+-        const bool reads = p.readCount != 0u || p.accRead != 0u || p.viRead != 0u;
+-        const bool check = always || (reads && ((p.flags & kNoStall) == 0u || pos < m_stallWindow));
++        // The readiness check is inline; jitStall only runs when something is not ready (or for
++        // FDIV/EFU/Q/P/flag reads).
++        const bool always = alwaysChecks(p);
++        const bool check = checks[pos] != 0u;
++        size_t committed = SIZE_MAX;
+         if (check)
+         {
+             std::vector<size_t> slow;
+@@ -1305,6 +1647,8 @@ void VuFastEngine::compileBlock(uint32_t index, uint32_t pairLimit, uint32_t cod
+             if (!always)
+             {
+                 e.load32(RAX, RBX, off(&cycle));
++                if (pendingCycles != 0u)
++                    e.add32Imm(RAX, static_cast<int32_t>(pendingCycles));
+                 e.sub32M(RAX, RBX, off(&m_readyBase));
+                 if (p.readCount != 0u || p.accRead != 0u)
+                 {
+@@ -1332,12 +1676,52 @@ void VuFastEngine::compileBlock(uint32_t index, uint32_t pairLimit, uint32_t cod
+                 for (size_t at : slow)
+                     e.patchRel32(at, e.size());
+             }
+-            call(reinterpret_cast<const void *>(&VuFastEngine::jitStall), &p);
++            // jitStall reads and may advance `cycle`: it is brought up to date around the call (and back to the
++            // pending form after it, so both paths of an inline check meet with the same pending count).
++            const uint32_t pendingHere = pendingCycles;
++            if (pendingHere != 0u)
++                e.add64MImm(RBX, off(&cycle), static_cast<int32_t>(pendingHere));
++            rawCall(reinterpret_cast<const void *>(&VuFastEngine::jitStall), &p);
+             e.test32(RAX, RAX);
+             exits.push_back({e.jccRel32(0x85), pos, n * 8u});
+-            if (!always)
++            if (always)
++                pendingCycles = 0;
++            else
++            {
++                if (pendingHere != 0u)
++                    e.add64MImm(RBX, off(&cycle), -static_cast<int32_t>(pendingHere));
++                // jitStall has committed already: past the commit below.
++                if (p.flags & kCommit)
++                    committed = e.jmpRel32();
+                 e.patchRel32(skip, e.size());
++            }
+         }
++        if ((p.flags & kCommit) && !always)
++        {
++            // An upper instruction that reads Q, with a lower one that reads no pipeline: with no division
++            // in flight Q is final, and the flags still pending can be committed later in the same order
++            // (whatever reads them commits first).
++            bool upperReadsQ = false, lowerReads = false;
++            selectUpper(p.upperInstr, true, upperReadsQ);
++            if ((p.flags & kIBit) == 0u)
++                selectLower(p.lowerInstr, lowerReads);
++            size_t noDivision = SIZE_MAX;
++            if (upperReadsQ && !lowerReads)
++            {
++                e.cmp8Imm(RBX, off(&fdiv.valid), 0);
++                noDivision = e.jccRel32(0x84);
++            }
++            const uint32_t pendingHere = pendingCycles;
++            if (pendingHere != 0u)
++                e.add64MImm(RBX, off(&cycle), static_cast<int32_t>(pendingHere));
++            rawCall(reinterpret_cast<const void *>(&jitCommit), nullptr);
++            if (pendingHere != 0u)
++                e.add64MImm(RBX, off(&cycle), -static_cast<int32_t>(pendingHere));
++            if (noDivision != SIZE_MAX)
++                e.patchRel32(noDivision, e.size());
++        }
++        if (committed != SIZE_MAX)
++            e.patchRel32(committed, e.size());
+         if (p.flags & kBranchBackup)
+         {
+             e.load32(RAX, RSI, soff(&s.vi[p.viWriteReg]));
+@@ -1352,7 +1736,7 @@ void VuFastEngine::compileBlock(uint32_t index, uint32_t pairLimit, uint32_t cod
+             std::memcpy(&bits, &value, sizeof(bits));
+             e.store32Imm(RSI, soff(&s.i), bits);
+         }
+-        else if (p.lower)
++        else if (p.lower && !(m_jitInline && emitLower(p)))
+             call(reinterpret_cast<const void *>(p.lower), &p);
+         // The VI branch backup lives for one pair: the one before the block, or a pair in it, may have set it.
+         if (pos == 0u || previousBackup)
+@@ -1366,10 +1750,13 @@ void VuFastEngine::compileBlock(uint32_t index, uint32_t pairLimit, uint32_t cod
+             e.store8Imm(RDI, 0, 1);
+         }
+ 
+-        if (p.upperWriteReg != 0u || p.lowerWriteReg != 0u || p.viWriteReg != 0u || p.accWriteLanes != 0u)
++        if ((p.upperWriteReg != 0u || p.lowerWriteReg != 0u || p.viWriteReg != 0u || p.accWriteLanes != 0u) &&
++            recordNeeded(pos))
+         {
+             // eax = issue cycle relative to m_readyBase
+             e.load32(RAX, RBX, off(&cycle));
++            if (pendingCycles != 0u)
++                e.add32Imm(RAX, static_cast<int32_t>(pendingCycles));
+             e.sub32M(RAX, RBX, off(&m_readyBase));
+             auto record = [&](int32_t slot, uint8_t lanes, uint32_t latency)
+             {
+@@ -1401,44 +1788,30 @@ void VuFastEngine::compileBlock(uint32_t index, uint32_t pairLimit, uint32_t cod
+             e.storeX(RSI, soff(s.vf[0]), 2);
+         }
+         e.store32Imm(RSI, soff(&s.vi[0]), 0u);
+-        e.add64MImm(RBX, off(&cycle), 1);
++        ++pendingCycles;
+     };
+ 
+-    auto inRange = [&](uint32_t n)
+-    { return n < pairLimit && n * 8u + 8u <= codeSize; };
+-
+-    for (uint32_t n = index; inRange(n) && count < kMaxBlockPairs; ++n)
+-    {
+-        const Pair &p = m_pairs[n];
+-        if (!jitable(p))
+-            break;
+-        if (p.flags & kBranch)
+-        {
+-            // The branch and its delay slot, then the branch resolves as in execute(). A delay slot the
+-            // block cannot take (or another branch) is left to the loop, with the branch.
+-            const uint32_t slot = n + 1u;
+-            if (!inRange(slot) || !jitable(m_pairs[slot]) || (m_pairs[slot].flags & kBranch))
+-                break;
+-            emitPair(n);
+-            emitPair(slot);
+-            e.cmp8Imm(RSI, soff(&s.branchPending), 0);
+-            const size_t notTaken = e.jccRel32(0x84);
+-            e.load32(RAX, RSI, soff(&s.branchTarget));
+-            e.and32Imm(RAX, pcMask);
+-            e.store32(RSI, soff(&s.pc), RAX);
+-            e.store8Imm(RSI, soff(&s.branchPending), 0);
+-            e.store32Imm(RSI, soff(&s.branchDelay), 0u);
+-            const size_t done = e.jmpRel32();
+-            e.patchRel32(notTaken, e.size());
+-            uint32_t next = slot * 8u + 8u;
+-            if (next >= codeSize)
+-                next = 0u;
+-            e.store32Imm(RSI, soff(&s.pc), next);
+-            e.patchRel32(done, e.size());
+-            endedWithBranch = true;
+-            break;
+-        }
++    for (const uint32_t n : order)
+         emitPair(n);
++    if (blockEndsWithBranch)
++    {
++        // The branch resolves as in execute().
++        const uint32_t slot = order.back();
++        e.cmp8Imm(RSI, soff(&s.branchPending), 0);
++        const size_t notTaken = e.jccRel32(0x84);
++        e.load32(RAX, RSI, soff(&s.branchTarget));
++        e.and32Imm(RAX, pcMask);
++        e.store32(RSI, soff(&s.pc), RAX);
++        e.store8Imm(RSI, soff(&s.branchPending), 0);
++        e.store32Imm(RSI, soff(&s.branchDelay), 0u);
++        const size_t done = e.jmpRel32();
++        e.patchRel32(notTaken, e.size());
++        uint32_t next = slot * 8u + 8u;
++        if (next >= codeSize)
++            next = 0u;
++        e.store32Imm(RSI, soff(&s.pc), next);
++        e.patchRel32(done, e.size());
++        endedWithBranch = true;
+     }
+     if (count == 0u)
+     {
+@@ -1454,6 +1827,7 @@ void VuFastEngine::compileBlock(uint32_t index, uint32_t pairLimit, uint32_t cod
+             next = 0u;
+         e.store32Imm(RSI, soff(&s.pc), next);
+     }
++    flushCycles();
+     e.add64MImm(RBX, off(&m_jitPairs), static_cast<int32_t>(count));
+     e.movImm32(RAX, 0u);
+     const size_t epilogue = e.size();
+diff --git a/ps2xRuntime/src/lib/vu/ps2_x64_emitter.h b/ps2xRuntime/src/lib/vu/ps2_x64_emitter.h
+index 939b9d1..27181b2 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_x64_emitter.h
++++ b/ps2xRuntime/src/lib/vu/ps2_x64_emitter.h
+@@ -300,6 +300,101 @@ namespace ps2x::x64
+             mem(reg, base, disp);
+         }
+ 
++        // mov r64, qword [base + disp]
++        void load64(uint8_t reg, uint8_t base, int32_t disp)
++        {
++            rex(true, reg, base);
++            byte(0x8B);
++            mem(reg, base, disp);
++        }
++        // r32 op= r32, with the "r/m, r" opcode: 0x01 add, 0x09 or, 0x21 and, 0x29 sub
++        void alu32RR(uint8_t op, uint8_t dst, uint8_t src)
++        {
++            rex(false, src, dst);
++            byte(op);
++            byte(static_cast<uint8_t>(0xC0u | ((src & 7u) << 3) | (dst & 7u)));
++        }
++        void add32RR(uint8_t dst, uint8_t src) { alu32RR(0x01, dst, src); }
++        void sub32RR(uint8_t dst, uint8_t src) { alu32RR(0x29, dst, src); }
++        void and32RR(uint8_t dst, uint8_t src) { alu32RR(0x21, dst, src); }
++        void or32RR(uint8_t dst, uint8_t src) { alu32RR(0x09, dst, src); }
++        // add r32, imm32
++        void add32Imm(uint8_t reg, int32_t imm)
++        {
++            rex(false, 0, reg);
++            byte(0x81);
++            byte(static_cast<uint8_t>(0xC0u | (reg & 7u)));
++            u32(static_cast<uint32_t>(imm));
++        }
++        // shl r32, imm8
++        void shl32Imm(uint8_t reg, uint8_t imm)
++        {
++            rex(false, 0, reg);
++            byte(0xC1);
++            byte(static_cast<uint8_t>(0xE0u | (reg & 7u)));
++            byte(imm);
++        }
++        // movsx r32, r16 / movzx r32, r16
++        void movsx16(uint8_t dst, uint8_t src)
++        {
++            rex(false, dst, src);
++            byte(0x0F);
++            byte(0xBF);
++            byte(static_cast<uint8_t>(0xC0u | ((dst & 7u) << 3) | (src & 7u)));
++        }
++        void movzx16(uint8_t dst, uint8_t src)
++        {
++            rex(false, dst, src);
++            byte(0x0F);
++            byte(0xB7);
++            byte(static_cast<uint8_t>(0xC0u | ((dst & 7u) << 3) | (src & 7u)));
++        }
++        // shr r32, imm8
++        void shr32Imm(uint8_t reg, uint8_t imm)
++        {
++            rex(false, 0, reg);
++            byte(0xC1);
++            byte(static_cast<uint8_t>(0xE8u | (reg & 7u)));
++            byte(imm);
++        }
++        // xor r32, imm32 / cmp r32, imm32
++        void xor32Imm(uint8_t reg, uint32_t imm)
++        {
++            rex(false, 0, reg);
++            byte(0x81);
++            byte(static_cast<uint8_t>(0xF0u | (reg & 7u)));
++            u32(imm);
++        }
++        void cmp32Imm(uint8_t reg, uint32_t imm)
++        {
++            rex(false, 0, reg);
++            byte(0x81);
++            byte(static_cast<uint8_t>(0xF8u | (reg & 7u)));
++            u32(imm);
++        }
++        // mov qword [base + disp], r64
++        void store64(uint8_t base, int32_t disp, uint8_t reg)
++        {
++            rex(true, reg, base);
++            byte(0x89);
++            mem(reg, base, disp);
++        }
++        // add r64, imm32 (sign-extended)
++        void add64Imm(uint8_t reg, int32_t imm)
++        {
++            rex(true, 0, reg);
++            byte(0x81);
++            byte(static_cast<uint8_t>(0xC0u | (reg & 7u)));
++            u32(static_cast<uint32_t>(imm));
++        }
++        // add r64, r64
++        void add64RR(uint8_t dst, uint8_t src)
++        {
++            rex(true, src, dst);
++            byte(0x01);
++            byte(static_cast<uint8_t>(0xC0u | ((src & 7u) << 3) | (dst & 7u)));
++        }
++
+         // Generic SSE forms: [prefix] [REX] 0F op... with a register or [base + disp32] operand.
+         void sseRR(uint8_t prefix, std::initializer_list<uint8_t> ops, uint8_t dst, uint8_t src)
+         {
+@@ -327,6 +422,8 @@ namespace ps2x::x64
+         void movdLoad(uint8_t x, uint8_t base, int32_t disp) { sseRM(0x66, {0x6E}, x, base, disp); }
+         void pandM(uint8_t x, uint8_t base, int32_t disp) { sseRM(0x66, {0xDB}, x, base, disp); }
+         void pand(uint8_t dst, uint8_t src) { sseRR(0x66, {0xDB}, dst, src); }
++        void pxor(uint8_t dst, uint8_t src) { sseRR(0x66, {0xEF}, dst, src); }
++        void pcmpeqd(uint8_t dst, uint8_t src) { sseRR(0x66, {0x76}, dst, src); }
+         void por(uint8_t dst, uint8_t src) { sseRR(0x66, {0xEB}, dst, src); }
+         void pminudM(uint8_t x, uint8_t base, int32_t disp) { sseRM(0x66, {0x38, 0x3B}, x, base, disp); }
+         void pcmpgtdM(uint8_t x, uint8_t base, int32_t disp) { sseRM(0x66, {0x66}, x, base, disp); }
+@@ -335,6 +432,12 @@ namespace ps2x::x64
+         void subps(uint8_t dst, uint8_t src) { sseRR(0, {0x5C}, dst, src); }
+         void minps(uint8_t dst, uint8_t src) { sseRR(0, {0x5D}, dst, src); }
+         void maxps(uint8_t dst, uint8_t src) { sseRR(0, {0x5F}, dst, src); }
++        // shufps xmm, xmm, imm8
++        void shufps(uint8_t dst, uint8_t src, uint8_t imm)
++        {
++            sseRR(0, {0xC6}, dst, src);
++            byte(imm);
++        }
+         // blendps xmm, xmm, imm8 (SSE4.1): element i from src where bit i is set.
+         void blendps(uint8_t dst, uint8_t src, uint8_t imm)
+         {

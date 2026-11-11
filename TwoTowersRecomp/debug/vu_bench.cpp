@@ -138,14 +138,18 @@ int main(int argc, char **argv)
         if (!(regs && flags && dataSame && kicksSame))
         {
             if (mismatches < 20)
-                std::printf("record %zu pc=0x%x: regs=%d flags=%d (mac %x/%x status %x/%x clip %x/%x) data=%d kicks=%d (%zu/%zu)\n", i,
-                            record.header.state.pc, regs, flags, a.mac, b.mac, a.status, b.status, a.clip, b.clip, dataSame,
+                std::printf("record %zu cycles %llu/%llu (start %llu) pc=0x%x: regs=%d flags=%d (mac %x/%x status %x/%x clip %x/%x) data=%d kicks=%d (%zu/%zu)\n", i,
+                            static_cast<unsigned long long>(a.cycles), static_cast<unsigned long long>(b.cycles),
+                            static_cast<unsigned long long>(record.header.state.cycles), record.header.state.pc, regs, flags, a.mac, b.mac, a.status, b.status, a.clip, b.clip, dataSame,
                             kicksSame, fast.kicks.size(), ref.kicks.size());
             ++mismatches;
         }
     }
     std::printf("correctness: %zu of %zu records differ; %llu pairs per pass\n", mismatches, records.size(),
                 static_cast<unsigned long long>(totalPairs));
+    // The interpreter counts a program's cycles differently (pipeline drain): compare this total between runs
+    // of the fast engine instead (PS2X_VU_JIT=0, the plain loop, is the reference for the block compiler).
+    std::printf("fast engine cycles: %llu\n", static_cast<unsigned long long>(fastVu.state().cycles));
 
     // 2. timing
     auto timeEngine = [&](bool fastEngine, int passes)
@@ -155,6 +159,7 @@ int main(int argc, char **argv)
         std::vector<uint8_t> data(16384);
         std::vector<std::vector<uint8_t>> kicks;
         uint64_t pairs = 0;
+        double runSeconds = 0.0; // time inside runDetached only (not the copies that set up each record)
         const auto start = std::chrono::steady_clock::now();
         for (int pass = 0; pass < passes; ++pass)
         {
@@ -165,13 +170,16 @@ int main(int argc, char **argv)
                 std::memcpy(data.data(), record.data.data(), record.data.size());
                 vu.state() = record.header.state;
                 kicks.clear();
+                const auto runStart = std::chrono::steady_clock::now();
                 const int64_t n = vu.runDetached(code.data(), record.header.codeSize, data.data(), record.header.dataSize, gs,
                                                  record.codeKey, record.header.maxCycles, fastEngine, &kicks);
+                runSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - runStart).count();
                 pairs += n > 0 ? static_cast<uint64_t>(n) : 0u;
             }
         }
         const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-        return std::make_pair(seconds, pairs);
+        std::printf("%s: %.3f s in the engine of %.3f s\n", fastEngine ? "fast" : "interpreter", runSeconds, seconds);
+        return std::make_pair(runSeconds, pairs);
     };
 
     const auto [fastSeconds, fastPairs] = timeEngine(true, repeats);
