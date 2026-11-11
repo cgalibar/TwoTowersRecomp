@@ -1,0 +1,376 @@
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 5e36321..050ca24 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -2355,9 +2355,13 @@ namespace
+         }
+     }
+ 
+-    // WritePixel with the state decoded in advance; `row` is pixelRow(p, y).
++    // WritePixel with the state decoded in advance; `row` is pixelRow(p, y). ZTested: the caller already
++    // checked zTestFast (a pixel that fails the depth test writes nothing, so it can be tested first and
++    // skip texturing).
++    template <bool ZTested = false>
+     inline void writePixelFast(const GSCpuBackend::PixelPipe &p, const PixelRow &row, int x, int y, int z, uint8_t r,
+                                uint8_t g, uint8_t b, uint8_t a, uint8_t fog);
++    inline bool zTestFast(const GSCpuBackend::PixelPipe &p, const PixelRow &row, int x, int y, int z);
+ }
+ 
+ struct GSCpuBackend::Sampler
+@@ -2416,8 +2420,14 @@ struct GSCpuBackend::Sampler
+         if constexpr (K == 0u)
+             return read(cache, vram, tbp, tbw, u, v);
+         else
++            return fetchPixelK<K>(cache, GSSwizzle::AddressFast(*format, texBase, texRowStride, u, v));
++    }
++
++    // The texel at swizzled pixel address `pixel` (K != 0).
++    template <unsigned K>
++    uint32_t fetchPixelK(GSMem::TexturePageCache &cache, uint32_t pixel) const
++    {
+         {
+-            const uint32_t pixel = GSSwizzle::AddressFast(*format, texBase, texRowStride, u, v);
+             if constexpr (K == 1u || K == 2u)
+             {
+                 uint32_t value = 0u;
+@@ -2448,7 +2458,12 @@ struct GSCpuBackend::Sampler
+     {
+         u = wrapTextureCoordinate(u, texW, wrapU, minU, maxU);
+         v = wrapTextureCoordinate(v, texH, wrapV, minV, maxV);
+-        const uint32_t raw = readTexelK<K>(cache, static_cast<uint32_t>(u), static_cast<uint32_t>(v));
++        return decode(readTexelK<K>(cache, static_cast<uint32_t>(u), static_cast<uint32_t>(v)));
++    }
++
++    // Colour of a raw texel (palette, TEXA, 16-bit expansion), as point() returns it.
++    uint32_t decode(uint32_t raw) const
++    {
+         if (palette)
+             return palette[raw & 0xFFu];
+         switch (kind)
+@@ -2827,6 +2842,22 @@ namespace
+         }
+     }
+ 
++    inline bool zTestFast(const GSCpuBackend::PixelPipe &p, const PixelRow &row, int x, int y, int z)
++    {
++        switch (p.ztestMethod)
++        {
++        case 0:
++            return false;
++        case 1:
++            return true;
++        case 2:
++            return static_cast<uint32_t>(z) >= readZFast(p, row, x, y);
++        default:
++            return static_cast<uint32_t>(z) > readZFast(p, row, x, y);
++        }
++    }
++
++    template <bool ZTested>
+     inline void writePixelFast(const GSCpuBackend::PixelPipe &p, const PixelRow &row, int x, int y, int z, uint8_t r,
+                                uint8_t g, uint8_t b, uint8_t a, uint8_t fog)
+     {
+@@ -2834,6 +2865,13 @@ namespace
+             return;
+         if (g_gsStats)
+             ++t_statPixels;
++        // Every test below only returns, so the order does not change the result: the depth test goes first
++        // (it skips the most work).
++        if constexpr (!ZTested)
++        {
++            if (!zTestFast(p, row, x, y, z))
++                return;
++        }
+ 
+         if (p.fge)
+         {
+@@ -2865,25 +2903,6 @@ namespace
+         if (p.dateRead && !passesDestinationAlphaTest(p.test, static_cast<uint8_t>(p.fpsm), rawFramebufferPixel))
+             return;
+ 
+-        bool zpass = false;
+-        switch (p.ztestMethod)
+-        {
+-        case 0:
+-            zpass = false;
+-            break;
+-        case 1:
+-            zpass = true;
+-            break;
+-        case 2:
+-            zpass = static_cast<uint32_t>(z) >= readZFast(p, row, x, y);
+-            break;
+-        case 3:
+-            zpass = static_cast<uint32_t>(z) > readZFast(p, row, x, y);
+-            break;
+-        }
+-        if (!zpass)
+-            return;
+-
+         if (writeMask.writesFramebuffer())
+         {
+             if (p.abe && !(p.pabe && (a & 0x80u) == 0u))
+@@ -3179,6 +3198,60 @@ void GSCpuBackend::DrawSpriteK(const GSPrimitiveBatch &batch)
+             }
+             columnsReady = true;
+         };
++        // UV coordinates without filtering (most textured sprites): the wrapped texel column of every pixel
++        // column and the row part of the texel address are fixed, so a pixel costs one table lookup and a
++        // fetch. The same texel as sampleK: u = (int)(U / 16) wrapped, v likewise.
++        thread_local std::vector<uint32_t> columnTexel;
++        if constexpr (K != 0u)
++        {
++            if (state.prim.fst && !smp.linear)
++            {
++                auto drawRowsFast = [&](int firstRow, int lastRow, GSMem::TexturePageCache &cache)
++                {
++                    if (!columnsReady)
++                    {
++                        prepareColumns();
++                        columnTexel.resize(columnU.size());
++                        for (size_t i = 0; i < columnU.size(); ++i)
++                        {
++                            const float texUf = static_cast<float>(columnU[i]) / 16.0f;
++                            columnTexel[i] = static_cast<uint32_t>(
++                                wrapTextureCoordinate(static_cast<int>(texUf), smp.texW, smp.wrapU, smp.minU, smp.maxU)) & 2047u;
++                        }
++                    }
++                    const GSSwizzle::Format &format = *smp.format;
++                    for (int y = firstRow; y <= lastRow; ++y)
++                    {
++                        PixelRow row;
++                        pixelRow(pipe, y, row);
++                        const float ty = (static_cast<float>(y - unclippedY0) + 0.5f) / spriteH;
++                        const float texVf = v0f + (v1f - v0f) * ty;
++                        const int fixedV = static_cast<int>((texVf * 16.0f) + 0.5f);
++                        const uint16_t sampleV = static_cast<uint16_t>(clampInt(fixedV, 0, 0xFFFF));
++                        const float texRowF = static_cast<float>(sampleV) / 16.0f;
++                        const uint32_t tv = static_cast<uint32_t>(
++                            wrapTextureCoordinate(static_cast<int>(texRowF), smp.texH, smp.wrapV, smp.minV, smp.maxV));
++                        const uint32_t inPage = tv & format.pageHMask;
++                        const uint32_t texRow = smp.texBase + (tv >> format.pageHShift) * smp.texRowStride + format.rowIn[inPage];
++                        const uint32_t *texCols = format.col + (inPage & format.periodMask) * 2048u;
++                        for (int x = drawX0; x <= drawX1; ++x)
++                        {
++                            if (!zTestFast(pipe, row, x, y, static_cast<int>(z1)))
++                                continue;
++                            const uint32_t texel = smp.decode(
++                                smp.template fetchPixelK<K>(cache, texRow + texCols[columnTexel[static_cast<size_t>(x - drawX0)]]));
++                            const TextureCombineResult color = combineTexture(tex, r, g, b, a, static_cast<uint8_t>(texel & 0xFF),
++                                                                              static_cast<uint8_t>((texel >> 8) & 0xFF),
++                                                                              static_cast<uint8_t>((texel >> 16) & 0xFF),
++                                                                              static_cast<uint8_t>((texel >> 24) & 0xFF));
++                            writePixelFast<true>(pipe, row, x, y, static_cast<int>(z1), color.r, color.g, color.b, color.a, v1.fog);
++                        }
++                    }
++                };
++                ForEachRowBand(drawY0, drawY1, area, drawRowsFast);
++                return;
++            }
++        }
+         auto drawRows = [&](int firstRow, int lastRow, GSMem::TexturePageCache &cache)
+         {
+             if (!columnsReady)
+@@ -3195,6 +3268,8 @@ void GSCpuBackend::DrawSpriteK(const GSPrimitiveBatch &batch)
+ 
+                 for (int x = drawX0; x <= drawX1; ++x)
+                 {
++                    if (!zTestFast(pipe, row, x, y, static_cast<int>(z1)))
++                        continue;
+                     uint32_t texel = 0xFFFF00FFu;
+                     if (state.prim.fst)
+                         texel = smp.template sampleK<K>(cache, 0.0f, 0.0f, 1.0f, columnU[static_cast<size_t>(x - drawX0)], sampleV);
+@@ -3207,7 +3282,7 @@ void GSCpuBackend::DrawSpriteK(const GSPrimitiveBatch &batch)
+                     uint8_t ta = static_cast<uint8_t>((texel >> 24) & 0xFF);
+ 
+                     const TextureCombineResult color = combineTexture(tex, r, g, b, a, tr, tg, tb, ta);
+-                    writePixelFast(pipe, row, x, y, static_cast<int>(z1), color.r, color.g, color.b, color.a, v1.fog);
++                    writePixelFast<true>(pipe, row, x, y, static_cast<int>(z1), color.r, color.g, color.b, color.a, v1.fog);
+                 }
+             }
+         };
+@@ -3321,26 +3396,21 @@ void GSCpuBackend::DrawTriangleK(const GSPrimitiveBatch &batch)
+             PixelRow row;
+             if (firstX <= lastX)
+                 pixelRow(pipe, y, row);
+-            for (int x = firstX; x <= lastX; ++x)
++            // The back end of one pixel from its interpolated sums (colour, U/V or S/T/Q, fog, as floats): the
++            // conversions are the same whether the sums come from the scalar or the AVX2 loop.
++            auto shadePixel = [&](int x, double z, float rSum, float gSum, float bSum, float aSum, float uSum, float vSum,
++                                  float sSum, float tSum, float qSum, float fogSum)
+             {
+-                float px = static_cast<float>(x) + 0.5f;
+-
+-                float w0 = (((fy1 - fy2) * (px - fx2) + (fx2 - fx1) * (py - fy2)) * winding) * invAbsDenom;
+-                float w1 = (((fy2 - fy0) * (px - fx2) + (fx0 - fx2) * (py - fy2)) * winding) * invAbsDenom;
+-                float w2 = 1.0f - w0 - w1;
+-
+-                if (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon)
+-                    continue;
+-
+-                double z = v0.z * w0 + v1.z * w1 + v2.z * w2;
+-
++                const int zValue = static_cast<int>(static_cast<u32>(z + 0.5));
++                if (!zTestFast(pipe, row, x, y, zValue))
++                    return;
+                 uint8_t r, g, b, a;
+                 if (state.prim.iip)
+                 {
+-                    r = clampU8(static_cast<int>(v0.r * w0 + v1.r * w1 + v2.r * w2));
+-                    g = clampU8(static_cast<int>(v0.g * w0 + v1.g * w1 + v2.g * w2));
+-                    b = clampU8(static_cast<int>(v0.b * w0 + v1.b * w1 + v2.b * w2));
+-                    a = clampU8(static_cast<int>(v0.a * w0 + v1.a * w1 + v2.a * w2));
++                    r = clampU8(static_cast<int>(rSum));
++                    g = clampU8(static_cast<int>(gSum));
++                    b = clampU8(static_cast<int>(bSum));
++                    a = clampU8(static_cast<int>(aSum));
+                 }
+                 else
+                 {
+@@ -3356,8 +3426,8 @@ void GSCpuBackend::DrawTriangleK(const GSPrimitiveBatch &batch)
+                     uint16_t iu, iv;
+                     if (state.prim.fst)
+                     {
+-                        iu = static_cast<uint16_t>(v0.u * w0 + v1.u * w1 + v2.u * w2);
+-                        iv = static_cast<uint16_t>(v0.v * w0 + v1.v * w1 + v2.v * w2);
++                        iu = static_cast<uint16_t>(uSum);
++                        iv = static_cast<uint16_t>(vSum);
+                         is = 0.0f;
+                         it = 0.0f;
+                         iq = 1.0f;
+@@ -3367,9 +3437,9 @@ void GSCpuBackend::DrawTriangleK(const GSPrimitiveBatch &batch)
+                         // The GS DDA interpolates the homogeneous S, T and Q
+                         // values. Texel coordinates are calculated from S/Q and
+                         // T/Q only after interpolation.
+-                        is = v0.s * w0 + v1.s * w1 + v2.s * w2;
+-                        it = v0.t * w0 + v1.t * w1 + v2.t * w2;
+-                        iq = v0.q * w0 + v1.q * w1 + v2.q * w2;
++                        is = sSum;
++                        it = tSum;
++                        iq = qSum;
+                         iu = 0;
+                         iv = 0;
+                     }
+@@ -3382,11 +3452,7 @@ void GSCpuBackend::DrawTriangleK(const GSPrimitiveBatch &batch)
+                     uint8_t ta = static_cast<uint8_t>((texel >> 24) & 0xFF);
+ 
+                     const auto &tex = ctx.tex0;
+-                    const uint8_t shadeR = r;
+-                    const uint8_t shadeG = g;
+-                    const uint8_t shadeB = b;
+-                    const uint8_t shadeA = a;
+-                    const TextureCombineResult color = combineTexture(tex, shadeR, shadeG, shadeB, shadeA, tr, tg, tb, ta);
++                    const TextureCombineResult color = combineTexture(tex, r, g, b, a, tr, tg, tb, ta);
+ 
+                     r = color.r;
+                     g = color.g;
+@@ -3394,9 +3460,107 @@ void GSCpuBackend::DrawTriangleK(const GSPrimitiveBatch &batch)
+                     a = color.a;
+                 }
+ 
+-                const uint8_t fog = clampU8(static_cast<int>(v0.fog * w0 + v1.fog * w1 + v2.fog * w2));
+-                writePixelFast(pipe, row, x, y, static_cast<int>(static_cast<u32>(z + 0.5)), r, g, b, a, fog);
++                const uint8_t fog = clampU8(static_cast<int>(fogSum));
++                writePixelFast<true>(pipe, row, x, y, zValue, r, g, b, a, fog);
++            };
++#if defined(__AVX__)
++            // Eight pixels at a time (AVX, the build's baseline): the same float and double operations, in the same order, as the scalar
++            // loop below (no FMA, no reassociation), so the sums are bit-identical; covered pixels then go
++            // through shadePixel one by one.
++            if (firstX <= lastX)
++            {
++                const __m256 vA0 = _mm256_set1_ps(fy1 - fy2);
++                const __m256 vA1 = _mm256_set1_ps(fy2 - fy0);
++                const __m256 vB0 = _mm256_set1_ps((fx2 - fx1) * (py - fy2));
++                const __m256 vB1 = _mm256_set1_ps((fx0 - fx2) * (py - fy2));
++                const __m256 vFx2 = _mm256_set1_ps(fx2);
++                const __m256 vWinding = _mm256_set1_ps(winding);
++                const __m256 vInv = _mm256_set1_ps(invAbsDenom);
++                const __m256 vOne = _mm256_set1_ps(1.0f);
++                const __m256 vHalf = _mm256_set1_ps(0.5f);
++                const __m256 vEps = _mm256_set1_ps(-kEdgeEpsilon);
++                const __m128i vLanesLo = _mm_setr_epi32(0, 1, 2, 3), vLanesHi = _mm_setr_epi32(4, 5, 6, 7);
++                const __m256d vZ0 = _mm256_set1_pd(v0.z), vZ1 = _mm256_set1_pd(v1.z), vZ2 = _mm256_set1_pd(v2.z);
++                auto interpolate = [&](float a0, float a1, float a2, __m256 w0, __m256 w1, __m256 w2) -> __m256
++                {
++                    return _mm256_add_ps(_mm256_add_ps(_mm256_mul_ps(_mm256_set1_ps(a0), w0), _mm256_mul_ps(_mm256_set1_ps(a1), w1)),
++                                         _mm256_mul_ps(_mm256_set1_ps(a2), w2));
++                };
++                alignas(32) float rs[8] = {}, gs[8] = {}, bs[8] = {}, as[8] = {}, us[8] = {}, vs[8] = {}, ss[8] = {}, ts[8] = {}, qs[8] = {}, fogs[8] = {};
++                alignas(32) double zs[8] = {};
++                for (int xBase = firstX; xBase <= lastX; xBase += 8)
++                {
++                    const __m128i xBases = _mm_set1_epi32(xBase);
++                    const __m256i xs = _mm256_set_m128i(_mm_add_epi32(xBases, vLanesHi), _mm_add_epi32(xBases, vLanesLo));
++                    const __m256 px = _mm256_add_ps(_mm256_cvtepi32_ps(xs), vHalf);
++                    const __m256 d = _mm256_sub_ps(px, vFx2);
++                    const __m256 w0 = _mm256_mul_ps(_mm256_mul_ps(_mm256_add_ps(_mm256_mul_ps(vA0, d), vB0), vWinding), vInv);
++                    const __m256 w1 = _mm256_mul_ps(_mm256_mul_ps(_mm256_add_ps(_mm256_mul_ps(vA1, d), vB1), vWinding), vInv);
++                    const __m256 w2 = _mm256_sub_ps(_mm256_sub_ps(vOne, w0), w1);
++                    const __m256 outside = _mm256_or_ps(_mm256_or_ps(_mm256_cmp_ps(w0, vEps, _CMP_LT_OQ), _mm256_cmp_ps(w1, vEps, _CMP_LT_OQ)),
++                                                        _mm256_cmp_ps(w2, vEps, _CMP_LT_OQ));
++                    unsigned mask = static_cast<unsigned>(~_mm256_movemask_ps(outside)) & 0xFFu;
++                    if (lastX - xBase < 7)
++                        mask &= (1u << (lastX - xBase + 1)) - 1u;
++                    if (mask == 0u)
++                        continue;
++                    // z in double, as v.z * w promotes w.
++                    const __m256d w0lo = _mm256_cvtps_pd(_mm256_castps256_ps128(w0)), w0hi = _mm256_cvtps_pd(_mm256_extractf128_ps(w0, 1));
++                    const __m256d w1lo = _mm256_cvtps_pd(_mm256_castps256_ps128(w1)), w1hi = _mm256_cvtps_pd(_mm256_extractf128_ps(w1, 1));
++                    const __m256d w2lo = _mm256_cvtps_pd(_mm256_castps256_ps128(w2)), w2hi = _mm256_cvtps_pd(_mm256_extractf128_ps(w2, 1));
++                    _mm256_store_pd(zs, _mm256_add_pd(_mm256_add_pd(_mm256_mul_pd(vZ0, w0lo), _mm256_mul_pd(vZ1, w1lo)), _mm256_mul_pd(vZ2, w2lo)));
++                    _mm256_store_pd(zs + 4, _mm256_add_pd(_mm256_add_pd(_mm256_mul_pd(vZ0, w0hi), _mm256_mul_pd(vZ1, w1hi)), _mm256_mul_pd(vZ2, w2hi)));
++                    if (state.prim.iip)
++                    {
++                        _mm256_store_ps(rs, interpolate(v0.r, v1.r, v2.r, w0, w1, w2));
++                        _mm256_store_ps(gs, interpolate(v0.g, v1.g, v2.g, w0, w1, w2));
++                        _mm256_store_ps(bs, interpolate(v0.b, v1.b, v2.b, w0, w1, w2));
++                        _mm256_store_ps(as, interpolate(v0.a, v1.a, v2.a, w0, w1, w2));
++                    }
++                    if (state.prim.tme)
++                    {
++                        if (state.prim.fst)
++                        {
++                            _mm256_store_ps(us, interpolate(v0.u, v1.u, v2.u, w0, w1, w2));
++                            _mm256_store_ps(vs, interpolate(v0.v, v1.v, v2.v, w0, w1, w2));
++                        }
++                        else
++                        {
++                            _mm256_store_ps(ss, interpolate(v0.s, v1.s, v2.s, w0, w1, w2));
++                            _mm256_store_ps(ts, interpolate(v0.t, v1.t, v2.t, w0, w1, w2));
++                            _mm256_store_ps(qs, interpolate(v0.q, v1.q, v2.q, w0, w1, w2));
++                        }
++                    }
++                    _mm256_store_ps(fogs, interpolate(v0.fog, v1.fog, v2.fog, w0, w1, w2));
++                    while (mask != 0u)
++                    {
++                        const unsigned lane = static_cast<unsigned>(__builtin_ctz(mask));
++                        mask &= mask - 1u;
++                        shadePixel(xBase + static_cast<int>(lane), zs[lane], rs[lane], gs[lane], bs[lane], as[lane], us[lane], vs[lane],
++                                   ss[lane], ts[lane], qs[lane], fogs[lane]);
++                    }
++                }
++            }
++#else
++            for (int x = firstX; x <= lastX; ++x)
++            {
++                float px = static_cast<float>(x) + 0.5f;
++
++                float w0 = (((fy1 - fy2) * (px - fx2) + (fx2 - fx1) * (py - fy2)) * winding) * invAbsDenom;
++                float w1 = (((fy2 - fy0) * (px - fx2) + (fx0 - fx2) * (py - fy2)) * winding) * invAbsDenom;
++                float w2 = 1.0f - w0 - w1;
++
++                if (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon)
++                    continue;
++
++                const double z = v0.z * w0 + v1.z * w1 + v2.z * w2;
++                shadePixel(x, z, v0.r * w0 + v1.r * w1 + v2.r * w2, v0.g * w0 + v1.g * w1 + v2.g * w2,
++                           v0.b * w0 + v1.b * w1 + v2.b * w2, v0.a * w0 + v1.a * w1 + v2.a * w2,
++                           v0.u * w0 + v1.u * w1 + v2.u * w2, v0.v * w0 + v1.v * w1 + v2.v * w2,
++                           v0.s * w0 + v1.s * w1 + v2.s * w2, v0.t * w0 + v1.t * w1 + v2.t * w2,
++                           v0.q * w0 + v1.q * w1 + v2.q * w2, v0.fog * w0 + v1.fog * w1 + v2.fog * w2);
+             }
++#endif
+         }
+     };
+     ForEachRowBand(minY, maxY, area, drawRows);

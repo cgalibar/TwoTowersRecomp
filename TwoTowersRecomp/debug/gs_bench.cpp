@@ -1,0 +1,532 @@
+// ttr_gs_bench: replays a GS capture (PS2X_GS_CAPTURE=<file>,<vblank>,<presents>) on the software GS.
+//
+//   ttr_gs_bench <capture> [--repeat <n>]        time the replay (best of n), print ms per game frame
+//   ttr_gs_bench <capture> --hashes <file>        also write one VRAM hash per presentation (flushes there)
+//   ttr_gs_bench --compare-hashes <a> <b>         first presentation whose hashes differ
+//   ttr_gs_bench <capture> --dump-vram <file>     write VRAM after the replay
+//   ttr_gs_bench --selftest                      check the row/column swizzle tables against GSMem
+//   ttr_gs_bench --compare-vram <a> <b>           differing bytes and pages of two VRAM dumps
+//   ttr_gs_bench <capture> --png <prefix>         write every presented frame as <prefix><n>.png
+//   ttr_gs_bench <capture> --presents <n>       stop after n presentations (any mode)
+//   ttr_gs_bench <capture> --list-presents       VBlank, primitives and display registers per presentation
+//   ttr_gs_bench <capture> --check-hashes <file>  write diff_<n>.vram at each presentation whose hash differs
+//   ttr_gs_bench <capture> --dump-at <n>          write at_<n>.vram at presentation n
+//   ttr_gs_bench <capture> --stats                pixels and primitives per class of GS state (no drawing)
+//
+// The raster threads follow PS2X_GS_THREADS as in the game (0 = everything on the calling thread, the
+// deterministic reference). TTR_PROFILE works as in the game.
+#include "runtime/gs/gs_capture.h"
+#include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/gs/gs_swizzle.h"
+#include "debug/sampling_profiler.h"
+
+#include "raylib.h"
+
+#if defined(_WIN32)
+extern "C" __declspec(dllimport) int __stdcall GetProcessTimes(void *process, void *creation, void *exit, void *kernel, void *user);
+extern "C" __declspec(dllimport) void *__stdcall GetCurrentProcess();
+#endif
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <string>
+#include <vector>
+
+namespace
+{
+    // User + kernel CPU time of the process, in milliseconds.
+    double processCpuMs()
+    {
+#if defined(_WIN32)
+        uint64_t creation = 0, exit = 0, kernel = 0, user = 0;
+        if (GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user))
+            return static_cast<double>(kernel + user) / 10000.0;
+#endif
+        return 0.0;
+    }
+
+    uint64_t hashBytes(const uint8_t *data, size_t size)
+    {
+        uint64_t hash = 0xCBF29CE484222325ull;
+        size_t i = 0;
+        for (; i + 8u <= size; i += 8u)
+        {
+            uint64_t word;
+            std::memcpy(&word, data + i, 8u);
+            hash = (hash ^ word) * 0x100000001B3ull;
+            hash ^= hash >> 29u;
+        }
+        for (; i < size; ++i)
+            hash = (hash ^ data[i]) * 0x100000001B3ull;
+        return hash;
+    }
+
+    bool readFile(const char *path, std::vector<uint8_t> &out)
+    {
+        FILE *file = std::fopen(path, "rb");
+        if (!file)
+            return false;
+        std::fseek(file, 0, SEEK_END);
+        out.resize(static_cast<size_t>(std::ftell(file)));
+        std::fseek(file, 0, SEEK_SET);
+        const bool ok = std::fread(out.data(), 1u, out.size(), file) == out.size();
+        std::fclose(file);
+        return ok;
+    }
+
+    bool writeFile(const std::string &path, const void *data, size_t size)
+    {
+        FILE *file = std::fopen(path.c_str(), "wb");
+        if (!file)
+            return false;
+        const bool ok = std::fwrite(data, 1u, size, file) == size;
+        std::fclose(file);
+        return ok;
+    }
+
+    int compareHashes(const char *a, const char *b)
+    {
+        std::vector<uint8_t> left, right;
+        if (!readFile(a, left) || !readFile(b, right))
+        {
+            std::printf("cannot read the hash files\n");
+            return 2;
+        }
+        const size_t count = std::min(left.size(), right.size()) / 8u;
+        size_t differing = 0, first = SIZE_MAX;
+        for (size_t i = 0; i < count; ++i)
+        {
+            if (std::memcmp(left.data() + i * 8u, right.data() + i * 8u, 8u) != 0)
+            {
+                ++differing;
+                first = std::min(first, i);
+            }
+        }
+        if (left.size() != right.size())
+            std::printf("different lengths: %zu and %zu presentations\n", left.size() / 8u, right.size() / 8u);
+        if (differing == 0u)
+            std::printf("same: %zu presentations\n", count);
+        else
+            std::printf("DIFFERENT: %zu of %zu presentations, first at presentation %zu\n", differing, count, first);
+        return differing == 0u && left.size() == right.size() ? 0 : 1;
+    }
+
+    int compareVram(const char *a, const char *b)
+    {
+        std::vector<uint8_t> left, right;
+        if (!readFile(a, left) || !readFile(b, right) || left.size() != right.size())
+        {
+            std::printf("cannot read the VRAM dumps (or they differ in size)\n");
+            return 2;
+        }
+        size_t differing = 0, shown = 0;
+        std::map<size_t, size_t> pages;
+        for (size_t i = 0; i < left.size(); ++i)
+        {
+            if (left[i] == right[i])
+                continue;
+            ++differing;
+            ++pages[i / 8192u];
+            if (shown < 20u)
+            {
+                std::printf("  0x%06zx (page %zu): %02x %02x\n", i, i / 8192u, left[i], right[i]);
+                ++shown;
+            }
+        }
+        std::printf("%zu bytes differ in %zu pages\n", differing, pages.size());
+        for (const auto &[page, count] : pages)
+            std::printf("  page %zu (block %zu): %zu bytes\n", page, page * 32u, count);
+        return differing == 0u ? 0 : 1;
+    }
+
+    // --stats: GS state classes by pixel area, to choose what to specialize.
+    struct ClassStats
+    {
+        uint64_t primitives = 0;
+        double pixels = 0.0;
+    };
+
+    std::string classify(const GSPrimitiveBatch &batch, double &area)
+    {
+        const GSDrawState &s = batch.state;
+        const GSContext &c = s.context;
+        const float ofx = static_cast<float>(c.xyoffset.ofx >> 4u);
+        const float ofy = static_cast<float>(c.xyoffset.ofy >> 4u);
+        float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
+        const unsigned count = std::min<unsigned>(batch.vertexCount, 3u);
+        for (unsigned i = 0; i < count; ++i)
+        {
+            minX = std::min(minX, batch.vertices[i].x - ofx);
+            maxX = std::max(maxX, batch.vertices[i].x - ofx);
+            minY = std::min(minY, batch.vertices[i].y - ofy);
+            maxY = std::max(maxY, batch.vertices[i].y - ofy);
+        }
+        minX = std::max(minX, static_cast<float>(c.scissor.x0));
+        minY = std::max(minY, static_cast<float>(c.scissor.y0));
+        maxX = std::min(maxX, static_cast<float>(c.scissor.x1) + 1.0f);
+        maxY = std::min(maxY, static_cast<float>(c.scissor.y1) + 1.0f);
+        area = (maxX > minX && maxY > minY) ? static_cast<double>(maxX - minX) * (maxY - minY) : 0.0;
+
+        const char *type = "point";
+        switch (s.prim.type)
+        {
+        case GS_PRIM_LINE:
+        case GS_PRIM_LINESTRIP:
+            type = "line";
+            break;
+        case GS_PRIM_TRIANGLE:
+        case GS_PRIM_TRISTRIP:
+        case GS_PRIM_TRIFAN:
+            type = "tri";
+            area *= 0.5;
+            break;
+        case GS_PRIM_SPRITE:
+            type = "sprite";
+            break;
+        default:
+            break;
+        }
+        const uint64_t test = c.test;
+        const bool ate = (test & 1u) != 0u;
+        const bool date = ((test >> 14u) & 1u) != 0u;
+        const bool zte = ((test >> 16u) & 1u) != 0u;
+        const unsigned ztst = static_cast<unsigned>((test >> 17u) & 3u);
+        char text[256];
+        int n = std::snprintf(text, sizeof(text), "%-6s fb=%u%s z=%s", type, c.frame.psm, c.frame.fbmsk ? "/msk" : "",
+                              zte ? "" : "off");
+        if (zte)
+            n += std::snprintf(text + n, sizeof(text) - n, "%u/t%u%s", c.zbuf.psm, ztst, c.zbuf.zmask ? "/nowrite" : "");
+        if (ate)
+            n += std::snprintf(text + n, sizeof(text) - n, " atst=%u/fail%u", static_cast<unsigned>((test >> 1u) & 7u),
+                               static_cast<unsigned>((test >> 12u) & 3u));
+        if (date)
+            n += std::snprintf(text + n, sizeof(text) - n, " date");
+        if (s.prim.abe)
+        {
+            const uint64_t a = c.alpha;
+            n += std::snprintf(text + n, sizeof(text) - n, " blend=%u%u%u%u", static_cast<unsigned>(a & 3u),
+                               static_cast<unsigned>((a >> 2u) & 3u), static_cast<unsigned>((a >> 4u) & 3u),
+                               static_cast<unsigned>((a >> 6u) & 3u));
+        }
+        if (s.prim.tme)
+            n += std::snprintf(text + n, sizeof(text) - n, " tex=%u%s tfx=%u tcc=%u%s", c.tex0.psm,
+                               s.linearFilter ? "/lin" : "", c.tex0.tfx, c.tex0.tcc, s.prim.fst ? " uv" : " stq");
+        if (s.prim.fge)
+            n += std::snprintf(text + n, sizeof(text) - n, " fog");
+        if (s.prim.iip)
+            n += std::snprintf(text + n, sizeof(text) - n, " gouraud");
+        return text;
+    }
+
+    struct Options
+    {
+        const char *capture = nullptr;
+        int repeat = 1;
+        std::string hashesPath;
+        std::string vramPath;
+        std::string pngPrefix;
+        bool stats = false;
+        bool listPresents = false;
+        uint64_t maxPresents = 0;
+        std::string checkHashesPath;
+        uint64_t dumpAt = ~0ull;
+        int touchingPage = -1;
+        uint64_t fromPresent = 0;
+    };
+
+    // Pages of the pixel rectangle [x0, x1] x [y0, y1] of a buffer (as GSCpuBackend's markRect).
+    void pagesOfRect(std::vector<bool> &pages, uint32_t bp, uint32_t bw, uint32_t psm, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1)
+    {
+        uint32_t pw = 64u, ph = 32u;
+        switch (psm)
+        {
+        case GS_PSM_T4: pw = 128u; ph = 128u; break;
+        case GS_PSM_T8: pw = 128u; ph = 64u; break;
+        case GS_PSM_CT16: case GS_PSM_CT16S: case GS_PSM_Z16: case GS_PSM_Z16S: pw = 64u; ph = 64u; break;
+        default: break;
+        }
+        const uint32_t perRow = std::max<uint32_t>((std::max<uint32_t>(bw, 1u) * 64u + pw - 1u) / pw, 1u);
+        const uint32_t spill = (bp & 31u) != 0u ? 1u : 0u;
+        for (uint32_t row = y0 / ph; row <= y1 / ph; ++row)
+            for (uint32_t col = x0 / pw; col <= x1 / pw + spill; ++col)
+                pages[((bp >> 5u) + row * perRow + col) & 511u] = true;
+    }
+}
+
+int main(int argc, char **argv)
+{
+    ttr::debug::startSamplingProfilerFromEnvironment();
+    Options options;
+    for (int i = 1; i < argc; ++i)
+    {
+        const std::string arg = argv[i];
+        if (arg == "--compare-hashes" && i + 2 < argc)
+            return compareHashes(argv[i + 1], argv[i + 2]);
+        if (arg == "--compare-vram" && i + 2 < argc)
+            return compareVram(argv[i + 1], argv[i + 2]);
+        if (arg == "--selftest")
+        {
+            std::string report;
+            const bool ok = GSSwizzle::SelfTest(report);
+            std::printf("swizzle tables: %s %s\n", ok ? "OK" : "FAILED", report.c_str());
+            return ok ? 0 : 1;
+        }
+        if (arg == "--repeat" && i + 1 < argc)
+            options.repeat = std::max(1, std::atoi(argv[++i]));
+        else if (arg == "--hashes" && i + 1 < argc)
+            options.hashesPath = argv[++i];
+        else if (arg == "--dump-vram" && i + 1 < argc)
+            options.vramPath = argv[++i];
+        else if (arg == "--png" && i + 1 < argc)
+            options.pngPrefix = argv[++i];
+        else if (arg == "--stats")
+            options.stats = true;
+        else if (arg == "--presents" && i + 1 < argc)
+            options.maxPresents = std::strtoull(argv[++i], nullptr, 10);
+        else if (arg == "--check-hashes" && i + 1 < argc)
+            options.checkHashesPath = argv[++i];
+        else if (arg == "--dump-at" && i + 1 < argc)
+            options.dumpAt = std::strtoull(argv[++i], nullptr, 10);
+        else if (arg == "--touching" && i + 1 < argc)
+            options.touchingPage = static_cast<int>(std::strtol(argv[++i], nullptr, 10));
+        else if (arg == "--from" && i + 1 < argc)
+            options.fromPresent = std::strtoull(argv[++i], nullptr, 10);
+        else if (arg == "--list-presents")
+            options.listPresents = true;
+        else if (!options.capture && arg[0] != '-')
+            options.capture = argv[i];
+        else
+        {
+            std::printf("unknown argument %s\n", argv[i]);
+            return 2;
+        }
+    }
+    if (!options.capture)
+    {
+        std::printf("usage: ttr_gs_bench <capture> [--repeat n] [--hashes file] [--dump-vram file] [--png prefix] [--stats]\n"
+                    "       ttr_gs_bench --compare-hashes <a> <b> | --compare-vram <a> <b>\n");
+        return 2;
+    }
+
+    GSCapture::Capture capture;
+    std::string error;
+    if (!GSCapture::Load(options.capture, capture, error))
+    {
+        std::printf("%s: %s\n", options.capture, error.c_str());
+        return 2;
+    }
+    std::printf("capture: VBlank %u, %.1f MB of records\n", capture.header.firstVblank,
+                static_cast<double>(capture.stream.size()) / 1048576.0);
+
+    if (options.touchingPage >= 0)
+    {
+        GSCapture::ReplayHooks hooks;
+        hooks.maxPresents = options.maxPresents;
+        uint64_t present = 0, index = 0;
+        hooks.onPresent = [&](const GSPresentationRequest &, const PresentationFrame *) { ++present; };
+        hooks.onSubmit = [&](const GSPrimitiveBatch &batch)
+        {
+            ++index;
+            if (present < options.fromPresent)
+                return;
+            const GSDrawState &st = batch.state;
+            const GSContext &c = st.context;
+            const unsigned count = std::min<unsigned>(batch.vertexCount, 3u);
+            float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
+            for (unsigned i = 0; i < count; ++i)
+            {
+                minX = std::min(minX, batch.vertices[i].x);
+                maxX = std::max(maxX, batch.vertices[i].x);
+                minY = std::min(minY, batch.vertices[i].y);
+                maxY = std::max(maxY, batch.vertices[i].y);
+            }
+            const int ofx = c.xyoffset.ofx >> 4, ofy = c.xyoffset.ofy >> 4;
+            const int x0 = std::max<int>(static_cast<int>(std::floor(minX)) - ofx - 1, c.scissor.x0);
+            const int x1 = std::min<int>(static_cast<int>(std::ceil(maxX)) - ofx + 1, c.scissor.x1);
+            const int y0 = std::max<int>(static_cast<int>(std::floor(minY)) - ofy - 1, c.scissor.y0);
+            const int y1 = std::min<int>(static_cast<int>(std::ceil(maxY)) - ofy + 1, c.scissor.y1);
+            if (x0 > x1 || y0 > y1)
+                return;
+            std::vector<bool> fb(512), z(512), tex(512);
+            pagesOfRect(fb, c.frame.fbp << 5u, c.frame.fbw, c.frame.psm, x0, y0, x1, y1);
+            pagesOfRect(z, c.zbuf.zbp << 5u, c.frame.fbw, c.zbuf.psm, x0, y0, x1, y1);
+            if (st.prim.tme)
+                pagesOfRect(tex, c.tex0.tbp0, c.tex0.tbw, c.tex0.psm, 0, 0, std::max<int>(st.textureWidth, 1) - 1,
+                            std::max<int>(st.textureHeight, 1) - 1);
+            const int page = options.touchingPage;
+            if (!fb[page] && !z[page] && !tex[page])
+                return;
+            std::printf("present %llu prim %llu %s%s%s type %u rect (%d,%d)-(%d,%d) fb %u/%u/psm%u msk %08x z %u/psm%u%s zte %u "
+                        "tex %u/%u/psm%u %ux%u abe %u alpha %llx test %llx\n",
+                        static_cast<unsigned long long>(present), static_cast<unsigned long long>(index), fb[page] ? "FB " : "",
+                        z[page] ? "Z " : "", tex[page] ? "TEX " : "", st.prim.type, x0, y0, x1, y1, c.frame.fbp, c.frame.fbw,
+                        c.frame.psm, c.frame.fbmsk, c.zbuf.zbp, c.zbuf.psm, c.zbuf.zmask ? " nowrite" : "",
+                        static_cast<unsigned>((c.test >> 16u) & 1u), c.tex0.tbp0, c.tex0.tbw, c.tex0.psm, st.textureWidth,
+                        st.textureHeight, st.prim.abe, static_cast<unsigned long long>(c.alpha),
+                        static_cast<unsigned long long>(c.test));
+        };
+        GSCapture::Replay(capture, nullptr, hooks);
+        return 0;
+    }
+
+    if (options.listPresents)
+    {
+        GSCapture::ReplayHooks hooks;
+        uint64_t submits = 0;
+        hooks.onSubmit = [&](const GSPrimitiveBatch &) { ++submits; };
+        hooks.onPresent = [&](const GSPresentationRequest &r, const PresentationFrame *)
+        {
+            std::printf("vblank %llu prims %llu dispfb1 %llx dispfb2 %llx pmode %llx preferred %d fbp %u dest %u ctx fbp %u %u\n",
+                        static_cast<unsigned long long>(r.vsyncTick), static_cast<unsigned long long>(submits),
+                        static_cast<unsigned long long>(r.dispfb1), static_cast<unsigned long long>(r.dispfb2),
+                        static_cast<unsigned long long>(r.pmode), r.hasPreferredSource ? 1 : 0, r.preferredSource.fbp,
+                        r.preferredDestFbp, r.contextFrames[0].fbp, r.contextFrames[1].fbp);
+            submits = 0;
+        };
+        GSCapture::Replay(capture, nullptr, hooks);
+        return 0;
+    }
+
+    if (options.stats)
+    {
+        std::map<std::string, ClassStats> classes;
+        GSCapture::ReplayHooks hooks;
+        hooks.maxPresents = options.maxPresents;
+        double totalPixels = 0.0;
+        hooks.onSubmit = [&](const GSPrimitiveBatch &batch)
+        {
+            double area = 0.0;
+            ClassStats &entry = classes[classify(batch, area)];
+            ++entry.primitives;
+            entry.pixels += area;
+            totalPixels += area;
+        };
+        const GSCapture::ReplayCounts counts = GSCapture::Replay(capture, nullptr, hooks);
+        std::vector<std::pair<std::string, ClassStats>> sorted(classes.begin(), classes.end());
+        std::sort(sorted.begin(), sorted.end(), [](const auto &a, const auto &b)
+                  { return a.second.pixels > b.second.pixels; });
+        std::printf("%llu primitives, %.1f M pixels (bounding boxes; triangles count half), %zu classes\n",
+                    static_cast<unsigned long long>(counts.submits), totalPixels / 1e6, sorted.size());
+        double cumulative = 0.0;
+        for (size_t i = 0; i < sorted.size() && i < 40u; ++i)
+        {
+            cumulative += sorted[i].second.pixels;
+            std::printf("%5.1f%% %5.1f%% %8llu prims  %s\n", 100.0 * sorted[i].second.pixels / totalPixels,
+                        100.0 * cumulative / totalPixels, static_cast<unsigned long long>(sorted[i].second.primitives),
+                        sorted[i].first.c_str());
+        }
+        return 0;
+    }
+
+    std::vector<uint64_t> expected;
+    if (!options.checkHashesPath.empty())
+    {
+        std::vector<uint8_t> bytes;
+        if (!readFile(options.checkHashesPath.c_str(), bytes))
+        {
+            std::printf("cannot read %s\n",options.checkHashesPath.c_str());
+            return 2;
+        }
+        expected.resize(bytes.size() / 8u);
+        std::memcpy(expected.data(), bytes.data(), expected.size() * 8u);
+        if (options.hashesPath.empty())
+            options.hashesPath = "-";
+    }
+    double best = 1e30;
+    std::vector<uint64_t> hashes;
+    std::vector<uint8_t> vram;
+    GSCapture::ReplayCounts counts;
+    uint64_t flips = 0;
+    for (int run = 0; run < options.repeat; ++run)
+    {
+        vram = capture.vram;
+        auto backend = std::make_unique<GSCpuBackend>();
+        backend->Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
+        backend->SetClutState(capture.clut);
+        hashes.clear();
+        flips = 0;
+        // The game draws into a back buffer and copies it to the displayed one: a presentation shows a new
+        // game frame when something was drawn into the displayed buffer since the previous one.
+        uint32_t displayFbp = ~0u;
+        bool drewDisplay = false;
+        uint64_t presentIndex = 0;
+        GSCapture::ReplayHooks hooks;
+        hooks.maxPresents = options.maxPresents;
+        hooks.onSubmit = [&](const GSPrimitiveBatch &batch)
+        {
+            if (batch.state.context.frame.fbp == displayFbp)
+                drewDisplay = true;
+        };
+        hooks.onPresent = [&](const GSPresentationRequest &request, const PresentationFrame *frame)
+        {
+            if (drewDisplay)
+                ++flips;
+            drewDisplay = false;
+            displayFbp = static_cast<uint32_t>(request.dispfb1 & 0x1FFu);
+            if (!options.hashesPath.empty() || presentIndex == options.dumpAt)
+            {
+                backend->Flush();
+                // VRAM after everything submitted so far, and the frame the backend presented.
+                uint64_t hash = hashBytes(vram.data(), vram.size());
+                if (frame && *frame)
+                    hash ^= hashBytes(frame->pixels.data(), frame->pixels.size()) * 0x9E3779B97F4A7C15ull;
+                hashes.push_back(hash);
+                const size_t i = hashes.size() - 1u;
+                if (presentIndex == options.dumpAt)
+                    writeFile("at_" + std::to_string(presentIndex) + ".vram", vram.data(), vram.size());
+                if (i < expected.size() && expected[i] != hashes.back())
+                {
+                    std::printf("presentation %zu differs: writing diff_%zu.vram\n",i, i);
+                    writeFile("diff_" + std::to_string(i) + ".vram", vram.data(), vram.size());
+                }
+            }
+            if (!options.pngPrefix.empty() && frame && *frame)
+            {
+                {
+                    Image image{};
+                    image.data = const_cast<uint8_t *>(frame->pixels.data());
+                    image.width = static_cast<int>(frame->width);
+                    image.height = static_cast<int>(frame->height);
+                    image.mipmaps = 1;
+                    image.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+                    char name[64];
+                    std::snprintf(name, sizeof(name), "%04llu.png", static_cast<unsigned long long>(presentIndex));
+                    ExportImage(image, (options.pngPrefix + name).c_str());
+                }
+            }
+            ++presentIndex;
+        };
+        const double cpuStart = processCpuMs();
+        const auto start = std::chrono::steady_clock::now();
+        counts = GSCapture::Replay(capture, backend.get(), hooks);
+        backend->Flush();
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        const double cpu = processCpuMs() - cpuStart;
+        best = std::min(best, ms);
+        // CPU time of every thread (spinning included): how much work the replay costs, whatever the waits.
+        std::printf("run %d: %.1f ms, CPU %.1f ms (%.1f ms per game frame)\n", run + 1, ms, cpu,
+                    cpu / static_cast<double>(std::max<uint64_t>(flips, 1u)));
+    }
+
+    const double frames = static_cast<double>(std::max<uint64_t>(flips, 1u));
+    std::printf("%llu commands, %llu primitives, %llu uploads (%.1f MB), %llu presentations, %llu game frames%s\n",
+                static_cast<unsigned long long>(counts.commands), static_cast<unsigned long long>(counts.submits),
+                static_cast<unsigned long long>(counts.uploads), static_cast<double>(counts.uploadBytes) / 1048576.0,
+                static_cast<unsigned long long>(counts.presents), static_cast<unsigned long long>(flips),
+                counts.truncated ? " (capture truncated)" : "");
+    std::printf("best %.1f ms: %.2f ms per game frame, %.2f M primitives/s\n", best, best / frames,
+                static_cast<double>(counts.submits) / (best * 1000.0));
+    std::printf("final VRAM hash %016llx\n", static_cast<unsigned long long>(hashBytes(vram.data(), vram.size())));
+    if (!options.hashesPath.empty() && options.hashesPath != "-" &&
+        !writeFile(options.hashesPath, hashes.data(), hashes.size() * sizeof(uint64_t)))
+        std::printf("cannot write %s\n", options.hashesPath.c_str());
+    if (!options.vramPath.empty() && !writeFile(options.vramPath, vram.data(), vram.size()))
+        std::printf("cannot write %s\n", options.vramPath.c_str());
+    return 0;
+}

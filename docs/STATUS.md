@@ -296,6 +296,15 @@ Reparto en la batalla (`PS2X_VIF1_STATS=1`, `PS2X_GS_STATS=1`):
   la textura vieja) y los demás esperan a que el hilo 0 la haga (la usan los lotes siguientes). Hacer esas
   dependencias exactas no ganó nada: es la propia secuencia subir → dibujar → subir en las mismas páginas.
 
+Parches `0014`-`0016` (GS sin barreras por texturas, banco de pruebas, triángulos con AVX, Z primero): la
+batalla pasa a **~15,4 fps** (13,5 con `0014`-`0015`) y
+desaparecen los bloques morados. Las texturas se leen de copias de sus páginas tomadas al encolar cada primitiva
+(semántica de caché de texturas hasta `TEXFLUSH`), así que las subidas y cargas de CLUT van al momento y los
+lotes ya no esperan unos a otros por lo que muestrean; direcciones de VRAM por tablas fila + columna. Con
+`ttr_gs_bench` sobre una captura de la batalla (`PS2X_GS_CAPTURE`): 173 → 101 ms por frame de juego con 9 hilos,
+idéntico bit a bit a la ruta de un hilo. Con `0016` el límite del juego pasa a ser el hilo de VIF1 (99 % ocupado,
+VU1 88 %); el raster sigue cerca (no escala más de ~3,7 veces en 6 núcleos). Detalle y siguientes pasos en [PLAN_60FPS.md](PLAN_60FPS.md), sección 6.1.
+
 ## Siguiente
 
 **Objetivo actual: el juego tal cual en PS2 pero a 60 fps.** El plan detallado, con las medidas por hilo, el

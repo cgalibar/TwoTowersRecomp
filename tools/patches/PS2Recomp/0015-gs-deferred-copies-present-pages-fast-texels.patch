@@ -1,0 +1,370 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+index 39e92f5..f19ed31 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+@@ -100,8 +100,13 @@ private:
+     void UploadImageUnlocked(const uint8_t *data, uint32_t sizeBytes, GSTransferCommand &transfer, GSTransferSnapshot &state,
+                              uint8_t *vram);
+     const uint16_t *ActiveClut() const;
++    // Dispatch on the texel format (Sampler::texelKind) to DrawSpriteK / DrawTriangleK.
+     void DrawSprite(const GSPrimitiveBatch &batch);
+     void DrawTriangle(const GSPrimitiveBatch &batch);
++    template <unsigned TexelKind>
++    void DrawSpriteK(const GSPrimitiveBatch &batch);
++    template <unsigned TexelKind>
++    void DrawTriangleK(const GSPrimitiveBatch &batch);
+     void DrawLine(const GSPrimitiveBatch &batch);
+     // Calls rows(first, last, textureCache) over [firstRow, lastRow]: in one go for small primitives, or in bands
+     // spread over the raster workers. Every pixel is still written by one thread, in primitive order.
+@@ -183,7 +188,6 @@ private:
+     std::vector<std::unique_ptr<uint8_t[]>> m_copyStorage;
+     // The host-to-local transfer in progress: its destination pages.
+     std::bitset<512> m_transferPages;
+-    bool m_waitingForTexture = false; // statistics: who waits in WaitForFbPagesUnlocked
+     std::unique_ptr<GSBandPipeline> m_bandPipeline;
+ 
+     GSTransferCommand m_transfer{};
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 938d090..5e36321 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -121,16 +121,12 @@ namespace
+     std::atomic<uint64_t> g_flushCount[kFlushReasons]{};
+     std::atomic<uint64_t> g_flushWaitNs[kFlushReasons]{};
+     std::atomic<uint64_t> g_publishWaitNs{0};
+-    std::atomic<uint64_t> g_clutShadowLoads{0};
+-    std::atomic<uint64_t> g_clutDeferred{0};
+-    std::atomic<uint64_t> g_rawSelf{0}, g_rawSelfNow{0}, g_rawSelfCopy{0}, g_rawPending{0}, g_rawInflight{0};
+-    // Band workers (summed over workers): drawing, waiting at barrier/serial slots, waiting for work.
++    // Band workers (summed over workers): drawing, waiting before a slot (barrier or page copies), waiting
++    // for work.
+     std::atomic<uint64_t> g_bandDrawNs{0}, g_bandBarrierNs{0}, g_bandIdleNs{0};
+-    // By slot kind (0 serial barrier, 1 barrier, 2 none): time waiting before the slot, slots seen by worker 0.
++    // By slot kind (0 with page copies, 1 barrier, 2 plain): time waiting before the slot, slots seen by worker 0.
+     std::atomic<uint64_t> g_bandWaitNs[3]{}, g_bandSlotKinds[3]{};
+-    // Serial operations: [0] worker 0 running them, [1] the other workers waiting for them.
+-    std::atomic<uint64_t> g_bandSerialNs[2]{};
+-    // GS thread: time inside Submit (classification, hazards, publishing).
++    // GS thread: time inside Submit (texture pages, frame/Z pages, publishing).
+     std::atomic<uint64_t> g_submitNs{0};
+     uint64_t statNowNs()
+     {
+@@ -138,40 +134,13 @@ namespace
+                                          std::chrono::steady_clock::now().time_since_epoch())
+                                          .count());
+     }
+-    // Diagnostics switches: PS2X_GS_SHADOW_CLUT=0 (CLUT loads never read the shadow VRAM), PS2X_GS_IMMEDIATE_UPLOAD=0
+-    // (host-to-local transfers are always queued).
+-    const bool g_gsShadowClut = []
+-    {
+-        const char *env = std::getenv("PS2X_GS_SHADOW_CLUT");
+-        return !(env && env[0] == '0');
+-    }();
+-    const bool g_gsSelfNow = []
+-    {
+-        const char *env = std::getenv("PS2X_GS_SELF_NOW");
+-        return !(env && env[0] == '0');
+-    }();
+-    const bool g_gsSelfCopy = []
+-    {
+-        const char *env = std::getenv("PS2X_GS_SELF_COPY");
+-        return !(env && env[0] == '0');
+-    }();
+-    const bool g_gsImmediateUploads = []
+-    {
+-        const char *env = std::getenv("PS2X_GS_IMMEDIATE_UPLOAD");
+-        return !(env && env[0] == '0');
+-    }();
+-    // PS2X_GS_RAW_BARRIER=1: a primitive that samples pages a batch in flight draws waits for it (barrier).
+-    const bool g_rawFlightBarrier = []
+-    {
+-        const char *env = std::getenv("PS2X_GS_RAW_BARRIER");
+-        return !(env && env[0] == '0');
+-    }();
+     std::atomic<uint64_t> g_publishCount{0};
+     // Why the pending batch was handed over (PS2X_GS_STATS): full, CLUT load, texture copy, frame/Z wait,
+     // layout change, flush.
+     enum PublishReason { kPubFull, kPubClut, kPubTexture, kPubFbWait, kPubLayout, kPubFlush, kPubReasons };
+     std::atomic<uint64_t> g_publishReason[kPubReasons]{};
+-    std::atomic<uint64_t> g_waitReason[2]{}; // [0] texture copies, [1] uploads/CLUT
++    // [0] texture pages copied by worker 0 (still drawn when sampled), [1] GS thread waits for frame/Z pages.
++    std::atomic<uint64_t> g_waitReason[2]{};
+     inline void countPublish(PublishReason reason)
+     {
+         if (g_gsStats)
+@@ -202,18 +171,9 @@ namespace
+                      static_cast<unsigned long long>(g_statPrims[GS_PRIM_POINT].exchange(0) + g_statPrims[GS_PRIM_LINE].exchange(0) +
+                                                      g_statPrims[GS_PRIM_LINESTRIP].exchange(0)));
+         char line[512];
+-        int len = std::snprintf(line, sizeof(line),
+-                                "[gs-flush] batches=%llu slot-wait=%.0fms clut-from-copy=%llu clut-deferred=%llu "
+-                                "read-after-write: self=%llu (drawn at once %llu, from a copy %llu) batch=%llu flight=%llu waits:",
++        int len = std::snprintf(line, sizeof(line), "[gs-flush] batches=%llu slot-wait=%.0fms waits:",
+                                 static_cast<unsigned long long>(g_publishCount.exchange(0)),
+-                                static_cast<double>(g_publishWaitNs.exchange(0)) / 1e6,
+-                                static_cast<unsigned long long>(g_clutShadowLoads.exchange(0)),
+-                                static_cast<unsigned long long>(g_clutDeferred.exchange(0)),
+-                                static_cast<unsigned long long>(g_rawSelf.exchange(0)),
+-                                static_cast<unsigned long long>(g_rawSelfNow.exchange(0)),
+-                                static_cast<unsigned long long>(g_rawSelfCopy.exchange(0)),
+-                                static_cast<unsigned long long>(g_rawPending.exchange(0)),
+-                                static_cast<unsigned long long>(g_rawInflight.exchange(0)));
++                                static_cast<double>(g_publishWaitNs.exchange(0)) / 1e6);
+         for (int r = 0; r < kFlushReasons && len > 0 && len < static_cast<int>(sizeof(line)); ++r)
+         {
+             const uint64_t count = g_flushCount[r].exchange(0);
+@@ -223,7 +183,7 @@ namespace
+                                      kFlushReasonNames[r], static_cast<unsigned long long>(count), static_cast<double>(ns) / 1e6);
+         }
+         std::fprintf(stderr, "%s\n", line);
+-        std::fprintf(stderr, "[gs-publish] full=%llu clut=%llu texture=%llu fb-wait=%llu layout=%llu flush=%llu; waits: texture=%llu upload/clut=%llu\n",
++        std::fprintf(stderr, "[gs-publish] full=%llu clut=%llu texture=%llu fb-wait=%llu layout=%llu flush=%llu; deferred page copies=%llu fb waits=%llu\n",
+                      static_cast<unsigned long long>(g_publishReason[kPubFull].exchange(0)),
+                      static_cast<unsigned long long>(g_publishReason[kPubClut].exchange(0)),
+                      static_cast<unsigned long long>(g_publishReason[kPubTexture].exchange(0)),
+@@ -235,11 +195,10 @@ namespace
+         std::fprintf(stderr, "[gs-time] band workers (summed): draw=%.0fms barrier=%.0fms idle=%.0fms; gs thread: submit=%.0fms\n",
+                      static_cast<double>(g_bandDrawNs.exchange(0)) / 1e6, static_cast<double>(g_bandBarrierNs.exchange(0)) / 1e6,
+                      static_cast<double>(g_bandIdleNs.exchange(0)) / 1e6, static_cast<double>(g_submitNs.exchange(0)) / 1e6);
+-        std::fprintf(stderr, "[gs-time] slots: serial-barrier=%llu (wait %.0fms) barrier=%llu (wait %.0fms) plain=%llu (wait %.0fms); serial ops run=%.0fms waited-for=%.0fms\n",
++        std::fprintf(stderr, "[gs-time] slots: copies=%llu (wait %.0fms) barrier=%llu (wait %.0fms) plain=%llu (wait %.0fms)\n",
+                      static_cast<unsigned long long>(g_bandSlotKinds[0].exchange(0)), static_cast<double>(g_bandWaitNs[0].exchange(0)) / 1e6,
+                      static_cast<unsigned long long>(g_bandSlotKinds[1].exchange(0)), static_cast<double>(g_bandWaitNs[1].exchange(0)) / 1e6,
+-                     static_cast<unsigned long long>(g_bandSlotKinds[2].exchange(0)), static_cast<double>(g_bandWaitNs[2].exchange(0)) / 1e6,
+-                     static_cast<double>(g_bandSerialNs[0].exchange(0)) / 1e6, static_cast<double>(g_bandSerialNs[1].exchange(0)) / 1e6);
++                     static_cast<unsigned long long>(g_bandSlotKinds[2].exchange(0)), static_cast<double>(g_bandWaitNs[2].exchange(0)) / 1e6);
+     }
+ }
+ 
+@@ -417,7 +376,7 @@ private:
+                 if (g_gsStats)
+                 {
+                     const uint64_t end = statNowNs();
+-                    const int kind = slot.barrier ? 1 : 2;
++                    const int kind = slot.barrier ? 1 : (slot.copies.empty() ? 2 : 0);
+                     g_bandWaitNs[kind].fetch_add(drawStart - barrierStart, std::memory_order_relaxed);
+                     if (k == 0u)
+                         g_bandSlotKinds[kind].fetch_add(1u, std::memory_order_relaxed);
+@@ -1572,7 +1531,7 @@ void GSCpuBackend::WaitForFbPagesUnlocked(const std::bitset<512> &pages)
+         return;
+     if (g_gsStats)
+     {
+-        g_waitReason[m_waitingForTexture ? 0 : 1].fetch_add(1u, std::memory_order_relaxed);
++        g_waitReason[1].fetch_add(1u, std::memory_order_relaxed);
+         const auto start = std::chrono::steady_clock::now();
+         m_bandPipeline->waitDoneBelow(need);
+         g_flushCount[kFlushTransfer].fetch_add(1u, std::memory_order_relaxed);
+@@ -2450,6 +2409,106 @@ struct GSCpuBackend::Sampler
+         }
+     }
+ 
++    // readTexel for one texel kind, known at compile time (DrawSpriteK / DrawTriangleK).
++    template <unsigned K>
++    uint32_t readTexelK(GSMem::TexturePageCache &cache, uint32_t u, uint32_t v) const
++    {
++        if constexpr (K == 0u)
++            return read(cache, vram, tbp, tbw, u, v);
++        else
++        {
++            const uint32_t pixel = GSSwizzle::AddressFast(*format, texBase, texRowStride, u, v);
++            if constexpr (K == 1u || K == 2u)
++            {
++                uint32_t value = 0u;
++                std::memcpy(&value, cache.Resolve(vram, (pixel << 2u) & 0x3FFFFCu), 4u);
++                return K == 2u ? (value & 0x00FFFFFFu) : value;
++            }
++            else if constexpr (K == 3u)
++            {
++                uint16_t value = 0u;
++                std::memcpy(&value, cache.Resolve(vram, (pixel << 1u) & 0x3FFFFEu), 2u);
++                return value;
++            }
++            else if constexpr (K == 4u)
++                return *cache.Resolve(vram, pixel & 0x3FFFFFu);
++            else if constexpr (K == 5u)
++                return (*cache.Resolve(vram, (pixel >> 1u) & 0x3FFFFFu) >> ((pixel & 1u) * 4u)) & 0x0Fu;
++            else if constexpr (K == 6u)
++                return *cache.Resolve(vram, ((pixel << 2u) + 3u) & 0x3FFFFFu);
++            else if constexpr (K == 7u)
++                return *cache.Resolve(vram, ((pixel << 2u) + 3u) & 0x3FFFFFu) & 0x0Fu;
++            else
++                return (*cache.Resolve(vram, ((pixel << 2u) + 3u) & 0x3FFFFFu) >> 4u) & 0x0Fu;
++        }
++    }
++
++    template <unsigned K>
++    uint32_t pointK(GSMem::TexturePageCache &cache, int u, int v) const
++    {
++        u = wrapTextureCoordinate(u, texW, wrapU, minU, maxU);
++        v = wrapTextureCoordinate(v, texH, wrapV, minV, maxV);
++        const uint32_t raw = readTexelK<K>(cache, static_cast<uint32_t>(u), static_cast<uint32_t>(v));
++        if (palette)
++            return palette[raw & 0xFFu];
++        switch (kind)
++        {
++        case 1:
++            return applyTexa(texa, psm, raw);
++        case 2:
++            return applyTexa(texa, psm, Rgba5551ToRgba8888(static_cast<u16>(raw)));
++        case 3:
++            return clutLookup(static_cast<uint8_t>(raw));
++        default:
++            return 0xFFFF00FFu;
++        }
++    }
++
++    // sample() with pointK.
++    template <unsigned K>
++    uint32_t sampleK(GSMem::TexturePageCache &cache, float s, float t, float q, uint16_t u, uint16_t v) const
++    {
++        float texUf, texVf;
++        if (fst)
++        {
++            texUf = static_cast<float>(u) / 16.0f;
++            texVf = static_cast<float>(v) / 16.0f;
++        }
++        else
++        {
++            const float invQ = 1.0f / fabsQ(q);
++            texUf = s * invQ * fTexW;
++            texVf = t * invQ * fTexH;
++        }
++        if (!linear)
++            return pointK<K>(cache, static_cast<int>(texUf), static_cast<int>(texVf));
++
++        const float sampleU = texUf - 0.5f;
++        const float sampleV = texVf - 0.5f;
++        const int u0 = static_cast<int>(std::floor(sampleU));
++        const int v0 = static_cast<int>(std::floor(sampleV));
++        const float fx = sampleU - static_cast<float>(u0);
++        const float fy = sampleV - static_cast<float>(v0);
++        const uint32_t wx = static_cast<uint32_t>(fx * 256.0f + 0.5f);
++        const uint32_t wy = static_cast<uint32_t>(fy * 256.0f + 0.5f);
++        const uint32_t c00 = pointK<K>(cache, u0, v0);
++        const uint32_t c10 = wx != 0u ? pointK<K>(cache, u0 + 1, v0) : 0u;
++        const uint32_t c01 = wy != 0u ? pointK<K>(cache, u0, v0 + 1) : 0u;
++        const uint32_t c11 = (wx != 0u && wy != 0u) ? pointK<K>(cache, u0 + 1, v0 + 1) : 0u;
++        if (wx == 0u && wy == 0u)
++            return c00;
++        constexpr uint32_t kMask = 0x00FF00FFu;
++        const auto lerp2 = [](uint32_t a, uint32_t b, uint32_t w) -> uint32_t
++        {
++            return (((a * (256u - w)) + (b * w) + 0x00800080u) >> 8) & kMask;
++        };
++        const uint32_t topRb = lerp2(c00 & kMask, c10 & kMask, wx);
++        const uint32_t topGa = lerp2((c00 >> 8) & kMask, (c10 >> 8) & kMask, wx);
++        const uint32_t bottomRb = lerp2(c01 & kMask, c11 & kMask, wx);
++        const uint32_t bottomGa = lerp2((c01 >> 8) & kMask, (c11 >> 8) & kMask, wx);
++        return lerp2(topRb, bottomRb, wy) | (lerp2(topGa, bottomGa, wy) << 8);
++    }
++
+     // The same value as GSMem::ReadTextureAs<psm> (bit offsets and 4 MiB wrap included).
+     uint32_t readTexel(GSMem::TexturePageCache &cache, uint32_t u, uint32_t v) const
+     {
+@@ -3012,7 +3071,8 @@ void GSCpuBackend::ForEachRowBand(int firstRow, int lastRow, uint64_t area, Rows
+     m_rasterWorkers->run(bands, band);
+ }
+ 
+-void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
++template <unsigned K>
++void GSCpuBackend::DrawSpriteK(const GSPrimitiveBatch &batch)
+ {
+     const GSDrawState &state = batch.state;
+     PixelPipe pipe;
+@@ -3137,9 +3197,9 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+                 {
+                     uint32_t texel = 0xFFFF00FFu;
+                     if (state.prim.fst)
+-                        texel = smp.sample(cache, 0.0f, 0.0f, 1.0f, columnU[static_cast<size_t>(x - drawX0)], sampleV);
++                        texel = smp.template sampleK<K>(cache, 0.0f, 0.0f, 1.0f, columnU[static_cast<size_t>(x - drawX0)], sampleV);
+                     else
+-                        texel = smp.sample(cache, columnS[static_cast<size_t>(x - drawX0)], sampleT, 1.0f, 0u, 0u);
++                        texel = smp.template sampleK<K>(cache, columnS[static_cast<size_t>(x - drawX0)], sampleT, 1.0f, 0u, 0u);
+ 
+                     uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
+                     uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
+@@ -3169,7 +3229,8 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+     }
+ }
+ 
+-void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
++template <unsigned K>
++void GSCpuBackend::DrawTriangleK(const GSPrimitiveBatch &batch)
+ {
+     const GSDrawState &state = batch.state;
+     PixelPipe pipe;
+@@ -3313,7 +3374,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+                         iv = 0;
+                     }
+ 
+-                    uint32_t texel = smp.sample(cache, is, it, iq, iu, iv);
++                    uint32_t texel = smp.template sampleK<K>(cache, is, it, iq, iu, iv);
+ 
+                     uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
+                     uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
+@@ -3341,6 +3402,65 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+     ForEachRowBand(minY, maxY, area, drawRows);
+ }
+ 
++namespace
++{
++    // Sampler::texelKind of a texture format (0: read through GSMem).
++    unsigned texelKindOf(const GSDrawState &state)
++    {
++        if (!state.prim.tme || !GSSwizzle::Get(state.context.tex0.psm))
++            return 0u;
++        switch (state.context.tex0.psm)
++        {
++        case GS_PSM_CT32:
++        case GS_PSM_Z32: return 1u;
++        case GS_PSM_CT24:
++        case GS_PSM_Z24: return 2u;
++        case GS_PSM_CT16:
++        case GS_PSM_CT16S:
++        case GS_PSM_Z16:
++        case GS_PSM_Z16S: return 3u;
++        case GS_PSM_T8: return 4u;
++        case GS_PSM_T4: return 5u;
++        case GS_PSM_T8H: return 6u;
++        case GS_PSM_T4HL: return 7u;
++        case GS_PSM_T4HH: return 8u;
++        default: return 0u;
++        }
++    }
++}
++
++void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
++{
++    switch (texelKindOf(batch.state))
++    {
++    case 1u: DrawSpriteK<1u>(batch); return;
++    case 2u: DrawSpriteK<2u>(batch); return;
++    case 3u: DrawSpriteK<3u>(batch); return;
++    case 4u: DrawSpriteK<4u>(batch); return;
++    case 5u: DrawSpriteK<5u>(batch); return;
++    case 6u: DrawSpriteK<6u>(batch); return;
++    case 7u: DrawSpriteK<7u>(batch); return;
++    case 8u: DrawSpriteK<8u>(batch); return;
++    default: DrawSpriteK<0u>(batch); return;
++    }
++}
++
++void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
++{
++    switch (texelKindOf(batch.state))
++    {
++    case 1u: DrawTriangleK<1u>(batch); return;
++    case 2u: DrawTriangleK<2u>(batch); return;
++    case 3u: DrawTriangleK<3u>(batch); return;
++    case 4u: DrawTriangleK<4u>(batch); return;
++    case 5u: DrawTriangleK<5u>(batch); return;
++    case 6u: DrawTriangleK<6u>(batch); return;
++    case 7u: DrawTriangleK<7u>(batch); return;
++    case 8u: DrawTriangleK<8u>(batch); return;
++    default: DrawTriangleK<0u>(batch); return;
++    }
++}
++
+ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
+ {
+     const GSDrawState &state = batch.state;

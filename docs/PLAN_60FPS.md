@@ -115,10 +115,13 @@ Set-Location "J:\El Señor de los Anillos Las Dos Torres Recompilado"; & .\tools
 
 - Presets: `win-clang-release` (medir fps), `win-clang-relwithdebinfo` (perfilar: tiene símbolos, sin LTO).
 - **No añadir `2>&1`**: PowerShell 5.1 convierte los avisos de cmake en error y la orden sale con código 1.
-- Compilador: clang-cl, `/O2 /Ob2 /Oi /GL /arch:AVX2` más LTCG. `/fp:fast` solo se activa con MSVC real, así que
-  clang-cl mantiene coma flotante IEEE estricta. Comprobado: en `gs_cpu_backend.cpp.obj` no hay ninguna
-  instrucción `vfmadd` (no hay contracción FMA), de modo que el código AVX2 escrito con las mismas fórmulas y
-  en el mismo orden da resultados idénticos bit a bit. En código nuevo con intrínsecos no usar `_mm256_fmadd_ps`.
+- Compilador: clang-cl, `/O2 /Ob2 /Oi /GL` más LTCG y **`/arch:AVX`** (no AVX2: el ejecutable solo exige AVX,
+  `TTR_X64_ARCH`/`PS2X_RELEASE_ARCH` en `docs/BUILDING.md`; corregido el 2026-11-11, antes este documento decía
+  AVX2). `/fp:fast` solo se activa con MSVC real, así que clang-cl mantiene coma flotante IEEE estricta y, sin
+  FMA en el objetivo, no hay contracción: el código vectorial escrito con las mismas fórmulas y en el mismo orden
+  da resultados idénticos bit a bit. Con AVX hay operaciones de coma flotante de 256 bits, pero las enteras de
+  256 bits, los *gather* y FMA son de AVX2. Para usar AVX2 sin subir el requisito: un fichero aparte compilado con
+  `/arch:AVX2` y `/clang:-ffp-contract=off`, elegido en tiempo de ejecución con `cpuid`. Nunca `_mm256_fmadd_ps`.
 
 ### 3.2 Ejecutar la batalla de forma automática
 
@@ -791,15 +794,15 @@ fase B, ms por frame del banco con 9 hilos.
 | Tarea | Estado | Medida | Parche |
 | --- | --- | --- | --- |
 | Medición y diseño | hecho (2026-11-09) | batalla ~10 fps | — |
-| A0 Punto de partida limpio | pendiente | | |
-| A1 Captura del GS | pendiente | | |
-| A2 `ttr_gs_bench` | pendiente | línea base: | |
-| B1 Tablas fila + columna | pendiente | | |
-| B2 Instantáneas de textura | pendiente | | |
-| B3 Reglas de sincronización | pendiente | | |
+| A0 Punto de partida limpio | hecho (2026-11-11) | commit `52587f0` | — |
+| A1 Captura del GS | hecho (2026-11-11) | `battle4000.gscap`: 100 presentaciones, 99 frames, 8,3 M primitivas | `0014` |
+| A2 `ttr_gs_bench` | hecho (2026-11-11) | línea base: 173 ms/frame con 9 hilos, 670 con 1 | `0014` |
+| B1 Tablas fila + columna | hecho (2026-11-11) | 556 M direcciones iguales; T8/T4 con periodo de 8 filas | `0014` |
+| B2 Instantáneas de textura | hecho con otra forma (ver 6.1) | 141 ms/frame; 13,5 fps en la batalla | `0014` |
+| B3 Reglas de sincronización | hecho en parte (ver 6.1) | 124 ms/frame; 0 frames con bloques morados | `0014` |
 | B4 Preparación única | pendiente | | |
-| B5 Bucles especializados | pendiente | | |
-| B6 AVX2 | pendiente | | |
+| B5 Bucles especializados | en parte (ver 6.1) | 1 hilo: 670 → 510 ms/frame | `0014`, `0015` |
+| B6 AVX2 | empezado (ver 6.1) | 1 hilo: 527 → 413 ms/frame; 9 hilos ~101 ms/frame; batalla 15,4 fps | `0016` |
 | B7 Camino hasta la cola | pendiente | | |
 | B8 Sprites con realimentación | solo si hace falta | | |
 | C1 Coste fijo por par | pendiente | | |
@@ -813,6 +816,87 @@ fase B, ms por frame del banco con 9 hilos.
 | E1 VBlank a 60 Hz | pendiente | | |
 | E2 Latencia y regularidad | pendiente | | |
 | F1 Cierre | pendiente | | |
+
+### 6.1 Notas de lo hecho (2026-11-11)
+
+Estado del banco (`battle4000.gscap`, Release, 9 hilos): **173 → 122-124 ms por frame de juego**; con un hilo de
+raster, 670 → 510 ms. En el juego, la batalla pasa de ~10 a ~13,5 fps y desaparecen los bloques morados. Lo
+que se hizo distinto de lo previsto y por qué:
+
+- **B2 sin texturas lineales.** Convertir cada textura a formato lineal costaba demasiado en el hilo del GS
+  (~7 MB de subidas por frame). En su lugar, cada página de 8 KiB que se muestrea se copia tal cual (sin
+  desentrelazar) una vez por versión, y los hilos de raster leen las texturas a través de un mapa de 512 punteros
+  por lote (`TexturePageCache::SetPageMap`). Las subidas se escriben en la VRAM al momento en el hilo del GS y
+  solo esperan si un lote en vuelo usa esas páginas como framebuffer o Z.
+- **Semántica de caché de texturas.** Una página mantiene la copia que se tomó en su primera lectura tras el
+  último `TEXFLUSH`, aunque luego se dibuje en ella (es lo que hace la ruta de un hilo y la caché real del GS). Sin
+  esto, ~1 700 sprites por frame que escriben el canal alfa de una página leyéndola como T8 se serializaban.
+- **Copias diferidas.** Si una página que hay que copiar aún se está dibujando, el hilo GS no espera: el hilo de
+  raster 0 la copia antes del siguiente lote, cuando acaban los lotes que la dibujan.
+- **Presentación.** Solo espera las páginas que puede mostrar (ambos circuitos, la fuente preferida y los
+  framebuffers de contexto) y copia esas, en vez de vaciar todo el pipeline 50 veces por segundo.
+- **Carrera de los bloques morados (resuelta).** La tubería de píxel prueba Z con ZTST 2/3 aunque `ZTE` sea 0, y
+  esas lecturas de Z no se contaban: un hilo podía leer Z mientras otro lo escribía con otra disposición.
+- **Barreras por disposición.** Dos primitivas que usan la misma página con otra disposición (base, ancho o
+  familia de formato: CT32, CT16, CT16S, Z32, Z16, Z16S) no pueden dibujarse a la vez por franjas; la segunda
+  espera a la primera. Quedan ~1 000 por segundo en el banco (pasadas de posproceso con una vista CT16 del
+  framebuffer de 32 bits) y se comen ~1,1 s por segundo de los hilos de raster.
+- **B5 parcial.** Direcciones de framebuffer, Z y texturas por tablas (`GSSwizzle::AddressFast`), paletas
+  resueltas una vez por versión de CLUT y por hilo, coordenada U de los sprites por columna, muestreo
+  especializado por formato de texel (`DrawSpriteK`/`DrawTriangleK`). Cada cambio se comprobó con el banco.
+- **B6 empezado.** La aritmética por píxel de los triángulos (pesos, Z en double, color, U/V o S/T/Q, niebla) se
+  hace de 8 en 8 con AVX (ruta escalar si el compilador no tiene AVX); el resto de la tubería sigue por píxel.
+  Un hilo: 527 → 484 ms por frame, idéntico a la referencia.
+- **Z primero.** Un píxel que falla la prueba Z no escribe nada (todas las pruebas solo descartan), así que se
+  prueba antes de muestrear la textura y de leer el framebuffer: 484 → 439 ms. Sprites con UV sin filtro: U ya
+  envuelta por columna y parte de fila de la dirección del texel por fila: 439 → 413 ms. Parche `0016`.
+
+**Resultado al cerrar el 2026-11-11:** banco 173 → ~101 ms por frame de juego con 9 hilos (413 con uno), idéntico
+bit a bit a la referencia; **batalla ~10 → 15,4 fps** (`0016`). En el juego el límite ya no es el GS: el hilo de
+VIF1 está al 99 % con VU1 al 88 % (`PS2X_VIF1_STATS=1`).
+
+**Lo que dicen las medidas sobre el objetivo (importante para decidir):**
+
+- El raster no escala con los hilos en esta CPU (6 núcleos, 12 hilos): 3 hilos ×2,5, 5 hilos ×3,3, 7 ×3,3,
+  9 ×3,7 respecto a uno. Además el EE, VIF1/VU1 y el hilo del GS necesitan sus propios núcleos.
+- Presupuesto a 60 fps: 6 núcleos × 16,7 ms ≈ 100 ms de CPU por frame. Si el EE se lleva ~10, VIF1 ~12 y el hilo
+  del GS ~8, para el raster quedan ~70 ms por frame contando el escalado real, es decir, el coste de un hilo tiene
+  que bajar de 413 a ~70-100 ms: **4-6 veces más rápido por píxel**. La batalla escribe ~16 M de píxeles por
+  frame (el GS de PS2 tiene fuerza bruta para eso); 70 ms son ~4,4 ns por píxel, el terreno de un rasterizador
+  con AVX2 en todo (lecturas y escrituras con *gather*, mezcla en vectores), como el de PCSX2.
+- Quitar las barreras por disposición solo gana ~1 % (medido desactivándolas): se descarta el reparto por páginas.
+- Las optimizaciones escalares ya dan poco. Lo que queda en el GS es la tubería por píxel en AVX2 (fichero
+  aparte con `/arch:AVX2` y elección por `cpuid`, ver 3.1), y es mucho trabajo. **Alternativa a valorar con el
+  usuario:** un renderizador por GPU que dibuje lo mismo que el GS (a la resolución nativa, sin mejoras); es otro
+  proyecto, pero es la forma habitual de llegar a 60 fps con este volumen de píxeles.
+
+**Siguiente recomendado:** fase C (VU1/VIF1), que es ahora el límite del juego; después volver a B6 (tubería por
+píxel en AVX2) o a la decisión sobre la GPU.
+
+Cómo comprobar un cambio del GS ahora:
+
+```bash
+cd out/gs_captures
+../build/win-clang-release/TwoTowersRecomp/ttr_gs_bench.exe battle4000.gscap --check-hashes ref2.hashes
+```
+
+Sin líneas `differs` = idéntico a la referencia (VRAM e imagen presentada en las 100 presentaciones). `ref2.hashes`
+se generó con `PS2X_GS_THREADS=0 ... --hashes ref2.hashes`; si la captura se rehace, hay que regenerarlo igual
+(la ruta de un hilo es la referencia determinista). Con 9 hilos, repetir la comprobación 2-3 veces: las
+carreras no salen siempre.
+
+**Siguiente en el GS, por orden de ganancia esperada:**
+
+1. **AVX2 (B6)** para triángulos y sprites: los hilos de raster son ahora el cuello de botella del juego
+   (70-80 % ocupados). Perfil de un hilo: `writePixelFast` ~23 %, aritmética del triángulo ~22 %, lectura de
+   texels ~18-20 %, sprite ~12 %. Las optimizaciones escalares ya no dan mucho (especializar por formato no
+   ganó nada): el coste está en la aritmética y en los accesos a memoria.
+2. **Quitar las barreras por disposición**: reparto de trabajo por página de memoria (hilo = página % hilos)
+   en lugar de por franja de filas, de modo que dos disposiciones de la misma memoria caigan en el mismo hilo;
+   solo haría falta barrera cuando dos primitivas en vuelo comparten Z con distinta relación framebuffer→Z o una
+   página se usa a la vez como framebuffer y como Z.
+3. **Preparación duplicada (B4)**: con 9 hilos la CPU total es ~1,8 veces la de un hilo (cada hilo repite
+   `BuildPixelPipe`, `BuildSampler`, la paleta y la preparación del triángulo o de las columnas del sprite).
 
 ## 7. Riesgos y avisos
 

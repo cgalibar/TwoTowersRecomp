@@ -1,0 +1,2818 @@
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index 47513cc..29e9fba 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -384,6 +384,8 @@ add_library(ps2_runtime STATIC
+     src/lib/gs/gs_frontend.cpp
+     src/lib/gs/gs_cpu_backend.cpp
+     src/lib/gs/gs_async_backend.cpp
++    src/lib/gs/gs_capture.cpp
++    src/lib/gs/gs_swizzle.cpp
+     src/lib/ps2_iop_host.cpp
+     src/lib/ps2_memory.cpp
+     src/lib/ps2_pad.cpp
+diff --git a/ps2xRuntime/include/runtime/gs/gs_capture.h b/ps2xRuntime/include/runtime/gs/gs_capture.h
+new file mode 100644
+index 0000000..b2d4681
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/gs/gs_capture.h
+@@ -0,0 +1,163 @@
++#pragma once
++
++#include "runtime/gs/gs_backend.h"
++#include "runtime/gs/gs_cpu_backend.h"
++
++#include <cstdint>
++#include <cstdio>
++#include <functional>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <vector>
++
++// GS command capture and replay.
++//
++// PS2X_GS_CAPTURE=<file>[,<first vblank>[,<presents>]] records everything the raster backend receives, in
++// the order it runs, starting right after the first presentation at or past <first vblank> (default 4000)
++// and ending after <presents> more presentations (default 100). The file starts with VRAM and the CLUT
++// state at that point, so ttr_gs_bench can replay it offline on any backend configuration and compare VRAM.
++//
++// File: Header, VRAM (vramSize bytes), CLUT (GSCpuBackend::ClutState), then records: one Op byte and its
++// payload (structures are written as they are in memory: only the same build reads them back).
++//   Submit             u8 vertexCount, u8 hasState, GSVertex[vertexCount], GSDrawState if hasState
++//                      (otherwise the state of the previous Submit)
++//   LoadClut           GSTex0Reg, GSTexClutReg
++//   BeginTransfer      GSTransferCommand
++//   UploadImage        u32 size, bytes
++//   Flush, TextureFlush, Readback (a VRAM read: flushes like one), Reset, End: nothing
++//   Sync               u8 GSSyncReason
++//   Present            GSPresentationRequest
++//   ClearFramebuffer   GSContext, u32 rgba
++//   WriteVram          u32 psm, base, bw, x, y, value
++//   ConsumeLocalToHost u32 maxBytes
++namespace GSCapture
++{
++    enum class Op : uint8_t
++    {
++        Submit = 1,
++        LoadClut,
++        BeginTransfer,
++        UploadImage,
++        Flush,
++        TextureFlush,
++        Sync,
++        Present,
++        ClearFramebuffer,
++        WriteVram,
++        ConsumeLocalToHost,
++        Readback,
++        Reset,
++        End = 0xFF,
++    };
++
++    struct Header
++    {
++        char magic[8] = {'T', 'T', 'R', 'G', 'S', '0', '0', '1'};
++        uint32_t vramSize = 0;
++        // Sizes of the structures written raw: a capture from another build is refused.
++        uint32_t vertexSize = sizeof(GSVertex);
++        uint32_t drawStateSize = sizeof(GSDrawState);
++        uint32_t transferSize = sizeof(GSTransferCommand);
++        uint32_t presentSize = sizeof(GSPresentationRequest);
++        uint32_t contextSize = sizeof(GSContext);
++        uint32_t clutStateSize = sizeof(GSCpuBackend::ClutState);
++        uint32_t firstVblank = 0;
++    };
++
++    struct Capture
++    {
++        Header header{};
++        std::vector<uint8_t> vram;
++        GSCpuBackend::ClutState clut{};
++        std::vector<uint8_t> stream; // the records
++    };
++
++    bool Load(const std::string &path, Capture &capture, std::string &error);
++
++    struct ReplayHooks
++    {
++        // Before each primitive is submitted (also when no backend is given).
++        std::function<void(const GSPrimitiveBatch &)> onSubmit;
++        // After each Present, with the request and the frame the backend returned (null without a backend).
++        std::function<void(const GSPresentationRequest &, const PresentationFrame *)> onPresent;
++        // Stop after this many presentations (0: replay everything).
++        uint64_t maxPresents = 0;
++    };
++
++    struct ReplayCounts
++    {
++        uint64_t commands = 0;
++        uint64_t submits = 0;
++        uint64_t uploads = 0;
++        uint64_t uploadBytes = 0;
++        uint64_t presents = 0;
++        bool truncated = false; // the stream ended without an End record (the game was closed mid-capture)
++    };
++
++    // Sends the records to backend (which may be null: hooks only). The backend must already hold the
++    // capture's VRAM and CLUT state.
++    ReplayCounts Replay(const Capture &capture, GSRasterBackend *backend, const ReplayHooks &hooks = {});
++}
++
++class GSCaptureBackend final : public GSRasterBackend
++{
++public:
++    GSCaptureBackend(std::unique_ptr<GSRasterBackend> inner, GSCpuBackend *cpu, std::string path,
++                     uint64_t firstVblank, uint64_t presents);
++    ~GSCaptureBackend() override;
++
++    void Initialize(uint8_t *vram, uint32_t vramSize) override;
++    void Reset() override;
++
++    void Submit(const GSPrimitiveBatch &batch) override;
++    void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) override;
++
++    void BeginTransfer(const GSTransferCommand &command) override;
++    void UploadImage(const uint8_t *data, uint32_t sizeBytes) override;
++
++    void Flush() override;
++    void Kick() override;
++    void TextureFlush() override;
++    void Sync(GSSyncReason reason) override;
++    PresentationFrame Present(const GSPresentationRequest &request) override;
++
++    bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override;
++    uint32_t ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes) override;
++
++    uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const override;
++    void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) override;
++    void SnapshotVram(std::vector<uint8_t> &out) const override;
++    GSTransferSnapshot GetTransferSnapshot() const override;
++
++private:
++    void begin(uint64_t vblank);
++    void finish();
++    void op(GSCapture::Op op) const;
++    void put(const void *data, size_t size) const;
++    template <typename T>
++    void putValue(const T &value) const { put(&value, sizeof(value)); }
++
++    std::unique_ptr<GSRasterBackend> m_inner;
++    GSCpuBackend *m_cpu = nullptr;
++    std::string m_path;
++    uint64_t m_firstVblank = 0;
++    uint64_t m_presents = 0;
++    // Calls come from the GS thread and, for the synchronous ones, from the caller once the queue is idle.
++    mutable std::recursive_mutex m_mutex;
++    mutable FILE *m_file = nullptr;
++    bool m_done = false;
++    uint64_t m_presentsWritten = 0;
++    uint64_t m_submits = 0;
++    uint64_t m_uploadBytes = 0;
++    GSDrawState m_lastState{};
++    bool m_haveState = false;
++    // The host-to-local transfer in progress: a capture that starts in its middle repeats it from the start
++    // (the bytes already in VRAM are written again with the same values).
++    GSTransferCommand m_transfer{};
++    bool m_transferOpen = false;
++    std::vector<uint8_t> m_transferBytes;
++};
++
++// The backend itself, or a GSCaptureBackend around it when PS2X_GS_CAPTURE is set.
++std::unique_ptr<GSRasterBackend> WrapGsCaptureIfRequested(std::unique_ptr<GSCpuBackend> backend);
+diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+index ab2ce36..39e92f5 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+@@ -18,6 +18,8 @@ class GSCpuBackend final : public GSRasterBackend
+ {
+ public:
+     GSCpuBackend();
++    // rasterThreads false: everything is drawn on the calling thread (presentation snapshots).
++    explicit GSCpuBackend(bool rasterThreads);
+     ~GSCpuBackend() override;
+ 
+     void Initialize(uint8_t *vram, uint32_t vramSize) override;
+@@ -41,6 +43,16 @@ public:
+     void SnapshotVram(std::vector<uint8_t> &out) const override;
+     GSTransferSnapshot GetTransferSnapshot() const override;
+ 
++    // Capture and replay (PS2X_GS_CAPTURE, ttr_gs_bench): besides VRAM, the only state that outlives a
++    // command is the CLUT buffer and the CBP registers compared by CLD 4/5. Both wait for every queued draw.
++    struct ClutState
++    {
++        std::array<uint16_t, 512> clut{};
++        std::array<uint32_t, 2> cbp{};
++    };
++    ClutState GetClutState() const;
++    void SetClutState(const ClutState &state);
++
+     // Per-primitive decoded pixel pipeline and texture sampler (gs_cpu_backend.cpp): the same results as
+     // WritePixel and SampleTexture without decoding the GS state on every pixel.
+     struct PixelPipe;
+@@ -55,30 +67,36 @@ private:
+     void WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
+ 
+     void DrawPrimitive(const GSPrimitiveBatch &batch);
+-    // Small triangles and sprites wait in m_pending and are then drawn by all raster threads at once, each
+-    // one owning interleaved bands of 8 rows (every pixel is still written by one thread, in submission
+-    // order). Each handed-over batch carries the CLUT and texture-cache epoch it was submitted with, so a
+-    // CLUT load or TEXFLUSH does not wait for it; anything that reads or writes VRAM draws them first.
++    // Triangles and sprites wait in m_pending and are then drawn by all raster threads at once, each one
++    // owning interleaved bands of 8 rows (every pixel is still written by one thread, in submission order).
++    // Each handed-over batch carries the CLUT it was submitted with and a page map: the textures it samples
++    // are read from copies of their VRAM pages taken at submission (PrepareTexturePagesUnlocked), so uploads,
++    // CLUT loads and later drawing into those pages never wait for it. FlushPendingUnlocked() draws
++    // everything handed over and waits for it.
+     void FlushPendingUnlocked(int reason = 0) const;
+     // Hands m_pending to the band pipeline and returns: the GS thread keeps accepting primitives into the
+     // next batch meanwhile. WaitInflightUnlocked() waits until every handed-over batch is drawn.
+     void DrawPendingUnlocked();
+     void WaitInflightUnlocked();
+-    void DrawBatchBands(const std::vector<GSPrimitiveBatch> &batches, const uint16_t *clut, uint32_t textureEpoch,
+-                        const uint8_t *textureVram, unsigned phase, unsigned stride);
+-    // VRAM pages (8 KiB) that the primitives in m_pending may write (frame and Z buffer) or read (texture).
++    void DrawBatchBands(const std::vector<GSPrimitiveBatch> &batches, const uint16_t *clut, uint64_t clutVersion,
++                        const uint8_t *const *pageMap, unsigned phase, unsigned stride);
++    // Pages (8 KiB) the primitives in m_pending use as frame or Z buffer: records them, marks the copies of
++    // written pages stale and asks for a barrier when another layout of the same memory is still drawn.
+     void MarkPendingWritesUnlocked(const GSPrimitiveBatch &batch);
+     void MarkPendingReadsUnlocked(const std::bitset<512> &pages) { m_pendingReads |= pages; }
++    // Waits until nothing handed over (or pending) uses `pages` as frame or Z buffer.
++    void WaitForFbPagesUnlocked(const std::bitset<512> &pages);
++    // Makes sure every page in `pages` has a current copy in m_pageMap for the next primitive.
++    void PrepareTexturePagesUnlocked(const std::bitset<512> &pages);
++    // VRAM changed under these pages: their copies are taken again when next sampled.
++    void StalePageCopiesUnlocked(const std::bitset<512> &pages) { m_pageCopyStale |= pages & m_pageHasCopy; }
++    void ResetPageCopiesUnlocked();
++    uint8_t *AllocatePageCopyUnlocked();
+     // Texture pages a primitive samples (the texels under its texture coordinates, with the wrap mode) and
+     // pages it writes (its box in the scissor).
+     std::bitset<512> PrimitiveReadPages(const GSPrimitiveBatch &batch) const;
+     std::bitset<512> PrimitiveWritePages(const GSPrimitiveBatch &batch) const;
+     void BeginTransferUnlocked(const GSTransferCommand &command, GSTransferCommand &transfer, GSTransferSnapshot &state);
+-    // Shadow VRAM: queued host-to-local transfers are also applied, on the GS thread, to a copy of the pages
+-    // they write (copied from VRAM first). A CLUT load whose pages only queued transfers write reads the copy
+-    // instead of waiting for the band workers. A page's copy is dropped when anything else writes it.
+-    // Makes copies of `pages` where it can; returns the pages that have one.
+-    std::bitset<512> ShadowPrepareUnlocked(const std::bitset<512> &pages);
+     void UploadImageUnlocked(const uint8_t *data, uint32_t sizeBytes, GSTransferCommand &transfer, GSTransferSnapshot &state,
+                              uint8_t *vram);
+     const uint16_t *ActiveClut() const;
+@@ -118,61 +136,54 @@ private:
+     std::array<ReadVramFunc, kPsmHandlerCount> m_readVramFuncs{};
+     std::array<WriteVramFunc, kPsmHandlerCount> m_writeVramFuncs{};
+     std::array<uint16_t, 512> m_clut{};
+-    // Deferred CLUT loads: a load whose source pages batches in flight still draw runs on band worker 0, in
+-    // order, into m_workerClut; until the pipeline drains, every batch takes its CLUT from there.
+-    std::array<uint16_t, 512> m_workerClut{};
+-    GSMem::TexturePageCache m_workerClutCache;
+-    bool m_clutDeferred = false;
+-    void ResyncClutUnlocked();
++    // Bumped whenever m_clut changes: batches carry it and resolved palettes are cached by it.
++    uint64_t m_clutVersion = 1;
+     std::array<uint32_t, 2> m_clutCbp{};
++    // GS thread (and single-threaded drawing): texture reads straight from VRAM through this cache.
+     GSMem::TexturePageCache m_texturePageCache;
+     std::vector<GSMem::TexturePageCache> m_workerTextureCaches;
+-    // Bumped whenever m_texturePageCache is invalidated (TEXFLUSH, reset); a worker drops its page copy
+-    // when its epoch is older, so all caches follow the same rule.
++    // Bumped whenever m_texturePageCache is invalidated (TEXFLUSH, reset), for the fork-join workers.
+     uint32_t m_textureCacheEpoch = 0;
+     std::vector<uint32_t> m_workerTextureCacheEpochs;
+     std::unique_ptr<GSRasterWorkers> m_rasterWorkers;
+ 
+     mutable std::vector<GSPrimitiveBatch> m_pending;
++    // Pages the pending primitives use as frame or Z buffer, and pages they sample.
+     std::bitset<512> m_pendingWrites;
+     std::bitset<512> m_pendingReads;
+-    // Pages written by the batches handed over since the pipeline was last idle (a superset of those in flight).
+-    std::bitset<512> m_inflightWritesUnion;
+-    // A large primitive that samples pages it draws is drawn by all band workers from a frozen copy of those
+-    // pages (taken by worker 0 once everything before it is drawn), in a slot of its own.
+-    std::unique_ptr<uint8_t[]> m_textureSnapshot;
+-    const uint8_t *m_nextTextureVram = nullptr;
+     // Last page sets of PrimitiveReadPages / PrimitiveWritePages, by buffer and page rectangle.
+     mutable uint64_t m_readPagesKey1 = ~0ull, m_readPagesKey2 = ~0ull;
+     mutable std::bitset<512> m_readPagesCached;
+     mutable uint64_t m_writePagesKey1 = ~0ull, m_writePagesKey2 = ~0ull;
+     mutable std::bitset<512> m_writePagesCached;
+-
+-    // Pages written by m_pendingSerial: in flight only until worker 0 has run the transfers.
+-    std::bitset<512> m_pendingTransferWrites;
+     uint64_t m_lastWriteKey = ~0ull;
+     uint64_t m_lastWriteKey2 = ~0ull;
+-    // The next handed-over batch starts only once every earlier one is drawn (set by TEXFLUSH: an earlier
+-    // batch may have drawn into the texture a later one reads).
++    // The next handed-over batch starts only once every earlier one is drawn.
+     bool m_barrierNext = false;
+-    // Host-to-local transfers queued for the band workers: they run in order with the batches (before the
+-    // primitives submitted after them) instead of the GS thread waiting for every batch first.
+-    std::vector<std::function<void()>> m_pendingSerial;
+-    // Whether an op in m_pendingSerial needs every earlier batch drawn first (transfers, CLUT loads from pages
+-    // being drawn); CLUT loads from settled pages only need worker 0 to reach them.
+-    bool m_pendingSerialBarrier = false;
+-    bool m_serialTransfer = false;
+-    std::unique_ptr<uint8_t[]> m_shadowVram;
+-    std::bitset<512> m_shadowValid;
+-    GSMem::TexturePageCache m_shadowPageCache;
+-    GSTransferCommand m_shadowTransfer{};
+-    GSTransferSnapshot m_shadowTransferState{};
+-    bool m_shadowActive = false; // the current queued transfer is also applied to the shadow
+-    // A host-to-local transfer that touches nothing queued or being drawn runs at once on the GS thread, with
+-    // its own state (a queued one may be running on a band worker with m_transfer meanwhile).
+-    bool m_immediateTransfer = false;
+-    GSTransferCommand m_immTransfer{};
+-    GSTransferSnapshot m_immTransferState{};
++
++    // Texture page copies (band pipeline only). A primitive samples page p through m_pageMap[p]: the copy
++    // taken when the page was first sampled after the last TEXFLUSH (or VRAM itself for pages no primitive
++    // has sampled). Copies are immutable; a replaced one is recycled once every batch that may read it is drawn.
++    std::array<const uint8_t *, 512> m_pageMap{};
++    std::array<uint8_t *, 512> m_pageCopy{};
++    std::bitset<512> m_pageHasCopy;
++    std::bitset<512> m_pageCopyStale;
++    // Pages sampled since the last TEXFLUSH: they keep their copy (texture cache semantics).
++    std::bitset<512> m_pageReadSinceFlush;
++    // Frame/Z buffer use: slots below m_pageFbSlot[p] may still draw into page p; m_pageLayout[p] is the
++    // buffer layout (base, width, format family) of the last primitive that did.
++    std::array<uint64_t, 512> m_pageFbSlot{};
++    std::array<uint32_t, 512> m_pageLayout{};
++    std::vector<std::pair<uint64_t, uint8_t *>> m_retiredCopies; // (first slot that no longer reads it, copy)
++    // Copies of pages still drawn, made by worker 0 before the next handed-over batch (page, destination).
++    std::vector<std::pair<uint32_t, uint8_t *>> m_pendingCopies;
++    uint64_t m_pendingCopyAfter = 0;
++    std::bitset<512> m_pendingCopyPages;
++    std::vector<uint8_t *> m_freeCopies;
++    std::vector<std::unique_ptr<uint8_t[]>> m_copyStorage;
++    // The host-to-local transfer in progress: its destination pages.
++    std::bitset<512> m_transferPages;
++    bool m_waitingForTexture = false; // statistics: who waits in WaitForFbPagesUnlocked
+     std::unique_ptr<GSBandPipeline> m_bandPipeline;
+ 
+     GSTransferCommand m_transfer{};
+diff --git a/ps2xRuntime/include/runtime/gs/gs_swizzle.h b/ps2xRuntime/include/runtime/gs/gs_swizzle.h
+new file mode 100644
+index 0000000..8b44ae9
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/gs/gs_swizzle.h
+@@ -0,0 +1,68 @@
++#pragma once
++
++#include <cstdint>
++#include <string>
++
++// Swizzled VRAM addresses as the sum of a row part and a column part.
++//
++// GSMem::PixelAddress(psm, bp, bw, x, y), the address every read and write of the software GS uses, is
++//   Base(bp) + PageRow(y, bw) + rowIn[y % pageH] + col[(y % pageH) % period][x]
++// where col folds the page column (x / pageW) and the column offset inside the page. For most formats the
++// offset inside the page splits exactly into a row and a column part (period 1); for PSMT8/PSMT4 the column
++// order changes with the row inside a 16-row block, so col has one row of offsets per row of that period.
++// The tables are built from GSMem::PixelAddress itself and checked against it (SelfTest).
++namespace GSSwizzle
++{
++    struct Format
++    {
++        uint32_t pageW = 64, pageH = 32;
++        uint32_t pixelsPerPage = 2048, pixelsPerBlock = 64;
++        uint32_t period = 1;
++        // log2(pageW), log2(pageH), pageH - 1 and period - 1 (all powers of two).
++        uint32_t pageWShift = 6, pageHShift = 5, pageHMask = 31, periodMask = 0;
++        uint32_t rowIn[128] = {};
++        // [period][2048]: (x / pageW) * pixelsPerPage + offset of column x inside the page.
++        const uint32_t *col = nullptr;
++    };
++
++    // The layout of a format (CT24 and the 8H/4H formats use the CT32 one, Z24 the Z32 one); null if unknown.
++    const Format *Get(uint32_t psm);
++
++    // Part of the address that depends on the row: base block, page row and row inside the page.
++    inline uint32_t RowBase(const Format &f, uint32_t bp, uint32_t bw, uint32_t y)
++    {
++        const uint32_t rowPages = (bw * 64u) / f.pageW;
++        return (bp / 32u) * f.pixelsPerPage + (bp % 32u) * f.pixelsPerBlock + (y / f.pageH) * rowPages * f.pixelsPerPage +
++               f.rowIn[y % f.pageH];
++    }
++
++    // Column offsets for row y (indexed by x & 2047).
++    inline const uint32_t *Columns(const Format &f, uint32_t y)
++    {
++        return f.col + ((y % f.pageH) % f.period) * 2048u;
++    }
++
++    // RowBase split for many rows of one buffer: Base(bp) + (y >> pageHShift) * RowStride(bw) + rowIn[...].
++    inline uint32_t Base(const Format &f, uint32_t bp)
++    {
++        return (bp / 32u) * f.pixelsPerPage + (bp % 32u) * f.pixelsPerBlock;
++    }
++    inline uint32_t RowStride(const Format &f, uint32_t bw)
++    {
++        return ((bw * 64u) >> f.pageWShift) * f.pixelsPerPage;
++    }
++    inline uint32_t AddressFast(const Format &f, uint32_t base, uint32_t rowStride, uint32_t x, uint32_t y)
++    {
++        const uint32_t inPage = y & f.pageHMask;
++        return base + (y >> f.pageHShift) * rowStride + f.rowIn[inPage] + f.col[(inPage & f.periodMask) * 2048u + (x & 2047u)];
++    }
++
++    inline uint32_t Address(const Format &f, uint32_t bp, uint32_t bw, uint32_t x, uint32_t y)
++    {
++        return RowBase(f, bp, bw, y) + Columns(f, y)[x & 2047u];
++    }
++
++    // Compares Address with GSMem::PixelAddress over many buffers and coordinates; false (and a description
++    // of the first mismatch) if they ever differ.
++    bool SelfTest(std::string &report);
++}
+diff --git a/ps2xRuntime/include/runtime/gs/gs_texture_page_cache.h b/ps2xRuntime/include/runtime/gs/gs_texture_page_cache.h
+index b4fcabd..686f6cc 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_texture_page_cache.h
++++ b/ps2xRuntime/include/runtime/gs/gs_texture_page_cache.h
+@@ -30,10 +30,19 @@ namespace GSMem
+             m_bases.fill(UINT32_MAX);
+         }
+ 
++        // Band workers read textures through the page map of their batch instead (512 pointers, one per
++        // page: the copy of the page taken when the primitives were submitted). Null: copies, as above.
++        void SetPageMap(const uint8_t *const *map) noexcept
++        {
++            m_map = map;
++        }
++
+         // byteAddress is the wrapped, swizzled VRAM address. The returned
+         // pointer is valid only until the next miss on the same slot or invalidation.
+         const uint8_t* Resolve(const uint8_t* vram, uint32_t byteAddress) noexcept
+         {
++            if (m_map)
++                return m_map[(byteAddress / kPageSize) & 511u] + (byteAddress & (kPageSize - 1u));
+             const uint32_t pageBase = byteAddress & ~(kPageSize - 1u);
+             const uint32_t slot = (pageBase / kPageSize) & (kSlots - 1u);
+             uint8_t *bytes = m_bytes.get() + static_cast<size_t>(slot) * kPageSize;
+@@ -48,5 +57,6 @@ namespace GSMem
+     private:
+         std::unique_ptr<uint8_t[]> m_bytes;
+         std::array<uint32_t, kSlots> m_bases{};
++        const uint8_t *const *m_map = nullptr;
+     };
+ }
+diff --git a/ps2xRuntime/include/runtime/gs/ps2_gs_memory.h b/ps2xRuntime/include/runtime/gs/ps2_gs_memory.h
+index 3b9ac0c..dd5c421 100644
+--- a/ps2xRuntime/include/runtime/gs/ps2_gs_memory.h
++++ b/ps2xRuntime/include/runtime/gs/ps2_gs_memory.h
+@@ -541,6 +541,10 @@ namespace GSMem
+ 	void InitLookupTables();
+ 
+     // Shares swizzle, VRAM wrapping, and lane extraction with the direct reads.
++    // Address of pixel (x, y) in units of the format's pixels (as Read and Write compute it, before the
++    // bit offset of the 8H/4H formats and the 4 MiB wrap).
++    u32 PixelAddress(u32 psm, u32 bp, u32 bw, u32 x, u32 y);
++
+     u32 ReadTexture(TexturePageCache& cache, const u8* data, u32 psm, u32 bp, u32 bw, u32 x, u32 y);
+ 
+     // The same read for one format, chosen once per primitive instead of switching on every texel.
+diff --git a/ps2xRuntime/src/lib/gs/gs_async_backend.cpp b/ps2xRuntime/src/lib/gs/gs_async_backend.cpp
+index 7f46637..e283919 100644
+--- a/ps2xRuntime/src/lib/gs/gs_async_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_async_backend.cpp
+@@ -1,4 +1,5 @@
+ #include "runtime/gs/gs_async_backend.h"
++#include "runtime/gs/gs_capture.h"
+ #include "runtime/gs/gs_cpu_backend.h"
+ #include "runtime/ps2_vif1_worker.h"
+ 
+@@ -349,7 +350,7 @@ GSTransferSnapshot GSAsyncBackend::GetTransferSnapshot() const
+ 
+ std::unique_ptr<GSRasterBackend> CreateDefaultGsBackend()
+ {
+-    auto backend = std::make_unique<GSCpuBackend>();
++    std::unique_ptr<GSRasterBackend> backend = WrapGsCaptureIfRequested(std::make_unique<GSCpuBackend>());
+     const char *async = std::getenv("PS2X_GS_ASYNC");
+     if (async && std::strcmp(async, "0") == 0)
+         return backend;
+diff --git a/ps2xRuntime/src/lib/gs/gs_capture.cpp b/ps2xRuntime/src/lib/gs/gs_capture.cpp
+new file mode 100644
+index 0000000..db5e166
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_capture.cpp
+@@ -0,0 +1,543 @@
++#include "runtime/gs/gs_capture.h"
++
++#include <algorithm>
++#include <cstdlib>
++#include <cstring>
++#include <iostream>
++
++namespace
++{
++    // Bytes a host-to-local transfer carries (rows of pixels; 4-bit formats pack two pixels per byte).
++    uint64_t transferBytes(const GSTransferCommand &command)
++    {
++        const uint64_t pixels = static_cast<uint64_t>(command.trxreg.rrw) * command.trxreg.rrh;
++        switch (command.bitbltbuf.dpsm)
++        {
++        case GS_PSM_CT32:
++        case GS_PSM_Z32:
++            return pixels * 4u;
++        case GS_PSM_CT24:
++        case GS_PSM_Z24:
++            return pixels * 3u;
++        case GS_PSM_CT16:
++        case GS_PSM_CT16S:
++        case GS_PSM_Z16:
++        case GS_PSM_Z16S:
++            return pixels * 2u;
++        case GS_PSM_T8:
++        case GS_PSM_T8H:
++            return pixels;
++        case GS_PSM_T4:
++        case GS_PSM_T4HL:
++        case GS_PSM_T4HH:
++            return (pixels + 1u) / 2u;
++        default:
++            return 0u;
++        }
++    }
++}
++
++GSCaptureBackend::GSCaptureBackend(std::unique_ptr<GSRasterBackend> inner, GSCpuBackend *cpu, std::string path,
++                                   uint64_t firstVblank, uint64_t presents)
++    : m_inner(std::move(inner)), m_cpu(cpu), m_path(std::move(path)), m_firstVblank(firstVblank),
++      m_presents(presents == 0u ? 1u : presents)
++{
++    std::cout << "[gs-capture] will record " << m_presents << " presentations from VBlank " << m_firstVblank
++              << " to " << m_path << std::endl;
++}
++
++GSCaptureBackend::~GSCaptureBackend()
++{
++    std::lock_guard<std::recursive_mutex> lock(m_mutex);
++    if (m_file)
++        finish();
++}
++
++void GSCaptureBackend::put(const void *data, size_t size) const
++{
++    if (m_file && size != 0u)
++        std::fwrite(data, 1u, size, m_file);
++}
++
++void GSCaptureBackend::op(GSCapture::Op value) const
++{
++    putValue(static_cast<uint8_t>(value));
++}
++
++void GSCaptureBackend::begin(uint64_t vblank)
++{
++    std::vector<uint8_t> vram;
++    m_inner->SnapshotVram(vram);
++    const GSCpuBackend::ClutState clut = m_cpu ? m_cpu->GetClutState() : GSCpuBackend::ClutState{};
++    m_file = std::fopen(m_path.c_str(), "wb");
++    if (!m_file)
++    {
++        std::cout << "[gs-capture] cannot write " << m_path << std::endl;
++        m_done = true;
++        return;
++    }
++    std::setvbuf(m_file, nullptr, _IOFBF, 8u << 20u);
++    GSCapture::Header header;
++    header.vramSize = static_cast<uint32_t>(vram.size());
++    header.firstVblank = static_cast<uint32_t>(vblank);
++    putValue(header);
++    put(vram.data(), vram.size());
++    putValue(clut);
++    // A transfer still waiting for data: repeat what it has received so far.
++    if (m_transferOpen && m_transfer.direction == 0u && m_transferBytes.size() < transferBytes(m_transfer))
++    {
++        op(GSCapture::Op::BeginTransfer);
++        putValue(m_transfer);
++        if (!m_transferBytes.empty())
++        {
++            op(GSCapture::Op::UploadImage);
++            putValue(static_cast<uint32_t>(m_transferBytes.size()));
++            put(m_transferBytes.data(), m_transferBytes.size());
++        }
++    }
++    m_haveState = false;
++    std::cout << "[gs-capture] started at VBlank " << vblank << std::endl;
++}
++
++void GSCaptureBackend::finish()
++{
++    op(GSCapture::Op::End);
++    std::fclose(m_file);
++    m_file = nullptr;
++    m_done = true;
++    std::cout << "[gs-capture] wrote " << m_presentsWritten << " presentations, " << m_submits << " primitives, "
++              << m_uploadBytes << " upload bytes to " << m_path << std::endl;
++}
++
++void GSCaptureBackend::Initialize(uint8_t *vram, uint32_t vramSize)
++{
++    std::lock_guard<std::recursive_mutex> lock(m_mutex);
++    m_inner->Initialize(vram, vramSize);
++}
++
++void GSCaptureBackend::Reset()
++{
++    std::lock_guard<std::recursive_mutex> lock(m_mutex);
++    op(GSCapture::Op::Reset);
++    m_transferOpen = false;
++    m_inner->Reset();
++}
++
++void GSCaptureBackend::Submit(const GSPrimitiveBatch &batch)
++{
++    std::lock_guard<std::recursive_mutex> lock(m_mutex);
++    if (m_file)
++    {
++        const uint8_t count = std::min<uint8_t>(batch.vertexCount, 3u);
++        const bool newState = !m_haveState || std::memcmp(&m_lastState, &batch.state, sizeof(GSDrawState)) != 0;
++        op(GSCapture::Op::Submit);
++        putValue(count);
++        putValue(static_cast<uint8_t>(newState ? 1u : 0u));
++        put(batch.vertices.data(), sizeof(GSVertex) * count);
++        if (newState)
++        {
++            putValue(batch.state);
++            m_lastState = batch.state;
++            m_haveState = true;
++        }
++        ++m_submits;
++    }
++    m_inner->Submit(batch);
++}
++
++void GSCaptureBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
++{
++    std::lock_guard<std::recursive_mutex> lock(m_mutex);
++    if (m_file)
++    {
++        op(GSCapture::Op::LoadClut);
++        putValue(tex0);
++        putValue(texclut);
++    }
++    m_inner->LoadClut(tex0, texclut);
++}
++
++void GSCaptureBackend::BeginTransfer(const GSTransferCommand &command)
++{
++    std::lock_guard<std::recursive_mutex> lock(m_mutex);
++    if (m_file)
++    {
++        op(GSCapture::Op::BeginTransfer);
++        putValue(command);
++    }
++    m_transfer = command;
++    m_transferOpen = true;
++    m_transferBytes.clear();
++    m_inner->BeginTransfer(command);
++}
++
++void GSCaptureBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
++{
++    std::lock_guard<std::recursive_mutex> lock(m_mutex);
++    if (m_file)
++    {
++        op(GSCapture::Op::UploadImage);
++        putValue(sizeBytes);
++        put(data, sizeBytes);
++        m_uploadBytes += sizeBytes;
++    }
++    else if (!m_done && m_transferOpen && data && m_transferBytes.size() < transferBytes(m_transfer))
++        m_transferBytes.insert(m_transferBytes.end(), data, data + sizeBytes);
++    m_inner->UploadImage(data, sizeBytes);
++}
++
++void GSCaptureBackend::Flush()
++{
++    std::lock_guard<std::recursive_mutex> lock(m_mutex);
++    op(GSCapture::Op::Flush);
++    m_inner->Flush();
++}
++
++void GSCaptureBackend::Kick()
++{
++    m_inner->Kick();
++}
++
++void GSCaptureBackend::TextureFlush()
++{
++    std::lock_guard<std::recursive_mutex> lock(m_mutex);
++    op(GSCapture::Op::TextureFlush);
++    m_inner->TextureFlush();
++}
++
++void GSCaptureBackend::Sync(GSSyncReason reason)
++{
++    std::lock_guard<std::recursive_mutex> lock(m_mutex);
++    if (m_file)
++    {
++        op(GSCapture::Op::Sync);
++        putValue(static_cast<uint8_t>(reason));
++    }
++    m_inner->Sync(reason);
++}
++
++PresentationFrame GSCaptureBackend::Present(const GSPresentationRequest &request)
++{
++    std::lock_guard<std::recursive_mutex> lock(m_mutex);
++    if (m_file)
++    {
++        op(GSCapture::Op::Present);
++        putValue(request);
++    }
++    PresentationFrame frame = m_inner->Present(request);
++    if (m_file)
++    {
++        if (++m_presentsWritten >= m_presents)
++            finish();
++    }
++    else if (!m_done && request.vsyncTick >= m_firstVblank)
++        begin(request.vsyncTick);
++    return frame;
++}
++
++bool GSCaptureBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
++{
++    std::lock_guard<std::recursive_mutex> lock(m_mutex);
++    if (m_file)
++    {
++        op(GSCapture::Op::ClearFramebuffer);
++        putValue(context);
++        putValue(rgba);
++    }
++    return m_inner->ClearFramebuffer(context, rgba);
++}
++
++uint32_t GSCaptureBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
++{
++    std::lock_guard<std::recursive_mutex> lock(m_mutex);
++    if (m_file)
++    {
++        op(GSCapture::Op::ConsumeLocalToHost);
++        putValue(maxBytes);
++    }
++    return m_inner->ConsumeLocalToHostBytes(dst, maxBytes);
++}
++
++uint32_t GSCaptureBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
++{
++    std::lock_guard<std::recursive_mutex> lock(m_mutex);
++    op(GSCapture::Op::Readback);
++    return m_inner->ReadVram(psm, base, bw, x, y);
++}
++
++void GSCaptureBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
++{
++    std::lock_guard<std::recursive_mutex> lock(m_mutex);
++    if (m_file)
++    {
++        op(GSCapture::Op::WriteVram);
++        const uint32_t args[6] = {psm, base, bw, x, y, value};
++        put(args, sizeof(args));
++    }
++    m_inner->WriteVram(psm, base, bw, x, y, value);
++}
++
++void GSCaptureBackend::SnapshotVram(std::vector<uint8_t> &out) const
++{
++    std::lock_guard<std::recursive_mutex> lock(m_mutex);
++    op(GSCapture::Op::Readback);
++    m_inner->SnapshotVram(out);
++}
++
++GSTransferSnapshot GSCaptureBackend::GetTransferSnapshot() const
++{
++    std::lock_guard<std::recursive_mutex> lock(m_mutex);
++    op(GSCapture::Op::Readback);
++    return m_inner->GetTransferSnapshot();
++}
++
++std::unique_ptr<GSRasterBackend> WrapGsCaptureIfRequested(std::unique_ptr<GSCpuBackend> backend)
++{
++    const char *env = std::getenv("PS2X_GS_CAPTURE");
++    if (!env || !env[0])
++        return backend;
++    std::string spec(env);
++    std::string path = spec;
++    uint64_t firstVblank = 4000u;
++    uint64_t presents = 100u;
++    const size_t comma = spec.find(',');
++    if (comma != std::string::npos)
++    {
++        path = spec.substr(0, comma);
++        const std::string rest = spec.substr(comma + 1u);
++        firstVblank = std::strtoull(rest.c_str(), nullptr, 10);
++        const size_t comma2 = rest.find(',');
++        if (comma2 != std::string::npos)
++            presents = std::strtoull(rest.c_str() + comma2 + 1u, nullptr, 10);
++    }
++    GSCpuBackend *cpu = backend.get();
++    return std::make_unique<GSCaptureBackend>(std::move(backend), cpu, path, firstVblank, presents);
++}
++
++namespace GSCapture
++{
++    bool Load(const std::string &path, Capture &capture, std::string &error)
++    {
++        FILE *file = std::fopen(path.c_str(), "rb");
++        if (!file)
++        {
++            error = "cannot open " + path;
++            return false;
++        }
++        bool ok = std::fread(&capture.header, sizeof(Header), 1u, file) == 1u;
++        const Header expected;
++        if (!ok || std::memcmp(capture.header.magic, expected.magic, sizeof(expected.magic)) != 0)
++        {
++            std::fclose(file);
++            error = "not a GS capture";
++            return false;
++        }
++        if (capture.header.vertexSize != expected.vertexSize || capture.header.drawStateSize != expected.drawStateSize ||
++            capture.header.transferSize != expected.transferSize || capture.header.presentSize != expected.presentSize ||
++            capture.header.contextSize != expected.contextSize || capture.header.clutStateSize != expected.clutStateSize)
++        {
++            std::fclose(file);
++            error = "capture from a build with other GS structures";
++            return false;
++        }
++        capture.vram.resize(capture.header.vramSize);
++        ok = std::fread(capture.vram.data(), 1u, capture.vram.size(), file) == capture.vram.size() &&
++             std::fread(&capture.clut, sizeof(capture.clut), 1u, file) == 1u;
++        if (!ok)
++        {
++            std::fclose(file);
++            error = "truncated header";
++            return false;
++        }
++        const long start = std::ftell(file);
++        std::fseek(file, 0, SEEK_END);
++        const long end = std::ftell(file);
++        std::fseek(file, start, SEEK_SET);
++        capture.stream.resize(static_cast<size_t>(end - start));
++        ok = std::fread(capture.stream.data(), 1u, capture.stream.size(), file) == capture.stream.size();
++        std::fclose(file);
++        if (!ok)
++            error = "read error";
++        return ok;
++    }
++
++    ReplayCounts Replay(const Capture &capture, GSRasterBackend *backend, const ReplayHooks &hooks)
++    {
++        ReplayCounts counts;
++        const uint8_t *p = capture.stream.data();
++        const uint8_t *end = p + capture.stream.size();
++        auto take = [&](void *out, size_t size) -> bool
++        {
++            if (static_cast<size_t>(end - p) < size)
++            {
++                p = end;
++                return false;
++            }
++            std::memcpy(out, p, size);
++            p += size;
++            return true;
++        };
++        GSPrimitiveBatch batch{};
++        std::vector<uint8_t> scratch;
++        for (;;)
++        {
++            uint8_t opByte = 0;
++            if (!take(&opByte, 1u))
++            {
++                counts.truncated = true;
++                return counts;
++            }
++            ++counts.commands;
++            switch (static_cast<Op>(opByte))
++            {
++            case Op::Submit:
++            {
++                uint8_t count = 0, hasState = 0;
++                if (!take(&count, 1u) || !take(&hasState, 1u) || count > 3u ||
++                    !take(batch.vertices.data(), sizeof(GSVertex) * count) ||
++                    (hasState && !take(&batch.state, sizeof(GSDrawState))))
++                {
++                    counts.truncated = true;
++                    return counts;
++                }
++                batch.vertexCount = count;
++                ++counts.submits;
++                if (hooks.onSubmit)
++                    hooks.onSubmit(batch);
++                if (backend)
++                    backend->Submit(batch);
++                break;
++            }
++            case Op::LoadClut:
++            {
++                GSTex0Reg tex0{};
++                GSTexClutReg texclut{};
++                if (!take(&tex0, sizeof(tex0)) || !take(&texclut, sizeof(texclut)))
++                {
++                    counts.truncated = true;
++                    return counts;
++                }
++                if (backend)
++                    backend->LoadClut(tex0, texclut);
++                break;
++            }
++            case Op::BeginTransfer:
++            {
++                GSTransferCommand command{};
++                if (!take(&command, sizeof(command)))
++                {
++                    counts.truncated = true;
++                    return counts;
++                }
++                if (backend)
++                    backend->BeginTransfer(command);
++                break;
++            }
++            case Op::UploadImage:
++            {
++                uint32_t size = 0;
++                if (!take(&size, sizeof(size)) || static_cast<size_t>(end - p) < size)
++                {
++                    counts.truncated = true;
++                    return counts;
++                }
++                ++counts.uploads;
++                counts.uploadBytes += size;
++                if (backend)
++                    backend->UploadImage(p, size);
++                p += size;
++                break;
++            }
++            case Op::Flush:
++                if (backend)
++                    backend->Flush();
++                break;
++            case Op::TextureFlush:
++                if (backend)
++                    backend->TextureFlush();
++                break;
++            case Op::Sync:
++            {
++                uint8_t reason = 0;
++                if (!take(&reason, 1u))
++                {
++                    counts.truncated = true;
++                    return counts;
++                }
++                if (backend)
++                    backend->Sync(static_cast<GSSyncReason>(reason));
++                break;
++            }
++            case Op::Present:
++            {
++                GSPresentationRequest request{};
++                if (!take(&request, sizeof(request)))
++                {
++                    counts.truncated = true;
++                    return counts;
++                }
++                ++counts.presents;
++                PresentationFrame frame;
++                if (backend)
++                    frame = backend->Present(request);
++                if (hooks.onPresent)
++                    hooks.onPresent(request, backend ? &frame : nullptr);
++                if (hooks.maxPresents != 0u && counts.presents >= hooks.maxPresents)
++                    return counts;
++                break;
++            }
++            case Op::ClearFramebuffer:
++            {
++                GSContext context{};
++                uint32_t rgba = 0;
++                if (!take(&context, sizeof(context)) || !take(&rgba, sizeof(rgba)))
++                {
++                    counts.truncated = true;
++                    return counts;
++                }
++                if (backend)
++                    backend->ClearFramebuffer(context, rgba);
++                break;
++            }
++            case Op::WriteVram:
++            {
++                uint32_t args[6] = {};
++                if (!take(args, sizeof(args)))
++                {
++                    counts.truncated = true;
++                    return counts;
++                }
++                if (backend)
++                    backend->WriteVram(args[0], args[1], args[2], args[3], args[4], args[5]);
++                break;
++            }
++            case Op::ConsumeLocalToHost:
++            {
++                uint32_t maxBytes = 0;
++                if (!take(&maxBytes, sizeof(maxBytes)))
++                {
++                    counts.truncated = true;
++                    return counts;
++                }
++                scratch.resize(maxBytes);
++                if (backend)
++                    backend->ConsumeLocalToHostBytes(scratch.data(), maxBytes);
++                break;
++            }
++            case Op::Readback:
++                if (backend)
++                    backend->Sync(GSSyncReason::DebugReadback);
++                break;
++            case Op::Reset:
++                if (backend)
++                    backend->Reset();
++                break;
++            case Op::End:
++                return counts;
++            default:
++                counts.truncated = true;
++                return counts;
++            }
++        }
++    }
++}
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 9889324..938d090 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -5,6 +5,7 @@
+ #include "runtime/gs/ps2_gs_psmt4.h"
+ #include "runtime/gs/ps2_gs_psmt8.h"
+ #include "runtime/gs/ps2_gs_memory.h"
++#include "runtime/gs/gs_swizzle.h"
+ #include "ps2_log.h"
+ #include <atomic>
+ #include <bitset>
+@@ -35,6 +36,17 @@ namespace
+ #endif
+     }
+ 
++    // Pause instructions a band worker or the GS thread spins before sleeping (PS2X_GS_SPIN, experiments).
++    uint32_t spinIterations()
++    {
++        static const uint32_t value = []
++        {
++            const char *env = std::getenv("PS2X_GS_SPIN");
++            return env ? static_cast<uint32_t>(std::atoi(env)) : 4096u;
++        }();
++        return value;
++    }
++
+     // PS2X_GS_THREADS overrides the number of extra rasterizer threads (0 draws everything on the GS caller).
+     unsigned rasterWorkerCount()
+     {
+@@ -56,6 +68,7 @@ namespace
+         int phase = 0;
+         GSMem::TexturePageCache *cache = nullptr;
+         const uint16_t *clut = nullptr; // the batch's CLUT (band workers); null: the backend's current one
++        uint64_t clutVersion = 0;       // its version (resolved palettes are cached by version)
+         const uint8_t *textureVram = nullptr; // textures read from this copy of VRAM (null: VRAM)
+     };
+     thread_local RowInterleave t_interleave;
+@@ -154,6 +167,16 @@ namespace
+         return !(env && env[0] == '0');
+     }();
+     std::atomic<uint64_t> g_publishCount{0};
++    // Why the pending batch was handed over (PS2X_GS_STATS): full, CLUT load, texture copy, frame/Z wait,
++    // layout change, flush.
++    enum PublishReason { kPubFull, kPubClut, kPubTexture, kPubFbWait, kPubLayout, kPubFlush, kPubReasons };
++    std::atomic<uint64_t> g_publishReason[kPubReasons]{};
++    std::atomic<uint64_t> g_waitReason[2]{}; // [0] texture copies, [1] uploads/CLUT
++    inline void countPublish(PublishReason reason)
++    {
++        if (g_gsStats)
++            g_publishReason[reason].fetch_add(1u, std::memory_order_relaxed);
++    }
+ 
+     void gsStatsFlushThread()
+     {
+@@ -200,6 +223,15 @@ namespace
+                                      kFlushReasonNames[r], static_cast<unsigned long long>(count), static_cast<double>(ns) / 1e6);
+         }
+         std::fprintf(stderr, "%s\n", line);
++        std::fprintf(stderr, "[gs-publish] full=%llu clut=%llu texture=%llu fb-wait=%llu layout=%llu flush=%llu; waits: texture=%llu upload/clut=%llu\n",
++                     static_cast<unsigned long long>(g_publishReason[kPubFull].exchange(0)),
++                     static_cast<unsigned long long>(g_publishReason[kPubClut].exchange(0)),
++                     static_cast<unsigned long long>(g_publishReason[kPubTexture].exchange(0)),
++                     static_cast<unsigned long long>(g_publishReason[kPubFbWait].exchange(0)),
++                     static_cast<unsigned long long>(g_publishReason[kPubLayout].exchange(0)),
++                     static_cast<unsigned long long>(g_publishReason[kPubFlush].exchange(0)),
++                     static_cast<unsigned long long>(g_waitReason[0].exchange(0)),
++                     static_cast<unsigned long long>(g_waitReason[1].exchange(0)));
+         std::fprintf(stderr, "[gs-time] band workers (summed): draw=%.0fms barrier=%.0fms idle=%.0fms; gs thread: submit=%.0fms\n",
+                      static_cast<double>(g_bandDrawNs.exchange(0)) / 1e6, static_cast<double>(g_bandBarrierNs.exchange(0)) / 1e6,
+                      static_cast<double>(g_bandIdleNs.exchange(0)) / 1e6, static_cast<double>(g_submitNs.exchange(0)) / 1e6);
+@@ -212,9 +244,11 @@ namespace
+ }
+ 
+ // Persistent band workers for batches of primitives. Worker k owns the 8-row bands b with b % workers == k
+-// and draws every published batch, in order, over its own bands; the GS thread publishes and goes on. There
+-// is no barrier between batches: the GS thread only waits when a slot is still in use or when it needs
+-// every batch drawn (VRAM reads and writes, CLUT, TEXFLUSH...).
++// and draws every published batch, in order, over its own bands; the GS thread publishes and goes on.
++// Textures are read through the batch's page map (copies taken when the primitives were submitted), so a
++// batch never waits for another one because of what it samples. The GS thread waits for the workers only
++// when it needs VRAM that a batch in flight draws (GSCpuBackend::WaitForFbPagesUnlocked) or everything
++// drawn; a barrier slot starts once every earlier slot is drawn (surfaces that alias with another layout).
+ class GSBandPipeline
+ {
+ public:
+@@ -222,17 +256,15 @@ public:
+     {
+         std::vector<GSPrimitiveBatch> primitives;
+         std::array<uint16_t, 512> clut{};
+-        uint32_t textureEpoch = 0;
++        uint64_t clutVersion = 0;
++        std::array<const uint8_t *, 512> pageMap{};
+         bool barrier = false;
+-        std::bitset<512> writes;
+-        std::bitset<512> reads;
+-        std::bitset<512> transferWrites;
+-        // Run by worker 0 before the primitives, once every earlier slot is drawn, with the others waiting.
+-        std::vector<std::function<void()>> serial;
+-        // The CLUT comes from worker 0 (deferred CLUT loads): it copies it into `clut` before the others draw.
+-        bool clutFromWorker = false;
+-        const uint8_t *textureVram = nullptr;
+-        bool serialBarrier = false;
++        // Texture pages to copy before the slot is drawn (page, destination), once every slot below
++        // copyAfter is drawn (the ones that draw into those pages); worker 0 copies, then sets copiesDone
++        // to the slot's index + 1.
++        std::vector<std::pair<uint32_t, uint8_t *>> copies;
++        uint64_t copyAfter = 0;
++        std::atomic<uint64_t> copiesDone{0};
+     };
+     using DrawFn = std::function<void(const Slot &, unsigned phase, unsigned stride)>;
+ 
+@@ -260,12 +292,15 @@ public:
+ 
+     unsigned workerCount() const { return m_workers; }
+ 
++    // Index the next published slot gets.
++    uint64_t nextIndex() const { return m_published.load(std::memory_order_relaxed); }
++
+     // Takes the primitives (swapping in an empty vector with the slot's old capacity).
+-    // Returns the slot's published index.
+-    uint64_t publish(std::vector<GSPrimitiveBatch> &batch, const std::array<uint16_t, 512> &clut, uint32_t textureEpoch,
+-                     bool barrier, const std::bitset<512> &writes, const std::bitset<512> &reads,
+-                     const std::bitset<512> &transferWrites, std::vector<std::function<void()>> &serial,
+-                     bool serialBarrier, const std::array<uint16_t, 512> *workerClut, const uint8_t *textureVram = nullptr)
++    void setVram(const uint8_t *vram) { m_vram = vram; }
++
++    void publish(std::vector<GSPrimitiveBatch> &batch, const std::array<uint16_t, 512> &clut, uint64_t clutVersion,
++                 const std::array<const uint8_t *, 512> &pageMap, bool barrier,
++                 std::vector<std::pair<uint32_t, uint8_t *>> &copies, uint64_t copyAfter)
+     {
+         const uint64_t published = m_published.load(std::memory_order_relaxed);
+         if (g_gsStats)
+@@ -287,89 +322,36 @@ public:
+         Slot &slot = m_slots[published % kSlots];
+         slot.primitives.swap(batch);
+         batch.clear();
+-        slot.clut = clut;
+-        slot.textureEpoch = textureEpoch;
++        if (slot.clutVersion != clutVersion)
++            slot.clut = clut;
++        slot.clutVersion = clutVersion;
++        slot.pageMap = pageMap;
+         slot.barrier = barrier;
+-        slot.writes = writes;
+-        slot.reads = reads;
+-        slot.transferWrites = transferWrites;
+-        slot.serial.swap(serial);
+-        serial.clear();
+-        slot.clutFromWorker = workerClut != nullptr;
+-        slot.serialBarrier = serialBarrier;
+-        slot.textureVram = textureVram;
+-        if (barrier || serialBarrier)
+-            m_lastBarrierSlot = published;
+-        if (workerClut)
+-            m_workerClut = workerClut; // never cleared: older deferred slots may still be in flight
++        slot.copies.swap(copies);
++        copies.clear();
++        slot.copyAfter = copyAfter;
+         m_published.store(published + 1u, std::memory_order_release);
+         m_wake.fetch_add(1u, std::memory_order_acq_rel);
+         m_wake.notify_all();
+-        return published;
+     }
+ 
+     bool idle() const { return minDone() >= m_published.load(std::memory_order_relaxed); }
+ 
+-    // Whether a handed-over batch that is not drawn yet may read or write one of `pages` (a queued transfer
+-    // counts until worker 0 has run it).
+-    bool touchesPagesInFlight(const std::bitset<512> &pages) const
+-    {
+-        const uint64_t published = m_published.load(std::memory_order_relaxed);
+-        const uint64_t serialDone = m_serialDone.load(std::memory_order_acquire);
+-        for (uint64_t n = minDone(); n < published; ++n)
+-        {
+-            const Slot &slot = m_slots[n % kSlots];
+-            if ((slot.writes & pages).any() || (slot.reads & pages).any())
+-                return true;
+-            if (n >= serialDone && (slot.transferWrites & pages).any())
+-                return true;
+-        }
+-        return false;
+-    }
+-
+-    // Whether primitives of a handed-over batch that is not drawn yet may write one of `pages`.
+-    // A slot after a barrier slot starts once everything before that barrier is drawn: only the writers from
+-    // the last barrier on can still be drawing when the next slot starts.
+-    bool primitivesWriteInFlight(const std::bitset<512> &pages) const
+-    {
+-        const uint64_t published = m_published.load(std::memory_order_relaxed);
+-        static const bool trim = []
+-        {
+-            const char *env = std::getenv("PS2X_GS_RAW_TRIM");
+-            return env && env[0] == '1';
+-        }();
+-        for (uint64_t n = trim ? std::max(minDone(), m_lastBarrierSlot) : minDone(); n < published; ++n)
+-            if ((m_slots[n % kSlots].writes & pages).any())
+-                return true;
+-        return false;
+-    }
++    // Every slot below `index` is drawn.
++    bool doneBelow(uint64_t index) const { return minDone() >= index; }
+ 
+-    // Whether a handed-over batch that is not drawn yet may write VRAM page `page` (primitives until drawn,
+-    // queued transfers until run).
+-    bool writesPageInFlight(uint32_t page) const
++    void waitDoneBelow(uint64_t index)
+     {
+-        const uint64_t published = m_published.load(std::memory_order_relaxed);
+-        const uint64_t serialDone = m_serialDone.load(std::memory_order_acquire);
+-        for (uint64_t n = minDone(); n < published; ++n)
+-        {
+-            const Slot &slot = m_slots[n % kSlots];
+-            if (slot.writes.test(page & 511u) || (n >= serialDone && slot.transferWrites.test(page & 511u)))
+-                return true;
+-        }
+-        return false;
++        if (minDone() < index)
++            waitUntil([&]()
++                      { return minDone() >= index; });
+     }
+ 
+     void waitAll()
+     {
+-        const uint64_t target = m_published.load(std::memory_order_relaxed);
+-        waitUntil([&]()
+-                  { return minDone() >= target; });
++        waitDoneBelow(m_published.load(std::memory_order_relaxed));
+     }
+ 
+-private:
+-    static constexpr uint64_t kSlots = 64u;
+-    static constexpr uint32_t kSpinIterations = 4096u;
+-
+     uint64_t minDone() const
+     {
+         uint64_t lowest = ~0ull;
+@@ -378,6 +360,10 @@ private:
+         return lowest;
+     }
+ 
++private:
++    static constexpr uint64_t kSlots = 64u;
++    const uint32_t kSpinIterations = spinIterations();
++
+     template <typename Pred>
+     void waitUntil(Pred &&ready)
+     {
+@@ -405,39 +391,34 @@ private:
+             if (next < m_published.load(std::memory_order_acquire))
+             {
+                 Slot &slot = m_slots[next % kSlots];
+-                // A barrier slot starts once every worker has drawn all the slots before it.
+-                const bool serial = !slot.serial.empty();
+                 const uint64_t barrierStart = g_gsStats ? statNowNs() : 0u;
+-                if (slot.barrier || slot.serialBarrier)
++                // A barrier slot starts once every worker has drawn all the slots before it.
++                if (slot.barrier)
+                     waitUntil([&]()
+                               { return minDone() >= next; });
+-                const uint64_t serialStart = g_gsStats ? statNowNs() : 0u;
+-                if (serial || slot.clutFromWorker)
++                if (!slot.copies.empty())
+                 {
+-                    // Worker 0 runs the slot's transfers and CLUT loads, takes the worker CLUT, and lets the
+-                    // others draw the slot (only serial slots also wait for every earlier slot).
+                     if (k == 0u)
+                     {
+-                        for (const std::function<void()> &op : slot.serial)
+-                            op();
+-                        if (slot.clutFromWorker && m_workerClut)
+-                            slot.clut = *m_workerClut;
+-                        m_serialDone.store(next + 1u, std::memory_order_release);
++                        waitUntil([&]()
++                                  { return minDone() >= slot.copyAfter; });
++                        for (const auto &copy : slot.copies)
++                            std::memcpy(copy.second, m_vram + copy.first * 8192u, 8192u);
++                        slot.copiesDone.store(next + 1u, std::memory_order_release);
+                         m_progress.fetch_add(1u, std::memory_order_acq_rel);
+                         m_progress.notify_all();
+                     }
+                     else
+                         waitUntil([&]()
+-                                  { return m_serialDone.load(std::memory_order_acquire) > next; });
++                                  { return slot.copiesDone.load(std::memory_order_acquire) == next + 1u; });
+                 }
+                 const uint64_t drawStart = g_gsStats ? statNowNs() : 0u;
+                 m_draw(slot, k, stride);
+                 if (g_gsStats)
+                 {
+                     const uint64_t end = statNowNs();
+-                    const int kind = slot.serialBarrier ? 0 : (slot.barrier ? 1 : 2);
+-                    g_bandWaitNs[kind].fetch_add(serialStart - barrierStart, std::memory_order_relaxed);
+-                    g_bandSerialNs[k == 0u ? 0 : 1].fetch_add(drawStart - serialStart, std::memory_order_relaxed);
++                    const int kind = slot.barrier ? 1 : 2;
++                    g_bandWaitNs[kind].fetch_add(drawStart - barrierStart, std::memory_order_relaxed);
+                     if (k == 0u)
+                         g_bandSlotKinds[kind].fetch_add(1u, std::memory_order_relaxed);
+                     g_bandBarrierNs.fetch_add(drawStart - barrierStart, std::memory_order_relaxed);
+@@ -471,14 +452,12 @@ private:
+     }
+ 
+     DrawFn m_draw;
++    const uint8_t *m_vram = nullptr;
+     Slot m_slots[kSlots];
+     std::atomic<uint64_t> m_published{0u};
+     const unsigned m_workers;
+     std::unique_ptr<std::atomic<uint64_t>[]> m_done;
+     std::atomic<uint32_t> m_progress{0u};
+-    std::atomic<uint64_t> m_serialDone{0u};
+-    uint64_t m_lastBarrierSlot = 0; // GS thread only
+-    const std::array<uint16_t, 512> *m_workerClut = nullptr;
+     std::atomic<uint32_t> m_wake{0u};
+     std::atomic<bool> m_stop{false};
+     std::vector<std::thread> m_threads;
+@@ -1008,12 +987,18 @@ namespace
+     }
+ }
+ 
+-GSCpuBackend::GSCpuBackend()
++GSCpuBackend::GSCpuBackend() : GSCpuBackend(true)
++{
++}
++
++GSCpuBackend::GSCpuBackend(bool rasterThreads)
+ {
+     using namespace GSMem;
+     static std::once_flag lookupTablesOnce;
+     std::call_once(lookupTablesOnce, []()
+-                   { InitLookupTables(); });
++                   {
++                       InitLookupTables();
++                       GSSwizzle::Get(GS_PSM_CT32); });
+     for (size_t i = 0; i < kPsmHandlerCount; ++i)
+     {
+         switch (i)
+@@ -1078,14 +1063,14 @@ GSCpuBackend::GSCpuBackend()
+     }
+     Reset();
+ 
+-    const unsigned workers = rasterWorkerCount();
++    const unsigned workers = rasterThreads ? rasterWorkerCount() : 0u;
+     if (workers != 0u)
+     {
+         m_workerTextureCaches.resize(workers);
+         m_workerTextureCacheEpochs.assign(workers, ~0u);
+         m_bandPipeline = std::make_unique<GSBandPipeline>(
+             workers, [this](const GSBandPipeline::Slot &slot, unsigned phase, unsigned stride)
+-            { DrawBatchBands(slot.primitives, slot.clut.data(), slot.textureEpoch, slot.textureVram, phase, stride); });
++            { DrawBatchBands(slot.primitives, slot.clut.data(), slot.clutVersion, slot.pageMap.data(), phase, stride); });
+     }
+ }
+ 
+@@ -1101,8 +1086,11 @@ void GSCpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
+         throw std::invalid_argument("GS CPU backend requires at least 4 MiB of VRAM");
+ 
+     std::lock_guard<std::mutex> lock(m_mutex);
++    WaitInflightUnlocked();
+     m_vram = vram;
+     m_vramSize = vramSize;
++    if (m_bandPipeline)
++        m_bandPipeline->setVram(vram);
+     ResetUnlocked();
+ }
+ 
+@@ -1111,22 +1099,17 @@ void GSCpuBackend::Reset()
+     std::lock_guard<std::mutex> lock(m_mutex);
+     WaitInflightUnlocked();
+     m_pending.clear();
+-    m_pendingSerial.clear();
+-    m_serialTransfer = false;
+-    m_immediateTransfer = false;
+     m_pendingReads.reset();
+     m_pendingWrites.reset();
+-    m_pendingTransferWrites.reset();
+-    m_shadowValid.reset();
+-    m_shadowActive = false;
++    m_barrierNext = false;
++    m_transferPages.reset();
+     ResetUnlocked();
+ }
+ 
+ void GSCpuBackend::ResetUnlocked()
+ {
+     m_clut.fill(0u);
+-    m_workerClut.fill(0u);
+-    m_clutDeferred = false;
++    ++m_clutVersion;
+     m_clutCbp.fill(0u);
+     m_texturePageCache.Invalidate();
+     ++m_textureCacheEpoch;
+@@ -1136,6 +1119,58 @@ void GSCpuBackend::ResetUnlocked()
+     m_transferState.direction = 3u;
+     m_localToHostBuffer.clear();
+     m_localToHostReadPos = 0u;
++    ResetPageCopiesUnlocked();
++}
++
++void GSCpuBackend::ResetPageCopiesUnlocked()
++{
++    // Callers have drawn everything handed over: no batch reads a copy any more.
++    m_pendingCopies.clear();
++    m_pendingCopyAfter = 0u;
++    m_pendingCopyPages.reset();
++    for (uint32_t page = 0; page < 512u; ++page)
++    {
++        if (m_pageCopy[page])
++            m_freeCopies.push_back(m_pageCopy[page]);
++        m_pageCopy[page] = nullptr;
++        m_pageMap[page] = m_vram ? m_vram + page * 8192u : nullptr;
++    }
++    for (const auto &retired : m_retiredCopies)
++        m_freeCopies.push_back(retired.second);
++    m_retiredCopies.clear();
++    m_pageHasCopy.reset();
++    m_pageCopyStale.reset();
++    m_pageReadSinceFlush.reset();
++    m_pageFbSlot.fill(0u);
++    m_pageLayout.fill(0u);
++}
++
++uint8_t *GSCpuBackend::AllocatePageCopyUnlocked()
++{
++    if (m_freeCopies.empty() && !m_retiredCopies.empty())
++    {
++        const uint64_t done = m_bandPipeline ? m_bandPipeline->minDone() : ~0ull;
++        size_t kept = 0;
++        for (const auto &retired : m_retiredCopies)
++        {
++            if (retired.first <= done)
++                m_freeCopies.push_back(retired.second);
++            else
++                m_retiredCopies[kept++] = retired;
++        }
++        m_retiredCopies.resize(kept);
++    }
++    if (m_freeCopies.empty())
++    {
++        constexpr size_t kBlockPages = 64u;
++        auto block = std::make_unique<uint8_t[]>(kBlockPages * 8192u);
++        for (size_t i = 0; i < kBlockPages; ++i)
++            m_freeCopies.push_back(block.get() + i * 8192u);
++        m_copyStorage.push_back(std::move(block));
++    }
++    uint8_t *copy = m_freeCopies.back();
++    m_freeCopies.pop_back();
++    return copy;
+ }
+ 
+ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
+@@ -1191,94 +1226,30 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
+     if (!batchable)
+     {
+         FlushPendingUnlocked(kFlushPrim);
+-        m_shadowValid.reset(); // drawn here, outside the page tracking
+-        DrawPrimitive(batch);
+-        return;
+-    }
+-    const std::bitset<512> reads = PrimitiveReadPages(batch); // empty without a texture
+-    if (batch.state.prim.tme)
+-    {
+-        // Read after write: band workers draw a batch in parallel and keep page copies, so a primitive that
+-        // samples pages drawn before it must not share a slot with their drawing, or start before it ends.
+-        const std::bitset<512> writes = PrimitiveWritePages(batch);
+-        if ((reads & writes).any())
+-        {
+-            // It samples what it draws: worker 0 draws it alone (all rows, fresh page copies) once everything
+-            // before it is drawn; the primitives after it follow.
+-            g_rawSelf.fetch_add(1u, std::memory_order_relaxed);
+-            const float area = std::fabs((batch.vertices[1].x - batch.vertices[0].x) * (batch.vertices[1].y - batch.vertices[0].y)) +
+-                               (batch.vertexCount > 2u ? std::fabs((batch.vertices[2].x - batch.vertices[0].x) *
+-                                                                   (batch.vertices[2].y - batch.vertices[0].y))
+-                                                       : 0.0f);
+-            const std::bitset<512> touched = reads | writes;
+-            if (g_gsSelfNow && area < 4096.0f && !m_clutDeferred && m_pendingSerial.empty() &&
+-                !(touched & (m_pendingReads | m_pendingWrites | m_pendingTransferWrites)).any() &&
+-                !m_bandPipeline->touchesPagesInFlight(touched))
+-            {
+-                // Nothing waiting or being drawn uses these pages: this thread draws it now, in order, and the
+-                // band workers drop their page copies before the next batch.
+-                m_texturePageCache.Invalidate();
+-                DrawPrimitive(batch);
+-                m_texturePageCache.Invalidate();
+-                m_shadowValid &= ~writes;
+-                ++m_textureCacheEpoch;
+-                g_rawSelfNow.fetch_add(1u, std::memory_order_relaxed);
+-                return;
+-            }
+-            if (g_gsSelfCopy && !m_clutDeferred && area >= 4096.0f)
+-            {
+-                // Large (post-processing in place): a slot of its own, after everything before it; worker 0
+-                // copies the pages it samples and every worker draws its bands from that copy.
+-                if (!m_textureSnapshot)
+-                    m_textureSnapshot = std::make_unique<uint8_t[]>(GSMem::MEMORY_SIZE);
+-                if (!m_pending.empty() || !m_pendingSerial.empty())
+-                    DrawPendingUnlocked();
+-                m_pendingSerial.emplace_back([this, reads]()
+-                                             {
+-                                                 for (uint32_t page = 0; page < 512u; ++page)
+-                                                     if (reads.test(page))
+-                                                         std::memcpy(m_textureSnapshot.get() + page * 8192u, m_vram + page * 8192u, 8192u); });
+-                m_pendingSerialBarrier = true;
+-                m_nextTextureVram = m_textureSnapshot.get();
+-                MarkPendingWritesUnlocked(batch);
+-                MarkPendingReadsUnlocked(reads);
+-                m_pending.push_back(batch);
+-                DrawPendingUnlocked();
+-                ++m_textureCacheEpoch; // the next slot drops the copied pages from the workers' caches
+-                m_shadowValid &= ~writes;
+-                g_rawSelfCopy.fetch_add(1u, std::memory_order_relaxed);
+-                return;
+-            }
+-            // Otherwise it waits for everything before it and is drawn here, alone.
+-            FlushPendingUnlocked(kFlushPrim);
++        if (m_bandPipeline)
++        {
++            // Drawn here, from VRAM as the band workers left it.
+             m_texturePageCache.Invalidate();
+             DrawPrimitive(batch);
+-            m_texturePageCache.Invalidate();
+-            m_shadowValid &= ~writes;
+-            ++m_textureCacheEpoch;
++            StalePageCopiesUnlocked(PrimitiveWritePages(batch));
+             return;
+         }
+-        if ((reads & m_pendingWrites).any())
+-        {
+-            // Drawn in the waiting batch: that batch goes first, and this one starts after it, with fresh copies.
+-            g_rawPending.fetch_add(1u, std::memory_order_relaxed);
+-            DrawPendingUnlocked();
+-            m_barrierNext = true;
+-            ++m_textureCacheEpoch;
+-        }
+-        else if (g_rawFlightBarrier && !m_barrierNext && !m_pendingSerialBarrier && (reads & m_inflightWritesUnion).any() &&
+-                 m_bandPipeline->primitivesWriteInFlight(reads))
+-        {
+-            g_rawInflight.fetch_add(1u, std::memory_order_relaxed);
+-            m_barrierNext = true;
+-            ++m_textureCacheEpoch;
+-        }
++        DrawPrimitive(batch);
++        return;
+     }
++    const std::bitset<512> reads = PrimitiveReadPages(batch); // empty without a texture
++    // The texture as it is now (before this primitive draws, also when it samples its own target): copies of
++    // its pages, taken once the primitives that draw into them are drawn.
++    if (batch.state.prim.tme)
++        PrepareTexturePagesUnlocked(reads);
+     MarkPendingWritesUnlocked(batch);
+-    MarkPendingReadsUnlocked(reads);
++    MarkPendingReadsUnlocked(reads); // after any hand-over above: this primitive is in the next batch
+     m_pending.push_back(batch);
+     if (m_pending.size() >= kBatchMaxPrimitives)
++    {
++        countPublish(kPubFull);
+         DrawPendingUnlocked();
++    }
+ }
+ 
+ void GSCpuBackend::MarkPendingWritesUnlocked(const GSPrimitiveBatch &batch)
+@@ -1301,31 +1272,64 @@ void GSCpuBackend::MarkPendingWritesUnlocked(const GSPrimitiveBatch &batch)
+     const int y1 = std::min<int>(static_cast<int>(std::ceil(maxY)) - ofy + 1, ctx.scissor.y1);
+     if (x0 > x1 || y0 > y1)
+         return; // clipped away
++    // The Z buffer counts when it is written or read (the pixel pipeline tests ZTST 2/3 whatever ZTE says).
++    const bool zUsed = !ctx.zbuf.zmask || ((ctx.test >> 17u) & 3u) >= 2u;
+     const uint64_t key = static_cast<uint64_t>(ctx.frame.fbp & 0x1FFu) | (static_cast<uint64_t>(ctx.frame.fbw & 0x3Fu) << 9u) |
+                          (static_cast<uint64_t>(ctx.frame.psm & 0x3Fu) << 15u) | (static_cast<uint64_t>(ctx.zbuf.zbp & 0x1FFu) << 21u) |
+-                         (static_cast<uint64_t>(ctx.zbuf.psm & 0x3Fu) << 30u) | (static_cast<uint64_t>(ctx.zbuf.zmask ? 1u : 0u) << 36u);
++                         (static_cast<uint64_t>(ctx.zbuf.psm & 0x3Fu) << 30u) | (static_cast<uint64_t>(ctx.zbuf.zmask ? 1u : 0u) << 36u) |
++                         (static_cast<uint64_t>(zUsed ? 1u : 0u) << 37u);
+     const uint64_t key2 = static_cast<uint64_t>(x0 / 64) | (static_cast<uint64_t>(x1 / 64) << 8u) |
+                           (static_cast<uint64_t>(y0 / 32) << 16u) | (static_cast<uint64_t>(y1 / 32) << 28u);
+     if (key == m_lastWriteKey && key2 == m_lastWriteKey2)
+         return;
+     m_lastWriteKey = key;
+     m_lastWriteKey2 = key2;
++    std::bitset<512> written;
+     // A page is 8 KiB: 64x32 pixels in the 32-bit formats, 64x64 in the 16-bit ones; FBW counts 64 pixels.
+-    auto mark = [&](uint32_t basePage, uint32_t psm)
++    auto mark = [&](uint32_t basePage, uint32_t psm, bool writes)
+     {
+         const uint32_t pageHeight = (psm & 0x2u) ? 64u : 32u;
+         const uint32_t width = std::max<uint32_t>(ctx.frame.fbw, 1u);
++        // Band workers own rows of the buffer: two layouts of the same memory (base, width or swizzle) put
++        // a byte in rows of different workers, so a primitive with another layout than the one still drawing
++        // into a page starts after it.
++        uint32_t family = 0u;
++        switch (psm)
++        {
++        case GS_PSM_CT16: family = 1u; break;
++        case GS_PSM_CT16S: family = 2u; break;
++        case GS_PSM_Z32:
++        case GS_PSM_Z24: family = 3u; break;
++        case GS_PSM_Z16: family = 4u; break;
++        case GS_PSM_Z16S: family = 5u; break;
++        default: family = 0u; break;
++        }
++        const uint32_t layout = (basePage & 0x1FFu) | ((width & 0x3Fu) << 9u) | (family << 15u) | 0x80000000u;
+         for (uint32_t row = static_cast<uint32_t>(y0) / pageHeight; row <= static_cast<uint32_t>(y1) / pageHeight; ++row)
+             for (uint32_t col = static_cast<uint32_t>(x0) / 64u; col <= static_cast<uint32_t>(x1) / 64u; ++col)
+             {
+                 const uint32_t page = (basePage + row * width + col) & 511u;
++                if (m_bandPipeline && m_pageLayout[page] != layout)
++                {
++                    if (m_pendingWrites.test(page))
++                    {
++                        countPublish(kPubLayout);
++                        DrawPendingUnlocked();
++                        m_barrierNext = true;
++                    }
++                    else if (m_pageLayout[page] != 0u && !m_bandPipeline->doneBelow(m_pageFbSlot[page]))
++                        m_barrierNext = true;
++                    m_pageLayout[page] = layout;
++                }
+                 m_pendingWrites.set(page);
+-                m_shadowValid.reset(page);
++                if (writes)
++                    written.set(page);
+             }
+     };
+-    mark(ctx.frame.fbp, ctx.frame.psm);
+-    if (!ctx.zbuf.zmask)
+-        mark(ctx.zbuf.zbp, ctx.zbuf.psm);
++    mark(ctx.frame.fbp, ctx.frame.psm, true);
++    if (zUsed)
++        mark(ctx.zbuf.zbp, ctx.zbuf.psm, !ctx.zbuf.zmask);
++    StalePageCopiesUnlocked(written);
+ }
+ 
+ namespace
+@@ -1551,6 +1555,82 @@ std::bitset<512> GSCpuBackend::PrimitiveWritePages(const GSPrimitiveBatch &batch
+     return pages;
+ }
+ 
++void GSCpuBackend::WaitForFbPagesUnlocked(const std::bitset<512> &pages)
++{
++    if (!m_bandPipeline || pages.none())
++        return;
++    if ((pages & (m_pendingWrites | m_pendingCopyPages)).any())
++    {
++        countPublish(kPubFbWait);
++        DrawPendingUnlocked();
++    }
++    uint64_t need = 0u;
++    for (uint32_t page = 0; page < 512u; ++page)
++        if (pages.test(page))
++            need = std::max(need, m_pageFbSlot[page]);
++    if (m_bandPipeline->doneBelow(need))
++        return;
++    if (g_gsStats)
++    {
++        g_waitReason[m_waitingForTexture ? 0 : 1].fetch_add(1u, std::memory_order_relaxed);
++        const auto start = std::chrono::steady_clock::now();
++        m_bandPipeline->waitDoneBelow(need);
++        g_flushCount[kFlushTransfer].fetch_add(1u, std::memory_order_relaxed);
++        g_flushWaitNs[kFlushTransfer].fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                                                          std::chrono::steady_clock::now() - start)
++                                                                          .count()),
++                                                std::memory_order_relaxed);
++        return;
++    }
++    m_bandPipeline->waitDoneBelow(need);
++}
++
++void GSCpuBackend::PrepareTexturePagesUnlocked(const std::bitset<512> &pages)
++{
++    if (!m_bandPipeline || !m_vram)
++        return;
++    // Texture cache rule (as the GS and the single-threaded path): a page keeps the contents it had when it
++    // was first sampled after the last TEXFLUSH, whatever is written into it later. Only a page not sampled
++    // since then needs a copy, and only if VRAM changed under its last one.
++    const std::bitset<512> missing = pages & ~m_pageReadSinceFlush & ~(m_pageHasCopy & ~m_pageCopyStale);
++    m_pageReadSinceFlush |= pages;
++    if (missing.none())
++        return;
++    // The pending primitives keep the copies they were given: they are handed over first. A page that
++    // primitives still draw into is copied once they are drawn (read after write).
++    if ((missing & (m_pendingReads | m_pendingWrites)).any())
++    {
++        countPublish(kPubTexture);
++        DrawPendingUnlocked();
++    }
++    const uint64_t next = m_bandPipeline->nextIndex();
++    for (uint32_t page = 0; page < 512u; ++page)
++    {
++        if (!missing.test(page))
++            continue;
++        // The old copy may be read by every batch handed over so far.
++        if (m_pageCopy[page])
++            m_retiredCopies.emplace_back(next, m_pageCopy[page]);
++        uint8_t *copy = AllocatePageCopyUnlocked();
++        if (m_bandPipeline->doneBelow(m_pageFbSlot[page]))
++            std::memcpy(copy, m_vram + page * 8192u, 8192u);
++        else
++        {
++            // Batches in flight still draw into the page: worker 0 copies it before the next batch is drawn,
++            // once they are done, and this thread goes on.
++            m_pendingCopies.emplace_back(page, copy);
++            m_pendingCopyAfter = std::max(m_pendingCopyAfter, m_pageFbSlot[page]);
++            m_pendingCopyPages.set(page);
++            if (g_gsStats)
++                g_waitReason[0].fetch_add(1u, std::memory_order_relaxed);
++        }
++        m_pageCopy[page] = copy;
++        m_pageMap[page] = copy;
++    }
++    m_pageHasCopy |= missing;
++    m_pageCopyStale &= ~missing;
++}
++
+ const uint16_t *GSCpuBackend::ActiveClut() const
+ {
+     return t_interleave.clut ? t_interleave.clut : m_clut.data();
+@@ -1559,8 +1639,11 @@ const uint16_t *GSCpuBackend::ActiveClut() const
+ void GSCpuBackend::FlushPendingUnlocked(int reason) const
+ {
+     GSCpuBackend *self = const_cast<GSCpuBackend *>(this);
+-    if (!m_pending.empty() || !m_pendingSerial.empty())
++    if (!m_pending.empty() || !m_pendingCopies.empty())
++    {
++        countPublish(kPubFlush);
+         self->DrawPendingUnlocked();
++    }
+     if (g_gsStats && m_bandPipeline && !m_bandPipeline->idle())
+     {
+         const auto start = std::chrono::steady_clock::now();
+@@ -1571,21 +1654,9 @@ void GSCpuBackend::FlushPendingUnlocked(int reason) const
+                                                              std::chrono::steady_clock::now() - start)
+                                                              .count()),
+                                    std::memory_order_relaxed);
+-        self->ResyncClutUnlocked();
+         return;
+     }
+     self->WaitInflightUnlocked();
+-    self->ResyncClutUnlocked();
+-}
+-
+-void GSCpuBackend::ResyncClutUnlocked()
+-{
+-    // Everything handed over has run: the worker CLUT is the current one again on this thread.
+-    if (m_clutDeferred && m_pending.empty() && m_pendingSerial.empty() && (!m_bandPipeline || m_bandPipeline->idle()))
+-    {
+-        m_clut = m_workerClut;
+-        m_clutDeferred = false;
+-    }
+ }
+ 
+ void GSCpuBackend::WaitInflightUnlocked()
+@@ -1596,7 +1667,7 @@ void GSCpuBackend::WaitInflightUnlocked()
+ 
+ void GSCpuBackend::DrawPendingUnlocked()
+ {
+-    if (m_pending.empty() && m_pendingSerial.empty())
++    if (m_pending.empty() && m_pendingCopies.empty())
+         return;
+     if (!m_bandPipeline)
+     {
+@@ -1605,38 +1676,27 @@ void GSCpuBackend::DrawPendingUnlocked()
+         m_pending.clear();
+         return;
+     }
+-    if (!m_pendingSerial.empty())
+-    {
+-        // The transfers change VRAM: every worker starts the slot with an empty texture cache.
+-        m_texturePageCache.Invalidate();
+-        ++m_textureCacheEpoch;
+-    }
+-    if (m_bandPipeline->idle())
+-        m_inflightWritesUnion.reset();
+-    m_inflightWritesUnion |= m_pendingWrites;
+-    m_bandPipeline->publish(m_pending, m_clut, m_textureCacheEpoch, m_barrierNext, m_pendingWrites,
+-                                                   m_pendingReads, m_pendingTransferWrites, m_pendingSerial, m_pendingSerialBarrier,
+-                                                   m_clutDeferred ? &m_workerClut : nullptr, m_nextTextureVram);
+-    m_nextTextureVram = nullptr;
+-    m_pendingSerialBarrier = false;
++    const uint64_t index = m_bandPipeline->nextIndex();
++    // The slot's copies read VRAM: uploads into those pages wait for it like for a frame buffer user.
++    const std::bitset<512> used = m_pendingWrites | m_pendingCopyPages;
++    for (uint32_t page = 0; page < 512u; ++page)
++        if (used.test(page))
++            m_pageFbSlot[page] = index + 1u;
++    m_bandPipeline->publish(m_pending, m_clut, m_clutVersion, m_pageMap, m_barrierNext, m_pendingCopies, m_pendingCopyAfter);
++    m_pendingCopyAfter = 0u;
++    m_pendingCopyPages.reset();
+     m_barrierNext = false;
+     m_pendingWrites.reset();
+     m_pendingReads.reset();
+-    m_pendingTransferWrites.reset();
+     m_lastWriteKey = ~0ull;
+ }
+ 
+-void GSCpuBackend::DrawBatchBands(const std::vector<GSPrimitiveBatch> &batches, const uint16_t *clut, uint32_t textureEpoch,
+-                                  const uint8_t *textureVram, unsigned phase, unsigned stride)
++void GSCpuBackend::DrawBatchBands(const std::vector<GSPrimitiveBatch> &batches, const uint16_t *clut, uint64_t clutVersion,
++                                  const uint8_t *const *pageMap, unsigned phase, unsigned stride)
+ {
+     GSMem::TexturePageCache *cache = &m_workerTextureCaches[phase];
+-    uint32_t &epoch = m_workerTextureCacheEpochs[phase];
+-    if (epoch != textureEpoch)
+-    {
+-        cache->Invalidate();
+-        epoch = textureEpoch;
+-    }
+-    t_interleave = {static_cast<int>(stride), static_cast<int>(phase), cache, clut, textureVram};
++    cache->SetPageMap(pageMap);
++    t_interleave = {static_cast<int>(stride), static_cast<int>(phase), cache, clut, clutVersion, nullptr};
+     for (const GSPrimitiveBatch &batch : batches)
+     {
+         const int ofy = batch.state.context.xyoffset.ofy >> 4;
+@@ -1652,6 +1712,7 @@ void GSCpuBackend::DrawBatchBands(const std::vector<GSPrimitiveBatch> &batches,
+         DrawPrimitive(batch);
+     }
+     t_interleave = {};
++    cache->SetPageMap(nullptr);
+     if (g_gsStats)
+         gsStatsFlushThread();
+ }
+@@ -1691,107 +1752,35 @@ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+     }
+ 
+     // The primitives submitted so far are handed over with the CLUT as it is now.
+-    if (!m_pending.empty() || !m_pendingSerial.empty())
+-        DrawPendingUnlocked();
+-    ResyncClutUnlocked();
+-    if (!m_bandPipeline)
++    if (!m_pending.empty())
+     {
+-        LoadClutUnlocked(tex0, texclut);
+-        return;
++        countPublish(kPubClut);
++        DrawPendingUnlocked();
+     }
+-
+-    // CLUT source pages: CSM1 CLUTs are at most 16x16 pixels from CBP (4 blocks); CSM2 reads a row (COV) of a
+-    // CBW-wide buffer. A hazard: a batch still in flight (primitives or a queued transfer) writes one of them.
+-    const uint32_t firstPage = tex0.cbp >> 5u;
+-    const uint32_t lastPage = tex0.csm != 0u
+-                                  ? firstPage + 1u + (static_cast<uint32_t>(texclut.cov) / 32u + 1u) * std::max<uint32_t>(texclut.cbw, 1u)
+-                                  : (tex0.cbp + 3u) >> 5u;
+-    bool hazard = false;
+-    for (uint32_t page = firstPage; page <= lastPage && !hazard; ++page)
+-        hazard = m_bandPipeline->writesPageInFlight(page);
+-
+-    if (!m_clutDeferred)
++    if (m_bandPipeline)
+     {
+-        // 1. This thread loads it when it can: from VRAM when the pages are settled, or from the shadow copy
+-        //    when only queued transfers write them.
+-        if (!hazard)
+-        {
+-            m_texturePageCache.Invalidate(); // band workers may have written VRAM since it was filled
+-            LoadClutUnlocked(tex0, texclut);
+-            return;
+-        }
++        // CLUT source pages: CSM1 CLUTs are at most 16x16 pixels from CBP (4 blocks); CSM2 reads a row (COV)
++        // of a CBW-wide buffer. Read from VRAM once nothing in flight draws into them.
++        const uint32_t firstPage = tex0.cbp >> 5u;
++        const uint32_t lastPage = tex0.csm != 0u
++                                      ? firstPage + 1u + (static_cast<uint32_t>(texclut.cov) / 32u + 1u) * std::max<uint32_t>(texclut.cbw, 1u)
++                                      : (tex0.cbp + 3u) >> 5u;
+         std::bitset<512> pages;
+         for (uint32_t page = firstPage; page <= lastPage; ++page)
+             pages.set(page & 511u);
+-        if (g_gsShadowClut && ShadowPrepareUnlocked(pages) == pages)
+-        {
+-            m_shadowPageCache.Invalidate();
+-            LoadClutUnlocked(tex0, texclut, m_shadowVram.get());
+-            g_clutShadowLoads.fetch_add(1u, std::memory_order_relaxed);
+-            return;
+-        }
+-        static const bool deferEnabled = []
+-        {
+-            const char *env = std::getenv("PS2X_GS_DEFER_CLUT");
+-            return env && env[0] == '1';
+-        }();
+-        if (!deferEnabled)
+-        {
+-            FlushPendingUnlocked(kFlushClut);
+-            m_texturePageCache.Invalidate();
+-            LoadClutUnlocked(tex0, texclut);
+-            return;
+-        }
+-        // 2. Primitives in flight draw the CLUT's pages: worker 0 loads it once every earlier batch is drawn,
+-        //    starting from this thread's CLUT, and the following batches take theirs from worker 0 until the
+-        //    pipeline drains (ResyncClutUnlocked).
+-        m_pendingSerial.emplace_back([this, snapshot = m_clut]()
+-                                     { m_workerClut = snapshot; });
+-        m_clutDeferred = true;
+-    }
+-    // While deferred, worker 0 does every load, in order (after the batches that draw the pages, on a hazard).
+-    if (hazard)
+-        m_pendingSerialBarrier = true;
+-    m_pendingSerial.emplace_back([this, tex0, texclut]()
+-                                 {
+-                                     m_workerClutCache.Invalidate();
+-                                     LoadClutUnlocked(tex0, texclut, m_vram, &m_workerClut, &m_workerClutCache); });
+-    // Worker 0 reads the source pages later: until then they count as read, so an upload to them (the next
+-    // palette, usually) is queued after this load instead of running at once on this thread.
+-    for (uint32_t page = firstPage; page <= lastPage; ++page)
+-        m_pendingReads.set(page & 511u);
+-    g_clutDeferred.fetch_add(1u, std::memory_order_relaxed);
+-}
+-
+-std::bitset<512> GSCpuBackend::ShadowPrepareUnlocked(const std::bitset<512> &pages)
+-{
+-    std::bitset<512> ready;
+-    if (!m_bandPipeline || !m_vram)
+-        return ready;
+-    if (!m_shadowVram)
+-        m_shadowVram = std::make_unique<uint8_t[]>(GSMem::MEMORY_SIZE);
+-    for (uint32_t page = 0; page < 512u; ++page)
+-    {
+-        if (!pages.test(page))
+-            continue;
+-        if (!m_shadowValid.test(page))
+-        {
+-            // A page gets a copy only while nothing queued or being drawn writes it (VRAM is then current).
+-            if (m_pendingWrites.test(page) || m_pendingTransferWrites.test(page) || m_bandPipeline->writesPageInFlight(page))
+-                continue;
+-            std::memcpy(m_shadowVram.get() + page * 8192u, m_vram + page * 8192u, 8192u);
+-            m_shadowValid.set(page);
+-        }
+-        ready.set(page);
++        WaitForFbPagesUnlocked(pages);
++        m_texturePageCache.Invalidate(); // band workers and uploads may have written VRAM since it was filled
+     }
+-    return ready;
++    LoadClutUnlocked(tex0, texclut);
+ }
+ 
+ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut, const uint8_t *vram,
+                                     std::array<uint16_t, 512> *target, GSMem::TexturePageCache *cache)
+ {
+     std::array<uint16_t, 512> &clut = target ? *target : m_clut;
+-    GSMem::TexturePageCache &pageCache = cache ? *cache : (vram ? m_shadowPageCache : m_texturePageCache);
++    if (!target)
++        ++m_clutVersion;
++    GSMem::TexturePageCache &pageCache = cache ? *cache : m_texturePageCache;
+     const bool fourBit = isFourBitIndexedPsm(tex0.psm);
+     const bool sixteenBit = tex0.cpsm == GS_PSM_CT16 || tex0.cpsm == GS_PSM_CT16S;
+     const bool thirtyTwoBit = tex0.cpsm == GS_PSM_CT32 || tex0.cpsm == GS_PSM_CT24;
+@@ -1848,13 +1837,8 @@ void GSCpuBackend::Flush()
+ void GSCpuBackend::TextureFlush()
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
+-    // Later primitives may sample what earlier ones drew: they start once those are drawn, with fresh caches.
+-    if (!m_pending.empty() || !m_pendingSerial.empty())
+-        DrawPendingUnlocked();
+-    if (m_bandPipeline)
+-        m_barrierNext = true;
+-    else
+-        WaitInflightUnlocked();
++    // Band workers: the next sample of each page takes it as VRAM is then (PrepareTexturePagesUnlocked).
++    m_pageReadSinceFlush.reset();
+     m_texturePageCache.Invalidate();
+     ++m_textureCacheEpoch;
+ }
+@@ -1891,7 +1875,7 @@ void GSCpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
+     FlushPendingUnlocked(kFlushVram);
+-    m_shadowValid.reset();
++    m_pageCopyStale |= m_pageHasCopy;
+     WriteVramUnlocked(psm, base, bw, x, y, value);
+ }
+ 
+@@ -1915,6 +1899,25 @@ void GSCpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
+     std::memcpy(out.data(), m_vram, m_vramSize);
+ }
+ 
++GSCpuBackend::ClutState GSCpuBackend::GetClutState() const
++{
++    std::lock_guard<std::mutex> lock(m_mutex);
++    FlushPendingUnlocked();
++    ClutState state;
++    state.clut = m_clut;
++    state.cbp = m_clutCbp;
++    return state;
++}
++
++void GSCpuBackend::SetClutState(const ClutState &state)
++{
++    std::lock_guard<std::mutex> lock(m_mutex);
++    FlushPendingUnlocked();
++    m_clut = state.clut;
++    m_clutCbp = state.cbp;
++    ++m_clutVersion;
++}
++
+ GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
+@@ -2299,6 +2302,11 @@ struct GSCpuBackend::PixelPipe
+     bool fb24 = false;
+     bool dateRead = false;
+     bool zmask = false;
++    // Frame and Z buffer addressing through the row/column tables (kind 0: through readFb/writeFb...).
++    const GSSwizzle::Format *fbFormat = nullptr;
++    const GSSwizzle::Format *zFormat = nullptr;
++    uint8_t fbKind = 0; // 1 CT32, 2 CT24, 3 CT16/CT16S
++    uint8_t zKind = 0;  // 1 Z32, 2 Z24, 3 Z16/Z16S
+ };
+ 
+ void GSCpuBackend::BuildPixelPipe(const GSDrawState &state, PixelPipe &p) const
+@@ -2338,13 +2346,59 @@ void GSCpuBackend::BuildPixelPipe(const GSDrawState &state, PixelPipe &p) const
+     p.fb24 = p.fpsm == GS_PSM_CT24;
+     p.dateRead = ((ctx.test >> 14) & 0x1u) != 0u && (p.fpsm == GS_PSM_CT32 || p.fpsm == GS_PSM_CT16 || p.fpsm == GS_PSM_CT16S);
+     p.zmask = ctx.zbuf.zmask;
++    switch (p.fpsm)
++    {
++    case GS_PSM_CT32: p.fbKind = 1u; break;
++    case GS_PSM_CT24: p.fbKind = 2u; break;
++    case GS_PSM_CT16:
++    case GS_PSM_CT16S: p.fbKind = 3u; break;
++    default: p.fbKind = 0u; break;
++    }
++    switch (p.zpsm)
++    {
++    case GS_PSM_Z32: p.zKind = 1u; break;
++    case GS_PSM_Z24: p.zKind = 2u; break;
++    case GS_PSM_Z16:
++    case GS_PSM_Z16S: p.zKind = 3u; break;
++    default: p.zKind = 0u; break;
++    }
++    p.fbFormat = p.fbKind ? GSSwizzle::Get(p.fpsm) : nullptr;
++    p.zFormat = p.zKind ? GSSwizzle::Get(p.zpsm) : nullptr;
++    if (!p.fbFormat)
++        p.fbKind = 0u;
++    if (!p.zFormat)
++        p.zKind = 0u;
+ }
+ 
+ namespace
+ {
+-    // WritePixel with the state decoded in advance.
+-    inline void writePixelFast(const GSCpuBackend::PixelPipe &p, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b,
+-                               uint8_t a, uint8_t fog);
++    // Frame and Z buffer addresses of one row (GSSwizzle): base plus the column table of the row.
++    struct PixelRow
++    {
++        uint32_t fbBase = 0;
++        const uint32_t *fbCol = nullptr;
++        uint32_t zBase = 0;
++        const uint32_t *zCol = nullptr;
++    };
++
++    inline void pixelRow(const GSCpuBackend::PixelPipe &p, int y, PixelRow &row)
++    {
++        const uint32_t uy = static_cast<uint32_t>(y);
++        if (p.fbKind)
++        {
++            row.fbBase = GSSwizzle::RowBase(*p.fbFormat, p.fbp, p.fbw, uy);
++            row.fbCol = GSSwizzle::Columns(*p.fbFormat, uy);
++        }
++        if (p.zKind)
++        {
++            row.zBase = GSSwizzle::RowBase(*p.zFormat, p.zbp, p.fbw, uy);
++            row.zCol = GSSwizzle::Columns(*p.zFormat, uy);
++        }
++    }
++
++    // WritePixel with the state decoded in advance; `row` is pixelRow(p, y).
++    inline void writePixelFast(const GSCpuBackend::PixelPipe &p, const PixelRow &row, int x, int y, int z, uint8_t r,
++                               uint8_t g, uint8_t b, uint8_t a, uint8_t fog);
+ }
+ 
+ struct GSCpuBackend::Sampler
+@@ -2352,6 +2406,12 @@ struct GSCpuBackend::Sampler
+     GSMem::TextureReader read = nullptr;
+     const uint8_t *vram = nullptr;
+     const uint16_t *clut = nullptr;
++    // Texel addressing through the row/column tables (GSSwizzle); texelKind 0 reads through `read`.
++    const GSSwizzle::Format *format = nullptr;
++    uint32_t texBase = 0, texRowStride = 0; // GSSwizzle::Base / RowStride of the texture buffer
++    uint8_t texelKind = 0; // 1 32-bit, 2 24-bit, 3 16-bit, 4 8-bit, 5 4-bit, 6 8H, 7 4HL, 8 4HH
++    // CLUT formats: the colour of every index (clutLookup), shared by the primitives with the same CLUT.
++    const uint32_t *palette = nullptr;
+     GSTexaReg texa{};
+     uint32_t tbp = 0, tbw = 0;
+     int texW = 1, texH = 1;
+@@ -2390,11 +2450,47 @@ struct GSCpuBackend::Sampler
+         }
+     }
+ 
++    // The same value as GSMem::ReadTextureAs<psm> (bit offsets and 4 MiB wrap included).
++    uint32_t readTexel(GSMem::TexturePageCache &cache, uint32_t u, uint32_t v) const
++    {
++        if (texelKind == 0u)
++            return read(cache, vram, tbp, tbw, u, v);
++        const uint32_t pixel = GSSwizzle::AddressFast(*format, texBase, texRowStride, u, v);
++        switch (texelKind)
++        {
++        case 1u:
++        case 2u:
++        {
++            uint32_t value = 0u;
++            std::memcpy(&value, cache.Resolve(vram, (pixel << 2u) & 0x3FFFFCu), 4u);
++            return texelKind == 2u ? (value & 0x00FFFFFFu) : value;
++        }
++        case 3u:
++        {
++            uint16_t value = 0u;
++            std::memcpy(&value, cache.Resolve(vram, (pixel << 1u) & 0x3FFFFEu), 2u);
++            return value;
++        }
++        case 4u:
++            return *cache.Resolve(vram, pixel & 0x3FFFFFu);
++        case 5u:
++            return (*cache.Resolve(vram, (pixel >> 1u) & 0x3FFFFFu) >> ((pixel & 1u) * 4u)) & 0x0Fu;
++        case 6u:
++            return *cache.Resolve(vram, ((pixel << 2u) + 3u) & 0x3FFFFFu);
++        case 7u:
++            return *cache.Resolve(vram, ((pixel << 2u) + 3u) & 0x3FFFFFu) & 0x0Fu;
++        default:
++            return (*cache.Resolve(vram, ((pixel << 2u) + 3u) & 0x3FFFFFu) >> 4u) & 0x0Fu;
++        }
++    }
++
+     uint32_t point(GSMem::TexturePageCache &cache, int u, int v) const
+     {
+         u = wrapTextureCoordinate(u, texW, wrapU, minU, maxU);
+         v = wrapTextureCoordinate(v, texH, wrapV, minV, maxV);
+-        const uint32_t raw = read(cache, vram, tbp, tbw, static_cast<uint32_t>(u), static_cast<uint32_t>(v));
++        const uint32_t raw = readTexel(cache, static_cast<uint32_t>(u), static_cast<uint32_t>(v));
++        if (palette)
++            return palette[raw & 0xFFu];
+         switch (kind)
+         {
+         case 1:
+@@ -2507,12 +2603,173 @@ void GSCpuBackend::BuildSampler(const GSDrawState &state, Sampler &smp) const
+         smp.kind = 0;
+         break;
+     }
++    switch (tex.psm)
++    {
++    case GS_PSM_CT32:
++    case GS_PSM_Z32: smp.texelKind = 1u; break;
++    case GS_PSM_CT24:
++    case GS_PSM_Z24: smp.texelKind = 2u; break;
++    case GS_PSM_CT16:
++    case GS_PSM_CT16S:
++    case GS_PSM_Z16:
++    case GS_PSM_Z16S: smp.texelKind = 3u; break;
++    case GS_PSM_T8: smp.texelKind = 4u; break;
++    case GS_PSM_T4: smp.texelKind = 5u; break;
++    case GS_PSM_T8H: smp.texelKind = 6u; break;
++    case GS_PSM_T4HL: smp.texelKind = 7u; break;
++    case GS_PSM_T4HH: smp.texelKind = 8u; break;
++    default: smp.texelKind = 0u; break;
++    }
++    smp.format = smp.texelKind ? GSSwizzle::Get(tex.psm) : nullptr;
++    if (!smp.format)
++        smp.texelKind = 0u;
++    else
++    {
++        smp.texBase = GSSwizzle::Base(*smp.format, smp.tbp);
++        smp.texRowStride = GSSwizzle::RowStride(*smp.format, smp.tbw);
++    }
++    smp.palette = nullptr;
++    if (smp.kind == 3)
++    {
++        // Resolved palettes, per thread, by CLUT version and the fields clutLookup reads.
++        struct PaletteCache
++        {
++            uint64_t version[4] = {~0ull, ~0ull, ~0ull, ~0ull};
++            uint64_t fields[4] = {};
++            uint32_t colors[4][256] = {};
++            unsigned next = 0;
++        };
++        thread_local PaletteCache cache;
++        const uint64_t version = t_interleave.clut ? t_interleave.clutVersion : m_clutVersion;
++        const uint64_t fields = static_cast<uint64_t>(smp.psm) | (static_cast<uint64_t>(smp.cpsm) << 8u) |
++                                (static_cast<uint64_t>(smp.csm) << 16u) | (static_cast<uint64_t>(smp.csa) << 24u) |
++                                (static_cast<uint64_t>(smp.texa.ta0) << 32u) | (static_cast<uint64_t>(smp.texa.ta1) << 40u) |
++                                (static_cast<uint64_t>(smp.texa.aem ? 1u : 0u) << 48u);
++        for (unsigned i = 0; i < 4u; ++i)
++        {
++            if (cache.version[i] == version && cache.fields[i] == fields)
++            {
++                smp.palette = cache.colors[i];
++                break;
++            }
++        }
++        if (!smp.palette)
++        {
++            const unsigned slot = cache.next++ & 3u;
++            for (uint32_t index = 0; index < 256u; ++index)
++                cache.colors[slot][index] = smp.clutLookup(static_cast<uint8_t>(index));
++            cache.version[slot] = version;
++            cache.fields[slot] = fields;
++            smp.palette = cache.colors[slot];
++        }
++    }
+ }
+ 
+ namespace
+ {
+-    inline void writePixelFast(const GSCpuBackend::PixelPipe &p, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b,
+-                               uint8_t a, uint8_t fog)
++    // Same reads and writes as GSMem::ReadCT32/WriteCT32... (the 4 MiB wrap included), addressed by the row.
++    inline uint32_t readFbFast(const GSCpuBackend::PixelPipe &p, const PixelRow &row, int x, int y)
++    {
++        uint32_t value = 0u;
++        switch (p.fbKind)
++        {
++        case 1u:
++            std::memcpy(&value, p.vram + (((row.fbBase + row.fbCol[x & 2047]) << 2u) & 0x3FFFFCu), 4u);
++            return value;
++        case 2u:
++            std::memcpy(&value, p.vram + (((row.fbBase + row.fbCol[x & 2047]) << 2u) & 0x3FFFFCu), 4u);
++            return value & 0x00FFFFFFu;
++        case 3u:
++        {
++            uint16_t half = 0u;
++            std::memcpy(&half, p.vram + (((row.fbBase + row.fbCol[x & 2047]) << 1u) & 0x3FFFFEu), 2u);
++            return half;
++        }
++        default:
++            return p.readFb(p.vram, p.fbp, p.fbw, x, y);
++        }
++    }
++
++    inline void writeFbFast(const GSCpuBackend::PixelPipe &p, const PixelRow &row, int x, int y, uint32_t value)
++    {
++        switch (p.fbKind)
++        {
++        case 1u:
++            std::memcpy(p.vram + (((row.fbBase + row.fbCol[x & 2047]) << 2u) & 0x3FFFFCu), &value, 4u);
++            return;
++        case 2u:
++        {
++            uint8_t *ptr = p.vram + (((row.fbBase + row.fbCol[x & 2047]) << 2u) & 0x3FFFFCu);
++            uint32_t old = 0u;
++            std::memcpy(&old, ptr, 4u);
++            value = (old & 0xFF000000u) | (value & 0x00FFFFFFu);
++            std::memcpy(ptr, &value, 4u);
++            return;
++        }
++        case 3u:
++        {
++            const uint16_t half = static_cast<uint16_t>(value);
++            std::memcpy(p.vram + (((row.fbBase + row.fbCol[x & 2047]) << 1u) & 0x3FFFFEu), &half, 2u);
++            return;
++        }
++        default:
++            p.writeFb(p.vram, p.fbp, p.fbw, x, y, value);
++            return;
++        }
++    }
++
++    inline uint32_t readZFast(const GSCpuBackend::PixelPipe &p, const PixelRow &row, int x, int y)
++    {
++        uint32_t value = 0u;
++        switch (p.zKind)
++        {
++        case 1u:
++            std::memcpy(&value, p.vram + (((row.zBase + row.zCol[x & 2047]) << 2u) & 0x3FFFFCu), 4u);
++            return value;
++        case 2u:
++            std::memcpy(&value, p.vram + (((row.zBase + row.zCol[x & 2047]) << 2u) & 0x3FFFFCu), 4u);
++            return value & 0x00FFFFFFu;
++        case 3u:
++        {
++            uint16_t half = 0u;
++            std::memcpy(&half, p.vram + (((row.zBase + row.zCol[x & 2047]) << 1u) & 0x3FFFFEu), 2u);
++            return half;
++        }
++        default:
++            return p.readZ(p.vram, p.zbp, p.fbw, x, y);
++        }
++    }
++
++    inline void writeZFast(const GSCpuBackend::PixelPipe &p, const PixelRow &row, int x, int y, uint32_t value)
++    {
++        switch (p.zKind)
++        {
++        case 1u:
++            std::memcpy(p.vram + (((row.zBase + row.zCol[x & 2047]) << 2u) & 0x3FFFFCu), &value, 4u);
++            return;
++        case 2u:
++        {
++            uint8_t *ptr = p.vram + (((row.zBase + row.zCol[x & 2047]) << 2u) & 0x3FFFFCu);
++            uint32_t old = 0u;
++            std::memcpy(&old, ptr, 4u);
++            value = (old & 0xFF000000u) | (value & 0x00FFFFFFu);
++            std::memcpy(ptr, &value, 4u);
++            return;
++        }
++        case 3u:
++        {
++            const uint16_t half = static_cast<uint16_t>(value);
++            std::memcpy(p.vram + (((row.zBase + row.zCol[x & 2047]) << 1u) & 0x3FFFFEu), &half, 2u);
++            return;
++        }
++        default:
++            p.writeZ(p.vram, p.zbp, p.fbw, x, y, value);
++            return;
++        }
++    }
++
++    inline void writePixelFast(const GSCpuBackend::PixelPipe &p, const PixelRow &row, int x, int y, int z, uint8_t r,
++                               uint8_t g, uint8_t b, uint8_t a, uint8_t fog)
+     {
+         if (x < p.sx0 || x > p.sx1 || y < p.sy0 || y > p.sy1)
+             return;
+@@ -2538,7 +2795,7 @@ namespace
+         u32 fbrgba = 0;
+         if (frmw)
+         {
+-            rawFramebufferPixel = p.readFb(p.vram, p.fbp, p.fbw, x, y);
++            rawFramebufferPixel = readFbFast(p, row, x, y);
+             fbrgba = rawFramebufferPixel;
+             if (p.fb16)
+                 fbrgba = Rgba5551ToRgba8888(static_cast<u16>(fbrgba));
+@@ -2559,10 +2816,10 @@ namespace
+             zpass = true;
+             break;
+         case 2:
+-            zpass = static_cast<uint32_t>(z) >= p.readZ(p.vram, p.zbp, p.fbw, x, y);
++            zpass = static_cast<uint32_t>(z) >= readZFast(p, row, x, y);
+             break;
+         case 3:
+-            zpass = static_cast<uint32_t>(z) > p.readZ(p.vram, p.zbp, p.fbw, x, y);
++            zpass = static_cast<uint32_t>(z) > readZFast(p, row, x, y);
+             break;
+         }
+         if (!zpass)
+@@ -2596,11 +2853,11 @@ namespace
+                 pixel = (pixel & 0x00FFFFFFu) | (fbrgba & 0xFF000000u);
+             if (p.fb16)
+                 pixel = Rgba8888ToRgba5551(pixel);
+-            p.writeFb(p.vram, p.fbp, p.fbw, x, y, pixel);
++            writeFbFast(p, row, x, y, pixel);
+         }
+ 
+         if (writeMask.writeDepth && !p.zmask)
+-            p.writeZ(p.vram, p.zbp, p.fbw, x, y, z);
++            writeZFast(p, row, x, y, static_cast<uint32_t>(z));
+     }
+ }
+ 
+@@ -2836,30 +3093,53 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+         if (spriteH < 1.0f)
+             spriteH = 1.0f;
+ 
++        // The texture coordinate of a column does not depend on the row: computed once per primitive (with
++        // the same operations as per pixel), when its rows are drawn.
++        thread_local std::vector<float> columnS;
++        thread_local std::vector<uint16_t> columnU;
++        bool columnsReady = false;
++        auto prepareColumns = [&]()
++        {
++            const size_t count = static_cast<size_t>(drawX1 - drawX0 + 1);
++            if (state.prim.fst)
++                columnU.resize(count);
++            else
++                columnS.resize(count);
++            for (int x = drawX0; x <= drawX1; ++x)
++            {
++                const float tx = (static_cast<float>(x - unclippedX0) + 0.5f) / spriteW;
++                const float texUf = u0f + (u1f - u0f) * tx;
++                if (state.prim.fst)
++                {
++                    const int fixedU = static_cast<int>((texUf * 16.0f) + 0.5f);
++                    columnU[static_cast<size_t>(x - drawX0)] = static_cast<uint16_t>(clampInt(fixedU, 0, 0xFFFF));
++                }
++                else
++                    columnS[static_cast<size_t>(x - drawX0)] = texUf / static_cast<float>(texW);
++            }
++            columnsReady = true;
++        };
+         auto drawRows = [&](int firstRow, int lastRow, GSMem::TexturePageCache &cache)
+         {
++            if (!columnsReady)
++                prepareColumns();
+             for (int y = firstRow; y <= lastRow; ++y)
+             {
++                PixelRow row;
++                pixelRow(pipe, y, row);
+                 float ty = (static_cast<float>(y - unclippedY0) + 0.5f) / spriteH;
+                 float texVf = v0f + (v1f - v0f) * ty;
++                const int fixedV = static_cast<int>((texVf * 16.0f) + 0.5f);
++                const uint16_t sampleV = static_cast<uint16_t>(clampInt(fixedV, 0, 0xFFFF));
++                const float sampleT = texVf / static_cast<float>(texH);
+ 
+                 for (int x = drawX0; x <= drawX1; ++x)
+                 {
+-                    float tx = (static_cast<float>(x - unclippedX0) + 0.5f) / spriteW;
+-                    float texUf = u0f + (u1f - u0f) * tx;
+                     uint32_t texel = 0xFFFF00FFu;
+                     if (state.prim.fst)
+-                    {
+-                        const int fixedU = static_cast<int>((texUf * 16.0f) + 0.5f);
+-                        const int fixedV = static_cast<int>((texVf * 16.0f) + 0.5f);
+-                        const uint16_t sampleU = static_cast<uint16_t>(clampInt(fixedU, 0, 0xFFFF));
+-                        const uint16_t sampleV = static_cast<uint16_t>(clampInt(fixedV, 0, 0xFFFF));
+-                        texel = smp.sample(cache, 0.0f, 0.0f, 1.0f, sampleU, sampleV);
+-                    }
++                        texel = smp.sample(cache, 0.0f, 0.0f, 1.0f, columnU[static_cast<size_t>(x - drawX0)], sampleV);
+                     else
+-                    {
+-                        texel = smp.sample(cache, texUf / static_cast<float>(texW), texVf / static_cast<float>(texH), 1.0f, 0u, 0u);
+-                    }
++                        texel = smp.sample(cache, columnS[static_cast<size_t>(x - drawX0)], sampleT, 1.0f, 0u, 0u);
+ 
+                     uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
+                     uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
+@@ -2867,7 +3147,7 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+                     uint8_t ta = static_cast<uint8_t>((texel >> 24) & 0xFF);
+ 
+                     const TextureCombineResult color = combineTexture(tex, r, g, b, a, tr, tg, tb, ta);
+-                    writePixelFast(pipe, x, y, static_cast<int>(z1), color.r, color.g, color.b, color.a, v1.fog);
++                    writePixelFast(pipe, row, x, y, static_cast<int>(z1), color.r, color.g, color.b, color.a, v1.fog);
+                 }
+             }
+         };
+@@ -2878,8 +3158,12 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
+         auto drawRows = [&](int firstRow, int lastRow, GSMem::TexturePageCache &)
+         {
+             for (int y = firstRow; y <= lastRow; ++y)
++            {
++                PixelRow row;
++                pixelRow(pipe, y, row);
+                 for (int x = drawX0; x <= drawX1; ++x)
+-                    writePixelFast(pipe, x, y, static_cast<int>(z1), r, g, b, a, v1.fog);
++                    writePixelFast(pipe, row, x, y, static_cast<int>(z1), r, g, b, a, v1.fog);
++            }
+         };
+         ForEachRowBand(drawY0, drawY1, area, drawRows);
+     }
+@@ -2973,6 +3257,9 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+             int firstX = minX;
+             int lastX = maxX;
+             rowSpan(py, firstX, lastX);
++            PixelRow row;
++            if (firstX <= lastX)
++                pixelRow(pipe, y, row);
+             for (int x = firstX; x <= lastX; ++x)
+             {
+                 float px = static_cast<float>(x) + 0.5f;
+@@ -3047,7 +3334,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
+                 }
+ 
+                 const uint8_t fog = clampU8(static_cast<int>(v0.fog * w0 + v1.fog * w1 + v2.fog * w2));
+-                writePixelFast(pipe, x, y, static_cast<int>(static_cast<u32>(z + 0.5)), r, g, b, a, fog);
++                writePixelFast(pipe, row, x, y, static_cast<int>(static_cast<u32>(z + 0.5)), r, g, b, a, fog);
+             }
+         }
+     };
+@@ -3126,50 +3413,22 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+     std::lock_guard<std::mutex> lock(m_mutex);
+     if (m_bandPipeline && command.direction == 0u)
+     {
++        // Host to local: written into VRAM here, as the data comes, once nothing handed over draws into the
++        // destination (batches that sample it read their own copies).
+         std::bitset<512> destination;
+         const uint32_t dx = command.trxpos.dsax, dy = command.trxpos.dsay;
+         markRect(destination, command.bitbltbuf.dbp, command.bitbltbuf.dbw, command.bitbltbuf.dpsm, dx, dy,
+                  dx + std::max<uint32_t>(command.trxreg.rrw, 1u) - 1u, dy + std::max<uint32_t>(command.trxreg.rrh, 1u) - 1u);
+-        // Nothing waiting or being drawn (queued transfers included) reads or writes the destination: the
+-        // upload happens now, on this thread (palettes, mostly: batches use their own CLUT copy).
+-        if (g_gsImmediateUploads && !(destination & (m_pendingReads | m_pendingWrites | m_pendingTransferWrites)).any() &&
+-            !m_bandPipeline->touchesPagesInFlight(destination))
+-        {
+-            m_serialTransfer = false;
+-            m_immediateTransfer = true;
+-            m_shadowActive = false;
+-            m_shadowValid &= ~destination; // VRAM changes under the copies
+-            // Band workers may still hold copies of these pages from batches already drawn (a texture that
+-            // lived there): the batches after the upload start with empty page caches.
+-            m_texturePageCache.Invalidate();
+-            ++m_textureCacheEpoch;
+-            BeginTransferUnlocked(command, m_immTransfer, m_immTransferState);
+-            return;
+-        }
+-        m_immediateTransfer = false;
+-        // Otherwise it is queued after the primitives so far, before the later ones.
+-        if (!m_pending.empty())
+-            DrawPendingUnlocked();
+-        // The copies of its pages get the transfer as well, when they can be made.
+-        // Pages that cannot get a copy keep none; the upload still goes to the others.
+-        const std::bitset<512> ready = ShadowPrepareUnlocked(destination);
+-        m_shadowValid &= ~(destination & ~ready);
+-        m_shadowActive = ready.any();
+-        if (m_shadowActive)
+-            BeginTransferUnlocked(command, m_shadowTransfer, m_shadowTransferState);
+-        m_pendingTransferWrites |= destination;
+-        m_pendingSerial.emplace_back([this, command]()
+-                                     { BeginTransferUnlocked(command, m_transfer, m_transferState); });
+-        m_pendingSerialBarrier = true;
+-        m_serialTransfer = true;
++        m_transferPages = destination;
++        WaitForFbPagesUnlocked(destination);
++        BeginTransferUnlocked(command, m_transfer, m_transferState);
+         return;
+     }
+     FlushPendingUnlocked(kFlushTransfer);
+-    m_serialTransfer = false;
+-    m_immediateTransfer = false;
+-    m_shadowActive = false;
+-    m_shadowValid.reset();
++    m_transferPages.reset();
+     BeginTransferUnlocked(command, m_transfer, m_transferState);
++    if (command.direction == 2u)
++        m_pageCopyStale |= m_pageHasCopy; // local to local wrote VRAM
+ }
+ 
+ void GSCpuBackend::BeginTransferUnlocked(const GSTransferCommand &command, GSTransferCommand &transfer, GSTransferSnapshot &state)
+@@ -3191,26 +3450,17 @@ void GSCpuBackend::BeginTransferUnlocked(const GSTransferCommand &command, GSTra
+ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
+-    if (m_bandPipeline && m_serialTransfer)
++    if (m_bandPipeline)
+     {
+         if (!data || sizeBytes == 0u)
+             return;
+-        if (!m_pending.empty())
+-            DrawPendingUnlocked();
+-        if (m_shadowActive)
+-            UploadImageUnlocked(data, sizeBytes, m_shadowTransfer, m_shadowTransferState, m_shadowVram.get());
+-        m_pendingSerialBarrier = true;
+-        m_pendingSerial.emplace_back([this, bytes = std::vector<uint8_t>(data, data + sizeBytes)]()
+-                                     { UploadImageUnlocked(bytes.data(), static_cast<uint32_t>(bytes.size()), m_transfer, m_transferState, m_vram); });
+-        return;
+-    }
+-    if (m_bandPipeline && m_immediateTransfer)
+-    {
+-        UploadImageUnlocked(data, sizeBytes, m_immTransfer, m_immTransferState, m_vram);
++        // Primitives submitted since BeginTransfer may draw into the destination too.
++        WaitForFbPagesUnlocked(m_transferPages);
++        UploadImageUnlocked(data, sizeBytes, m_transfer, m_transferState, m_vram);
++        StalePageCopiesUnlocked(m_transferPages);
+         return;
+     }
+     FlushPendingUnlocked(kFlushUpload);
+-    m_shadowValid.reset();
+     UploadImageUnlocked(data, sizeBytes, m_transfer, m_transferState, m_vram);
+ }
+ 
+@@ -3448,7 +3698,7 @@ bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
+     FlushPendingUnlocked(kFlushClear);
+-    m_shadowValid.reset();
++    m_pageCopyStale |= m_pageHasCopy;
+     if (!m_vram || context.frame.fbw == 0u)
+         return false;
+ 
+@@ -3588,11 +3838,43 @@ PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
+     // Snapshot local memory under the backend lock, then perform the expensive
+     // display conversion without holding the producer-side raster lock.
+     thread_local std::vector<uint8_t> snapshot;
+-    SnapshotVram(snapshot);
+-    if (snapshot.empty())
+-        return {};
+-
+-    thread_local GSCpuBackend snapshotBackend;
++    {
++        std::lock_guard<std::mutex> lock(m_mutex);
++        if (!m_vram || m_vramSize == 0u)
++            return {};
++        if (!m_bandPipeline)
++        {
++            FlushPendingUnlocked();
++            snapshot.assign(m_vram, m_vram + m_vramSize);
++        }
++        else
++        {
++            // Only the buffers the display may read (both circuits, the preferred source, the context frame
++            // buffers it falls back to) must be drawn: wait for those pages and copy them; the band workers
++            // go on with the rest.
++            std::bitset<512> pages;
++            auto addFrame = [&](const GSFrameReg &frame, uint32_t originX, uint32_t originY)
++            {
++                markRect(pages, frame.fbp * 32u, frame.fbw, frame.psm, 0u, 0u,
++                         std::min<uint32_t>(originX + kHostFrameWidth, 2047u), std::min<uint32_t>(originY + kHostFrameHeight, 2047u));
++            };
++            addFrame(decodeDisplayFrame(request.dispfb1), decodeDisplayReadOrigin(request.dispfb1).x,
++                     decodeDisplayReadOrigin(request.dispfb1).y);
++            addFrame(decodeDisplayFrame(request.dispfb2), decodeDisplayReadOrigin(request.dispfb2).x,
++                     decodeDisplayReadOrigin(request.dispfb2).y);
++            if (request.hasPreferredSource)
++                addFrame(request.preferredSource, 0u, 0u);
++            for (const GSFrameReg &frame : request.contextFrames)
++                addFrame(frame, 0u, 0u);
++            WaitForFbPagesUnlocked(pages);
++            snapshot.resize(m_vramSize);
++            for (uint32_t page = 0; page < 512u; ++page)
++                if (pages.test(page))
++                    std::memcpy(snapshot.data() + page * 8192u, m_vram + page * 8192u, 8192u);
++        }
++    }
++
++    thread_local GSCpuBackend snapshotBackend(false);
+     snapshotBackend.Initialize(snapshot.data(), static_cast<uint32_t>(snapshot.size()));
+     return snapshotBackend.PresentFromLocalMemory(request);
+ }
+diff --git a/ps2xRuntime/src/lib/gs/gs_swizzle.cpp b/ps2xRuntime/src/lib/gs/gs_swizzle.cpp
+new file mode 100644
+index 0000000..acd8e41
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_swizzle.cpp
+@@ -0,0 +1,143 @@
++#include "runtime/gs/gs_swizzle.h"
++#include "runtime/gs/gs_types.h"
++#include "runtime/gs/ps2_gs_memory.h"
++
++#include <array>
++#include <cstdio>
++#include <memory>
++#include <mutex>
++#include <vector>
++
++namespace GSSwizzle
++{
++    namespace
++    {
++        constexpr uint32_t kColumns = 2048u;
++
++        struct Tables
++        {
++            Format formats[64];
++            bool known[64] = {};
++            std::vector<std::unique_ptr<uint32_t[]>> storage;
++        };
++
++        Tables &tables()
++        {
++            static Tables instance;
++            static std::once_flag once;
++            std::call_once(once, []()
++                           {
++                               GSMem::InitLookupTables();
++                               struct Spec
++                               {
++                                   uint32_t psm, pageW, pageH, pixelsPerBlock;
++                               };
++                               const Spec specs[] = {
++                                   {GS_PSM_CT32, 64u, 32u, 64u}, {GS_PSM_Z32, 64u, 32u, 64u}, {GS_PSM_CT16, 64u, 64u, 128u},
++                                   {GS_PSM_CT16S, 64u, 64u, 128u}, {GS_PSM_Z16, 64u, 64u, 128u}, {GS_PSM_Z16S, 64u, 64u, 128u},
++                                   {GS_PSM_T8, 128u, 64u, 256u}, {GS_PSM_T4, 128u, 128u, 512u},
++                               };
++                               for (const Spec &spec : specs)
++                               {
++                                   Format f;
++                                   f.pageW = spec.pageW;
++                                   f.pageH = spec.pageH;
++                                   f.pixelsPerBlock = spec.pixelsPerBlock;
++                                   f.pixelsPerPage = spec.pixelsPerBlock * 32u;
++                                   // Inside the first page (bp 0): the row part is the address of column 0.
++                                   const uint32_t bw = spec.pageW / 64u;
++                                   auto at = [&](uint32_t x, uint32_t y)
++                                   { return GSMem::PixelAddress(spec.psm, 0u, bw, x, y); };
++                                   for (uint32_t y = 0; y < f.pageH; ++y)
++                                       f.rowIn[y] = at(0u, y);
++                                   // Smallest period of rows after which the column offsets repeat.
++                                   uint32_t period = f.pageH;
++                                   for (uint32_t candidate : {1u, 2u, 4u, 8u, 16u, 32u})
++                                   {
++                                       bool same = f.pageH % candidate == 0u;
++                                       for (uint32_t y = 0; y < f.pageH && same; ++y)
++                                           for (uint32_t x = 0; x < f.pageW && same; ++x)
++                                               same = at(x, y) - at(0u, y) == at(x, y % candidate) - at(0u, y % candidate);
++                                       if (same)
++                                       {
++                                           period = candidate;
++                                           break;
++                                       }
++                                   }
++                                   f.period = period;
++                                   f.periodMask = period - 1u;
++                                   f.pageHMask = f.pageH - 1u;
++                                   f.pageWShift = f.pageW == 128u ? 7u : 6u;
++                                   f.pageHShift = f.pageH == 128u ? 7u : (f.pageH == 64u ? 6u : 5u);
++                                   auto col = std::make_unique<uint32_t[]>(static_cast<size_t>(period) * kColumns);
++                                   for (uint32_t r = 0; r < period; ++r)
++                                       for (uint32_t x = 0; x < kColumns; ++x)
++                                           col[r * kColumns + x] = (x / f.pageW) * f.pixelsPerPage + at(x % f.pageW, r) - at(0u, r);
++                                   f.col = col.get();
++                                   instance.storage.push_back(std::move(col));
++                                   instance.formats[spec.psm] = f;
++                                   instance.known[spec.psm] = true;
++                               }
++                               // Formats that share a layout.
++                               auto alias = [&](uint32_t psm, uint32_t base)
++                               {
++                                   instance.formats[psm] = instance.formats[base];
++                                   instance.known[psm] = true;
++                               };
++                               alias(GS_PSM_CT24, GS_PSM_CT32);
++                               alias(GS_PSM_T8H, GS_PSM_CT32);
++                               alias(GS_PSM_T4HL, GS_PSM_CT32);
++                               alias(GS_PSM_T4HH, GS_PSM_CT32);
++                               alias(GS_PSM_Z24, GS_PSM_Z32); });
++            return instance;
++        }
++    }
++
++    const Format *Get(uint32_t psm)
++    {
++        Tables &t = tables();
++        psm &= 63u;
++        return t.known[psm] ? &t.formats[psm] : nullptr;
++    }
++
++    bool SelfTest(std::string &report)
++    {
++        const uint32_t formats[] = {GS_PSM_CT32, GS_PSM_CT24, GS_PSM_CT16, GS_PSM_CT16S, GS_PSM_T8, GS_PSM_T4, GS_PSM_T8H,
++                                    GS_PSM_T4HL, GS_PSM_T4HH, GS_PSM_Z32, GS_PSM_Z24, GS_PSM_Z16, GS_PSM_Z16S};
++        const uint32_t bases[] = {0u, 1u, 5u, 31u, 32u, 33u, 0x1234u, 0x3FE0u, 0x3FFFu};
++        uint64_t checks = 0;
++        for (uint32_t psm : formats)
++        {
++            const Format *f = Get(psm);
++            if (!f)
++            {
++                report = "no layout for psm " + std::to_string(psm);
++                return false;
++            }
++            for (uint32_t bw = 0; bw <= 32u; ++bw)
++                for (uint32_t bp : bases)
++                    for (uint32_t y = 0; y < 1024u; y += (y < 256u ? 1u : 7u))
++                        for (uint32_t x = 0; x < 2048u; x += (x < 256u ? 1u : 13u))
++                        {
++                            const uint32_t expected = GSMem::PixelAddress(psm, bp, bw, x, y);
++                            const uint32_t got = Address(*f, bp, bw, x, y);
++                            const uint32_t fast = AddressFast(*f, Base(*f, bp), RowStride(*f, bw), x, y);
++                            ++checks;
++                            if (expected != got || expected != fast)
++                            {
++                                char text[200];
++                                std::snprintf(text, sizeof(text), "psm %u bp %u bw %u (%u,%u): expected %u, got %u", psm, bp, bw,
++                                              x, y, expected, got);
++                                report = text;
++                                return false;
++                            }
++                        }
++        }
++        char text[160];
++        std::snprintf(text, sizeof(text), "%llu addresses match; periods CT32 %u CT16 %u T8 %u T4 %u Z32 %u Z16 %u",
++                      static_cast<unsigned long long>(checks), Get(GS_PSM_CT32)->period, Get(GS_PSM_CT16)->period,
++                      Get(GS_PSM_T8)->period, Get(GS_PSM_T4)->period, Get(GS_PSM_Z32)->period, Get(GS_PSM_Z16)->period);
++        report = text;
++        return true;
++    }
++}
+diff --git a/ps2xRuntime/src/lib/gs/ps2_gs_memory.cpp b/ps2xRuntime/src/lib/gs/ps2_gs_memory.cpp
+index b0c8070..b9d377a 100644
+--- a/ps2xRuntime/src/lib/gs/ps2_gs_memory.cpp
++++ b/ps2xRuntime/src/lib/gs/ps2_gs_memory.cpp
+@@ -270,6 +270,24 @@ namespace GSMem
+         }
+     }
+ 
++    u32 PixelAddress(u32 psm, u32 bp, u32 bw, u32 x, u32 y)
++    {
++        switch (static_cast<PixelStorageMode>(psm & 0x3Fu))
++        {
++        case C32: case C24: case P8H: case P4HL: case P4HH:
++            return PixelStorageTraits<C32>::Address(PageTableC32, bp, bw, x, y);
++        case Z32: case Z24:
++            return PixelStorageTraits<Z32>::Address(PageTableZ32, bp, bw, x, y);
++        case C16: return PixelStorageTraits<C16>::Address(PageTableC16, bp, bw, x, y);
++        case C16S: return PixelStorageTraits<C16S>::Address(PageTableC16S, bp, bw, x, y);
++        case Z16: return PixelStorageTraits<Z16>::Address(PageTableZ16, bp, bw, x, y);
++        case Z16S: return PixelStorageTraits<Z16S>::Address(PageTableZ16S, bp, bw, x, y);
++        case P8: return PixelStorageTraits<P8>::Address(PageTableP8, bp, bw, x, y);
++        case P4: return PixelStorageTraits<P4>::Address(PageTableP4, bp, bw, x, y);
++        default: return 0u;
++        }
++    }
++
+     u32 ReadTexture(TexturePageCache& cache, const u8* data, u32 psm, u32 bp, u32 bw, u32 x, u32 y)
+     {
+         switch (static_cast<PixelStorageMode>(psm & 0x3Fu))
