@@ -28,7 +28,7 @@ Ryzen 5 3600X con la build `Release`. Ver *Rendimiento*.
 | Menú de pausa de la misión, opciones, confirmación de "Salir a Menú" | ✅ |
 | Sonido: mezcla del SPU2 al host (raylib, 48 kHz) | ✅ (falta escucharlo con calma: AutoDMA, efectos, reverb) |
 | Velocidad del juego | ✅ tiempo real (reloj del EE anclado al del PC, parche `0013`) |
-| Fotogramas por segundo con personajes | ⚠️ ~10 fps en batalla, ~7-9 en la cinemática del motor (el juego apunta a 25) |
+| Fotogramas por segundo con personajes | ✅ batalla ~24 fps de media, casi siempre en el tope de 25 que el propio juego pone en partida (GS en la GPU); objetivo 60 en curso |
 | Menú principal y nueva partida desde cero | pendiente |
 
 ## Problemas resueltos
@@ -306,6 +306,13 @@ idéntico bit a bit a la ruta de un hilo. Con `0016` el límite del juego pasa a
 VU1 88 %); el raster sigue cerca (no escala más de ~3,7 veces en 6 núcleos). Parche `0017` (VU1 en línea):
 11,6 → 8,8 ns por par en `ttr_vu_bench` y batalla **~15,8 fps**; el hilo de VIF1 sigue lleno, ahora a partes
 iguales por VU1 y por la cola del GS llena. Detalle y siguientes pasos en [PLAN_60FPS.md](PLAN_60FPS.md), sección 6.1.
+
+Parche `0019` (GS en la GPU, por defecto): compute shaders sobre la VRAM en un SSBO con las mismas reglas por
+píxel que el GS por software, **idéntico bit a bit** en las 100 presentaciones de la captura de la batalla.
+Batalla **~24 fps** (antes 15,8), casi siempre en el tope de 25 fps que el juego se pone en partida
+(`CapTo30FPS`, también en PS2). Sin ese tope (`TTR_UNCAP_FPS=1`) llega a 35-44 fps en tramos ligeros y 21-27 en
+los pesados, limitado por VU1 en el hilo de VIF1 y por la preparación de primitivas en el hilo del GS
+([PLAN_60FPS.md](PLAN_60FPS.md), 6.3 y fase E).
 
 ## Siguiente
 

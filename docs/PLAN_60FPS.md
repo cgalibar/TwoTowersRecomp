@@ -727,6 +727,13 @@ salvo que una sola supere el 15 % del frame.
 
 Es decir: **como mucho un frame por VBlank**. En PAL son 50. Los menús ya van a 49,5.
 
+**Visto el 2026-11-12:** `ClGameModePlay::enter` llama a `ClDisplay::CapTo30FPS(1)` (`0x16603C` y `0x1664C8`) y
+`exit` a `CapTo30FPS(0)`: **en partida el juego se limita a un frame cada 2 VBlanks (25 fps en PAL)**, también en
+PS2. Con el GS en la GPU la batalla ya está casi siempre en ese tope. `TTR_UNCAP_FPS=1` (reemplazo de
+`0x17CB30` en `game/sles_51256_trace.cpp`) lo quita: la batalla sube a 35-44 fps en los tramos ligeros y se
+queda en 21-27 en los pesados, con el hilo de VIF1 al 99 % (VU1 85 %) y el del GS al ~93 %. Ese es el trabajo
+que queda para 50-60: VU1 (fase C) y la preparación de primitivas del GS en la GPU (G7).
+
 En el runtime: `EeScheduler::setVBlankRate(hz)` (`src/lib/Kernel/EeScheduler.cpp:496`) fija el periodo y llama a
 `PS2Memory::setEeTimerHBlankRate(hz)` (`src/lib/ps2_memory.cpp:424`: 15 625 Hz si son 50, 15 734 si no). Lo
 llaman `Stubs/GS.cpp:807` y `Syscalls/System.cpp:16` con 50 porque el juego pide modo PAL. La ventana ya se
@@ -816,7 +823,7 @@ fase B, ms por frame del banco con 9 hilos.
 | E1 VBlank a 60 Hz | pendiente | | |
 | E2 Latencia y regularidad | pendiente | | |
 | F1 Cierre | pendiente | | |
-| G0-G7 GS en la GPU | G0 y G1 hechos (ver 6.3) | subidas: 78 813 transferencias, VRAM idéntica | `0018` |
+| G0-G7 GS en la GPU | G0-G6 hechos, G7 en curso (ver 6.3) | 100 presentaciones idénticas; banco 47 ms/frame; batalla 24,1 fps (tope del juego 25) | `0018`, `0019` |
 
 ### 6.1 Notas de lo hecho (2026-11-11)
 
@@ -999,13 +1006,40 @@ y compara las dos VRAM. Cuando la GPU haga todas las órdenes (G5), la comparaci
   `UploadImageUnlocked` (píxel incompleto al final de un trozo descartado, RMW de 24 bits, escrituras de 16/8/4 bits
   con `atomicAnd`/`atomicOr` porque comparten palabra con otros píxeles). `ttr_gs_bench <captura> --gpu-uploads`:
   78 813 transferencias y 724 MB de la batalla, VRAM idéntica a la de la CPU.
-- **Siguiente: G2** (sprites sin textura). Plan: un SSBO con las primitivas del lote (vértices + índice de
-  estado), un SSBO de estados decodificados (`PixelPipe`), y un *kernel* de dibujo con un grupo por tesela de
-  8×8 píxeles del framebuffer que recorre en orden las primitivas que la tocan (primero por fuerza bruta: todas
-  las del lote; el *binning* llega en G7). La prueba: `--gpu-sprites`, reproduciendo subidas + sprites sin textura.
-  Ojo con `writePixelFast`: Z primero, niebla, prueba alfa y sus modos de fallo, DATE, mezcla con `pabe`, `fba`,
-  `fbmsk`, conversión a 16 bits y RMW de 24 bits; todo con enteros salvo nada (sin coma flotante en sprites sin
-  textura salvo `(int)v.x`).
+- **G2-G5 hechos (parche `0019`).** Sprites y triángulos con y sin textura, todos los formatos de textura, CLUT,
+  filtro bilineal, niebla, mezcla, pruebas alfa/DATE/Z, máscaras y framebuffers de 16/24/32 bits, en
+  `src/lib/gs/gs_gpu_shaders.inc` (cada función GLSL traduce la de `GSCpuBackend` que nombra su comentario; el
+  recorte por filas `rowSpan` de los triángulos también, para no depender de que sea conservador).
+  `ttr_gs_bench battle4000.gscap --gpu --check-hashes ref2.hashes`: **las 100 presentaciones idénticas** a la
+  referencia, sin ninguna orden por la vía lenta (líneas, local→local, local→host, borrados y lecturas de VRAM
+  irían por `GSCpuBackend` sobre una copia; en la captura no hay ninguna).
+  - La CPU prepara cada primitiva como `DrawSprite`/`DrawTriangle` (registro de 64 palabras) y la reparte en
+    teselas de 16×16; un grupo de trabajo por tesela recorre en orden sus primitivas (un hilo por píxel).
+  - Un lote termina cuando una primitiva muestrea **columnas** (64 bytes, un cuarto de bloque) que el lote ya ha
+    dibujado. Con páginas eran ~4 000 lotes por frame: el juego hace efectos *in situ* (vista T8 de un buffer
+    CT32 con *region repeat*, desplazamientos de franjas de 8 píxeles, Z16 sobre el Z24) que comparten página y
+    bloque pero no columna. El rectángulo de texels es exacto para sprites UV sin filtro y el modo *region
+    repeat* se enumera. Ahora ~310 lotes por frame. Las páginas que el lote muestrea y luego dibuja se copian
+    antes del lote (mapa de páginas).
+  - Las subidas se encolan y van todas en un *dispatch* (descriptores por trozo), por delante del lote si no
+    tocan nada de él; las CLUT van a un anillo de 4 096 instancias en la GPU.
+- **G6 hecho.** El juego usa el GS en la GPU por defecto (`PS2X_GS_GPU=0` vuelve al de software; también una
+  captura `PS2X_GS_CAPTURE`). El contexto se crea en el hilo principal y `GSAsyncBackend` hace **todas** las
+  llamadas al backend en el hilo del GS (las síncronas con un comando `Call`). La presentación copia las páginas
+  mostradas a un búfer de lectura con una *fence* y monta la imagen en la siguiente presentación (sin parar la
+  GPU; un frame más de latencia). Batalla: **24,1 fps de media** (antes 15,8), casi siempre en 25,0, que es el
+  tope del propio juego (ver E1). Imagen correcta en menús, FMV, cinemática y batalla.
+- **G7 en curso** (rendimiento). Banco: 173 → **47 ms por frame** (sin presentación, 40). La GPU dibuja en
+  ~31 ms/frame (consultas de tiempo; 24 sin la réplica del `rowSpan`), las subidas ~3 ms. El hilo del GS va al
+  ~93 % en el juego: el coste está en la CPU (`Submit` ~50 % con el seguimiento de columnas ~10 %, registros de
+  256 bytes por primitiva, copias a la GPU). Siguiente:
+  1. `Submit` más barato: estado deduplicado (registro por estado + vértices por primitiva), escribir en búferes
+     mapeados persistentes (`glBufferStorage`) en vez de `glBufferSubData`, *binning* sin vectores por tesela.
+  2. `rowSpan` una vez por fila y primitiva (memoria compartida o en la preparación) en vez de por píxel.
+  3. Presentación sin lectura de vuelta: contexto compartido con raylib y conversión en la GPU.
+  - Herramientas: `PS2X_GS_GPU_TIMING=1` (tiempos de CPU y de GPU con consultas `GL_TIME_ELAPSED`),
+    `PS2X_GS_GPU_DEFINES=NO_ROWSPAN` (defines en el *kernel* de dibujo), `PS2X_GS_GPU_RAW_LOG=<n>` (las primeras
+    `<n>` primitivas que cortan un lote por lectura tras escritura), `PS2X_GS_GPU_NO_PRESENT=1`.
 
 ## 7. Riesgos y avisos
 

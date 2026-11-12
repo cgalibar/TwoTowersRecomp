@@ -506,6 +506,14 @@ namespace ttr::sles51256
             playModal__5ClFMVFPCcibP15ClSubtitleAsset_0x26a7a0(rdram, ctx, runtime);
         }
 
+        // Phase E (docs/PLAN_60FPS.md): ClGameModePlay::enter turns on ClDisplay::CapTo30FPS, so gameplay draws at
+        // most every second VBlank (25 fps in PAL). TTR_UNCAP_FPS=1 keeps that cap off.
+        void hackNoFrameCap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            SET_GPR_U32(ctx, 4, 0u);
+            CapTo30FPS__9ClDisplayFb_0x17cb30(rdram, ctx, runtime);
+        }
+
         // Debug hack: skips ClDisplayList::drawShadowAnims, the characters' shadow volumes.
         void hackSkipShadowVolumes(uint8_t *, R5900Context *ctx, PS2Runtime *)
         {
@@ -1030,6 +1038,11 @@ namespace ttr::sles51256
         {
             runtime.replaceFunction(0x00254350u, &hackSkipShadowVolumes);
             std::cout << "[ttr] hack: no character shadow volumes" << std::endl;
+        }
+        if (const char *uncap = std::getenv("TTR_UNCAP_FPS"); uncap && uncap[0] == '1')
+        {
+            runtime.replaceFunction(0x0017CB30u, &hackNoFrameCap);
+            std::cout << "[ttr] gameplay not capped to half the VBlank rate" << std::endl;
         }
         if (const char *hack = std::getenv("TTR_HACK_SKIPPABLE_FMV"); hack && hack[0] == '1')
         {

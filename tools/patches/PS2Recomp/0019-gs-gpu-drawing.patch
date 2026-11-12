@@ -1,0 +1,2838 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_async_backend.h b/ps2xRuntime/include/runtime/gs/gs_async_backend.h
+index b41b555..d4f2e4c 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_async_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_async_backend.h
+@@ -4,6 +4,7 @@
+ 
+ #include <atomic>
+ #include <cstdint>
++#include <functional>
+ #include <memory>
+ #include <mutex>
+ #include <thread>
+@@ -14,7 +15,8 @@
+ // once. Calls that return data or need the drawn VRAM (VRAM reads and writes, local-to-host transfers,
+ // every Sync except FINISH and Presentation) first wait until the thread has executed everything queued
+ // before. Present is queued too: it returns the last frame the thread presented (one VBlank behind), so
+-// the host's display never stalls the producers.
++// the host's display never stalls the producers. Every call of the inner backend happens on the GS thread
++// (the calls that wait run there too), so a backend tied to its thread (GSGpuBackend) works behind it.
+ class GSAsyncBackend final : public GSRasterBackend
+ {
+ public:
+@@ -54,6 +56,7 @@ private:
+         Flush,
+         TextureFlush,
+         Present,
++        Call,
+         Stop,
+     };
+ 
+@@ -66,6 +69,7 @@ private:
+         GSTransferCommand transfer{};
+         GSPresentationRequest present{};
+         std::vector<uint8_t> data;
++        std::function<void()> call;
+     };
+ 
+     // About a frame and a half of the prologue battle: VIF1 alternates between VU1-heavy stretches that send
+@@ -82,6 +86,9 @@ private:
+     void publishUnlocked() const;
+     void waitForExecuted(uint64_t count) const;
+     void waitIdle() const;
++    // Runs fn on the GS thread after everything queued before, and waits for it.
++    template <typename Fn>
++    void runOnThread(Fn &&fn) const;
+     void run();
+     void execute(Command &command);
+ 
+@@ -103,5 +110,6 @@ private:
+     std::thread m_thread;
+ };
+ 
+-// GSCpuBackend, on its own GS thread unless PS2X_GS_ASYNC=0.
++// GSGpuBackend on the GS thread when OpenGL 4.3 is available; otherwise (or with PS2X_GS_GPU=0, a GS capture
++// or PS2X_GS_ASYNC=0) GSCpuBackend, on its own GS thread unless PS2X_GS_ASYNC=0.
+ std::unique_ptr<GSRasterBackend> CreateDefaultGsBackend();
+diff --git a/ps2xRuntime/include/runtime/gs/gs_backend.h b/ps2xRuntime/include/runtime/gs/gs_backend.h
+index 9f4f61a..3af6f3e 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_backend.h
+@@ -33,4 +33,9 @@ public:
+     virtual void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) = 0;
+     virtual void SnapshotVram(std::vector<uint8_t> &out) const = 0;
+     virtual GSTransferSnapshot GetTransferSnapshot() const = 0;
++
++    // Backends tied to one thread at a time (the GS on the GPU and its GL context): the creating thread lets
++    // go of it, then the thread that makes every later call takes it.
++    virtual void DetachFromThread() {}
++    virtual void AttachToThread() {}
+ };
+diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+index f19ed31..fcf7bf3 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+@@ -53,6 +53,10 @@ public:
+     ClutState GetClutState() const;
+     void SetClutState(const ClutState &state);
+ 
++    // Pages a presentation may read: both circuits, the preferred source and the context frame buffers it
++    // falls back to.
++    static std::bitset<512> PresentationPages(const GSPresentationRequest &request);
++
+     // Per-primitive decoded pixel pipeline and texture sampler (gs_cpu_backend.cpp): the same results as
+     // WritePixel and SampleTexture without decoding the GS state on every pixel.
+     struct PixelPipe;
+diff --git a/ps2xRuntime/include/runtime/gs/gs_gpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_gpu_backend.h
+index ba4b7d1..5872313 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_gpu_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_gpu_backend.h
+@@ -1,49 +1,184 @@
+ #pragma once
+ 
++#include "runtime/gs/gs_backend.h"
++#include "runtime/gs/gs_cpu_backend.h"
+ #include "runtime/gs/gs_gpu_context.h"
+ #include "runtime/gs/gs_types.h"
+ 
++#include <array>
++#include <bitset>
+ #include <cstdint>
+ #include <memory>
+ #include <string>
++#include <thread>
+ #include <vector>
+ 
+-// The GS on the GPU (docs/PLAN_60FPS.md, section 6.3): GS local memory is a 4 MiB shader storage buffer and
+-// every command runs as a compute dispatch with the same addressing and per-pixel rules as GSCpuBackend.
+-// Built up milestone by milestone; so far (G1) host-to-local transfers. The caller makes the context current.
+-class GSGpuBackend
++// The GS on the GPU (docs/PLAN_60FPS.md, section 6.3). GS local memory is a 4 MiB shader storage buffer and
++// commands run as compute dispatches with the same addressing and per-pixel rules as GSCpuBackend (its
++// single-threaded path is the reference: ttr_gs_bench compares both).
++//
++// - Triangles and sprites are prepared on the CPU exactly as GSCpuBackend does per primitive, binned into 16x16
++//   tiles of their frame buffer and drawn in batches: one workgroup per tile, one thread per pixel, walking the
++//   tile's primitives in order (as ps2-web-recomp and paraLLEl-GS do).
++// - Texture pages a batch samples and later draws into are copied before the batch (page map), so every
++//   primitive samples VRAM as it was when it was submitted; a primitive that samples a page the batch already
++//   draws into starts a new batch. CLUT loads produce instances in a ring.
++// - Host-to-local uploads and CLUT loads that touch nothing the pending batch uses run at once, ahead of it.
++// - Rare operations (lines and points, local-to-local and local-to-host transfers, clears, VRAM reads and
++//   writes, presentation) go through a GSCpuBackend on a host copy of the pages involved.
++//
++// Every call must come from the thread that created the backend or, after MakeCurrent(), from one other thread.
++class GSGpuBackend final : public GSRasterBackend
+ {
+ public:
+     // Null (and `error` set) without an OpenGL 4.3 context or when a shader does not compile.
+     static std::unique_ptr<GSGpuBackend> Create(std::string &error);
+-    ~GSGpuBackend();
++    ~GSGpuBackend() override;
+ 
+     GSGpuContext &Context() { return *m_gpu; }
++    // Binds the GL context to the calling thread (the GS thread).
++    void MakeCurrent();
+ 
+     // VRAM from / to host memory (4 MiB).
+     void LoadVram(const uint8_t *vram, size_t bytes);
+-    void ReadVram(std::vector<uint8_t> &out);
++    void ReadVramAll(std::vector<uint8_t> &out);
+ 
+-    // Host-to-local transfers, as GSCpuBackend::BeginTransfer / UploadImage (direction 0 only).
+-    void BeginTransfer(const GSTransferCommand &command);
+-    void UploadImage(const uint8_t *data, uint32_t sizeBytes);
++    void Initialize(uint8_t *vram, uint32_t vramSize) override;
++    void Reset() override;
++    void Submit(const GSPrimitiveBatch &batch) override;
++    void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) override;
++    void BeginTransfer(const GSTransferCommand &command) override;
++    void UploadImage(const uint8_t *data, uint32_t sizeBytes) override;
++    void Flush() override;
++    void TextureFlush() override {}
++    void Sync(GSSyncReason reason) override;
++    PresentationFrame Present(const GSPresentationRequest &request) override;
++    bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override;
++    uint32_t ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes) override;
++    uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const override;
++    void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) override;
++    void SnapshotVram(std::vector<uint8_t> &out) const override;
++    GSTransferSnapshot GetTransferSnapshot() const override;
++
++    // Capture/replay: the CLUT state at the start of a capture.
++    void SetClutState(const GSCpuBackend::ClutState &state);
++
++    // Present reads the displayed pages back without waiting for the GPU and returns the frame of an earlier
++    // call (the copy of its pages is done by then); synchronous: waits and returns this call's frame (tests).
++    void SetSynchronousPresent(bool synchronous) { m_synchronousPresent = synchronous; }
++
++    void DetachFromThread() override;
++    void AttachToThread() override;
++
++    struct Stats
++    {
++        uint64_t batches = 0, primitives = 0, tiles = 0, uploads = 0, clutLoads = 0, fallbacks = 0, snapshotPages = 0;
++        // Primitives that sample pages the batch draws into, but not its blocks (no new batch).
++        uint64_t sharedPages = 0;
++        uint64_t uploadDispatches = 0;
++        // PS2X_GS_GPU_TIMING=1: CPU time in Submit (batches it ends included), in DrawBatch and in uploads, and
++        // time waiting for the GPU after each batch (glFinish).
++        double submitMs = 0.0, drawMs = 0.0, uploadMs = 0.0, gpuWaitMs = 0.0, uploadGpuMs = 0.0;
++        // Batches by what ended them (FlushReason).
++        uint64_t ended[8] = {};
++    };
++    enum FlushReason
++    {
++        kEndOther,
++        kEndReadAfterWrite,
++        kEndLayout,
++        kEndFull,
++        kEndClut,
++        kEndUploadRead,
++        kEndUploadWrite,
++        kEndSync,
++    };
++    const Stats &GetStats() const { return m_stats; }
+ 
+ private:
+     GSGpuBackend() = default;
+     bool Build(std::string &error);
++    void DrawBatch(int reason = kEndOther);
++    // Adds the blocks of m_writeRects not yet in m_batchWriteBlocks.
++    void UpdateWriteBlocks();
++    // GSCpuBackend runs `op` on host memory: the GPU VRAM is read back first and written again after.
++    template <typename Op>
++    void Fallback(bool writesVram, Op &&op);
++    // Queues a chunk of the transfer in progress; FlushUploads() runs every queued chunk in one dispatch.
++    void QueueUpload(const uint8_t *data, uint32_t sizeBytes);
++    void FlushUploads();
++    // Readbacks of displayed pages (Present): the oldest ones whose copy is done (or all, waiting) become
++    // m_lastFrame.
++    void CollectReadbacks(bool wait);
+ 
+     std::unique_ptr<GSGpuContext> m_gpu;
+-    uint32_t m_vram = 0;      // 1 Mi uint words
+-    uint32_t m_swizzle = 0;   // GSSwizzle tables of every layout
+-    uint32_t m_staging = 0;   // upload data
++    // VRAM (1 Mi words) followed by room for texture page snapshots (512 pages).
++    uint32_t m_vram = 0;
++    uint32_t m_swizzle = 0;
++    uint32_t m_staging = 0;
+     size_t m_stagingSize = 0;
+-    uint32_t m_uploadProgram = 0;
+-    // Where each layout's tables start in m_swizzle (in words), by layout index.
++    uint32_t m_primBuffer = 0, m_tileBuffer = 0, m_listBuffer = 0, m_pageMapBuffer = 0, m_clutBuffer = 0;
++    size_t m_primCapacity = 0, m_tileCapacity = 0, m_listCapacity = 0;
++    uint32_t m_uploadProgram = 0, m_rasterProgram = 0, m_copyProgram = 0, m_clutProgram = 0;
++    int32_t m_copyCountLocation = -1;
++    std::array<int32_t, 13> m_clutLocations{};
+     std::vector<uint32_t> m_layoutOffset;
+ 
+-    // The host-to-local transfer in progress (as GSCpuBackend's m_transfer / m_transferState).
++    // The batch being collected: primitive records, their pages, the tiles they cover.
++    std::vector<uint32_t> m_prims;
++    uint32_t m_primCount = 0;
++    std::bitset<512> m_batchWrites, m_batchReads;
++    std::array<uint32_t, 512> m_pageLayout{};
++    std::vector<std::vector<uint32_t>> m_tileLists; // by tile index (y * 128 + x)
++    std::vector<uint32_t> m_usedTiles;
++    // Scratch of Submit: frame / Z buffer pages of the primitive and their layout.
++    struct PageUse
++    {
++        uint32_t page, layout;
++    };
++    std::vector<PageUse> m_pageUses;
++    // Pixel rectangles the batch draws (frame and Z buffers) and, for those up to m_writeRectsDone, their blocks.
++    struct WriteRect
++    {
++        uint32_t bp, bw, psm, x0, y0, x1, y1;
++    };
++    std::vector<WriteRect> m_writeRects;
++    size_t m_writeRectsDone = 0;
++    std::bitset<65536> m_batchWriteBlocks; // by column (64 bytes)
++
++    // CLUT: instances in a ring on the GPU; the current one, and CBP0/CBP1 for CLD 4/5.
++    static constexpr uint32_t kClutInstances = 4096u;
++    uint32_t m_clutInstance = 0;
++    uint32_t m_clutInstancesInBatch = 0;
++    std::array<uint32_t, 2> m_clutCbp{};
++
++    // The host-to-local transfer in progress.
+     GSTransferCommand m_transfer{};
+-    uint32_t m_copied = 0;
+-    uint32_t m_total = 0;
+-    bool m_active = false;
++    uint32_t m_copied = 0, m_total = 0;
++    bool m_uploadActive = false;
++    std::bitset<512> m_transferPages;
++    // Queued upload chunks: their bytes (each 4-byte aligned), descriptors, workgroups and destination pages.
++    std::vector<uint8_t> m_uploadData;
++    std::vector<uint32_t> m_uploadChunks, m_uploadGroups;
++    std::bitset<512> m_uploadPages;
++    uint32_t m_uploadDataBuffer = 0, m_uploadChunkBuffer = 0, m_uploadGroupBuffer = 0;
++    size_t m_uploadDataCapacity = 0, m_uploadChunkCapacity = 0, m_uploadGroupCapacity = 0;
++
++    // Host copy of VRAM and the CPU backend for the rare operations (its single-threaded path).
++    std::vector<uint8_t> m_host;
++    std::unique_ptr<GSCpuBackend> m_cpu;
++    std::thread::id m_owner;
++    struct Readback
++    {
++        uint32_t buffer = 0;
++        void *fence = nullptr;
++        GSPresentationRequest request{};
++        std::bitset<512> pages;
++    };
++    std::array<Readback, 3> m_readbacks{};
++    uint32_t m_readbackNext = 0;
++    PresentationFrame m_lastFrame{};
++    bool m_synchronousPresent = false;
++    bool m_timing = false;
++    Stats m_stats;
+ };
+diff --git a/ps2xRuntime/include/runtime/gs/gs_gpu_context.h b/ps2xRuntime/include/runtime/gs/gs_gpu_context.h
+index ce3212f..70ae222 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_gpu_context.h
++++ b/ps2xRuntime/include/runtime/gs/gs_gpu_context.h
+@@ -33,17 +33,35 @@ public:
+     uint32_t CreateProgram(const std::string &source, std::string &error);
+     void UseProgram(uint32_t program);
+     void SetUniform(uint32_t program, const char *name, uint32_t value);
++    // Location of a uniform (looked up once) and setting it on the program in use.
++    int32_t UniformLocation(uint32_t program, const char *name);
++    void SetUniformAt(int32_t location, uint32_t value);
+     void SetUniform(uint32_t program, const char *name, int32_t value);
+     void Dispatch(uint32_t groupsX, uint32_t groupsY = 1, uint32_t groupsZ = 1);
+     // Shader storage writes become visible to later dispatches and buffer reads.
+     void Barrier();
+     void Finish();
++    // A buffer the host reads (GL_STREAM_READ), buffer-to-buffer copies and reads that do not wait for the
++    // whole pipeline once the copy's fence is signaled.
++    uint32_t CreateReadbackBuffer(size_t bytes);
++    void CopyBuffer(uint32_t source, size_t sourceOffset, uint32_t target, size_t targetOffset, size_t bytes);
++    void ReadBuffer(uint32_t buffer, size_t offset, size_t bytes, void *data);
++    void *Fence();
++    // True once the commands before `fence` are done (waiting at most timeoutNs).
++    bool WaitFence(void *fence, uint64_t timeoutNs);
++    void DeleteFence(void *fence);
++    // GPU time of the commands between BeginTimer() and EndTimer(), in ms (EndTimer waits for them).
++    void BeginTimer();
++    double EndTimer();
+ 
+     struct Functions;
+ 
+ private:
+     GSGpuContext() = default;
+     void *m_window = nullptr;
++    unsigned int m_timerQuery = 0;
++    // The context that was current on the thread before MakeCurrent(), made current again by ReleaseCurrent().
++    void *m_previous = nullptr;
+     std::unique_ptr<Functions> m_gl;
+     std::string m_renderer;
+ };
+diff --git a/ps2xRuntime/src/lib/gs/gs_async_backend.cpp b/ps2xRuntime/src/lib/gs/gs_async_backend.cpp
+index e283919..aa2b574 100644
+--- a/ps2xRuntime/src/lib/gs/gs_async_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_async_backend.cpp
+@@ -1,6 +1,7 @@
+ #include "runtime/gs/gs_async_backend.h"
+ #include "runtime/gs/gs_capture.h"
+ #include "runtime/gs/gs_cpu_backend.h"
++#include "runtime/gs/gs_gpu_backend.h"
+ #include "runtime/ps2_vif1_worker.h"
+ 
+ #include <chrono>
+@@ -67,6 +68,7 @@ void GSAsyncBackend::publishUnlocked() const
+ GSAsyncBackend::GSAsyncBackend(std::unique_ptr<GSRasterBackend> inner)
+     : m_inner(std::move(inner)), m_ring(kCapacity)
+ {
++    m_inner->DetachFromThread();
+     m_thread = std::thread([this]()
+                            { run(); });
+ }
+@@ -76,6 +78,19 @@ GSAsyncBackend::~GSAsyncBackend()
+     push([](Command &command)
+          { command.type = CommandType::Stop; });
+     m_thread.join();
++    // The inner backend is destroyed on this thread.
++    m_inner->AttachToThread();
++}
++
++template <typename Fn>
++void GSAsyncBackend::runOnThread(Fn &&fn) const
++{
++    GSAsyncBackend *self = const_cast<GSAsyncBackend *>(this);
++    self->push([&fn](Command &command)
++               {
++                   command.type = CommandType::Call;
++                   command.call = [&fn]() { fn(); }; });
++    waitIdle();
+ }
+ 
+ void GSAsyncBackend::waitForExecuted(uint64_t count) const
+@@ -118,6 +133,7 @@ void GSAsyncBackend::run()
+     uint64_t idleNs = 0u;
+     auto lastReport = std::chrono::steady_clock::now();
+     uint64_t executed = m_executed.load(std::memory_order_relaxed);
++    m_inner->AttachToThread();
+     for (;;)
+     {
+         uint64_t queued = m_queued.load(std::memory_order_acquire);
+@@ -162,6 +178,8 @@ void GSAsyncBackend::run()
+             const bool stop = command.type == CommandType::Stop;
+             if (!stop)
+                 execute(command);
++            else
++                m_inner->DetachFromThread();
+             m_executed.store(++executed, std::memory_order_seq_cst);
+             if (m_executedWaiters.load(std::memory_order_seq_cst) != 0u)
+                 m_executed.notify_all();
+@@ -208,6 +226,10 @@ void GSAsyncBackend::execute(Command &command)
+         m_presentQueued.store(false, std::memory_order_release);
+         break;
+     }
++    case CommandType::Call:
++        command.call();
++        command.call = nullptr;
++        break;
+     case CommandType::Stop:
+         break;
+     }
+@@ -215,14 +237,14 @@ void GSAsyncBackend::execute(Command &command)
+ 
+ void GSAsyncBackend::Initialize(uint8_t *vram, uint32_t vramSize)
+ {
+-    waitIdle();
+-    m_inner->Initialize(vram, vramSize);
++    runOnThread([&]()
++                { m_inner->Initialize(vram, vramSize); });
+ }
+ 
+ void GSAsyncBackend::Reset()
+ {
+-    waitIdle();
+-    m_inner->Reset();
++    runOnThread([&]()
++                { m_inner->Reset(); });
+ }
+ 
+ void GSAsyncBackend::Submit(const GSPrimitiveBatch &batch)
+@@ -283,8 +305,8 @@ void GSAsyncBackend::Sync(GSSyncReason reason)
+     // the FINISH event itself.
+     if (reason == GSSyncReason::Finish || reason == GSSyncReason::Presentation)
+         return;
+-    waitIdle();
+-    m_inner->Sync(reason);
++    runOnThread([&]()
++                { m_inner->Sync(reason); });
+ }
+ 
+ PresentationFrame GSAsyncBackend::Present(const GSPresentationRequest &request)
+@@ -294,8 +316,8 @@ PresentationFrame GSAsyncBackend::Present(const GSPresentationRequest &request)
+         if (!m_hasPresented)
+         {
+             // The first frame: present in place.
+-            waitIdle();
+-            m_lastPresented = m_inner->Present(request);
++            runOnThread([&]()
++                        { m_lastPresented = m_inner->Present(request); });
+             m_hasPresented = true;
+             return m_lastPresented;
+         }
+@@ -314,42 +336,67 @@ PresentationFrame GSAsyncBackend::Present(const GSPresentationRequest &request)
+ 
+ bool GSAsyncBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
+ {
+-    waitIdle();
+-    return m_inner->ClearFramebuffer(context, rgba);
++    bool result = false;
++    runOnThread([&]()
++                { result = m_inner->ClearFramebuffer(context, rgba); });
++    return result;
+ }
+ 
+ uint32_t GSAsyncBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+ {
+-    waitIdle();
+-    return m_inner->ConsumeLocalToHostBytes(dst, maxBytes);
++    uint32_t result = 0u;
++    runOnThread([&]()
++                { result = m_inner->ConsumeLocalToHostBytes(dst, maxBytes); });
++    return result;
+ }
+ 
+ uint32_t GSAsyncBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
+ {
+-    waitIdle();
+-    return m_inner->ReadVram(psm, base, bw, x, y);
++    uint32_t result = 0u;
++    runOnThread([&]()
++                { result = m_inner->ReadVram(psm, base, bw, x, y); });
++    return result;
+ }
+ 
+ void GSAsyncBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
+ {
+-    waitIdle();
+-    m_inner->WriteVram(psm, base, bw, x, y, value);
++    runOnThread([&]()
++                { m_inner->WriteVram(psm, base, bw, x, y, value); });
+ }
+ 
+ void GSAsyncBackend::SnapshotVram(std::vector<uint8_t> &out) const
+ {
+-    waitIdle();
+-    m_inner->SnapshotVram(out);
++    runOnThread([&]()
++                { m_inner->SnapshotVram(out); });
+ }
+ 
+ GSTransferSnapshot GSAsyncBackend::GetTransferSnapshot() const
+ {
+-    waitIdle();
+-    return m_inner->GetTransferSnapshot();
++    GSTransferSnapshot result{};
++    runOnThread([&]()
++                { result = m_inner->GetTransferSnapshot(); });
++    return result;
+ }
+ 
+ std::unique_ptr<GSRasterBackend> CreateDefaultGsBackend()
+ {
++    // The GS on the GPU (docs/PLAN_60FPS.md 6.3) when OpenGL 4.3 is available, always on its own thread;
++    // PS2X_GS_GPU=0, a GS capture (PS2X_GS_CAPTURE records the software GS) or PS2X_GS_ASYNC=0 keep the
++    // software GS. This runs on the main thread (GLFW creates the context's hidden window there).
++    const char *gpu = std::getenv("PS2X_GS_GPU");
++    const char *capture = std::getenv("PS2X_GS_CAPTURE");
++    const char *sync = std::getenv("PS2X_GS_ASYNC");
++    if (!(gpu && gpu[0] == '0') && !(capture && capture[0] != '\0') && !(sync && std::strcmp(sync, "0") == 0))
++    {
++        std::string error;
++        std::unique_ptr<GSGpuBackend> backend = GSGpuBackend::Create(error);
++        if (backend)
++        {
++            std::fprintf(stderr, "[gs] GS on the GPU: %s\n", backend->Context().Renderer().c_str());
++            return std::make_unique<GSAsyncBackend>(std::move(backend));
++        }
++        std::fprintf(stderr, "[gs] no GS on the GPU (%s): software GS\n", error.c_str());
++    }
+     std::unique_ptr<GSRasterBackend> backend = WrapGsCaptureIfRequested(std::make_unique<GSCpuBackend>());
+     const char *async = std::getenv("PS2X_GS_ASYNC");
+     if (async && std::strcmp(async, "0") == 0)
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 050ca24..d6e05fd 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -4133,23 +4133,9 @@ PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
+         }
+         else
+         {
+-            // Only the buffers the display may read (both circuits, the preferred source, the context frame
+-            // buffers it falls back to) must be drawn: wait for those pages and copy them; the band workers
+-            // go on with the rest.
+-            std::bitset<512> pages;
+-            auto addFrame = [&](const GSFrameReg &frame, uint32_t originX, uint32_t originY)
+-            {
+-                markRect(pages, frame.fbp * 32u, frame.fbw, frame.psm, 0u, 0u,
+-                         std::min<uint32_t>(originX + kHostFrameWidth, 2047u), std::min<uint32_t>(originY + kHostFrameHeight, 2047u));
+-            };
+-            addFrame(decodeDisplayFrame(request.dispfb1), decodeDisplayReadOrigin(request.dispfb1).x,
+-                     decodeDisplayReadOrigin(request.dispfb1).y);
+-            addFrame(decodeDisplayFrame(request.dispfb2), decodeDisplayReadOrigin(request.dispfb2).x,
+-                     decodeDisplayReadOrigin(request.dispfb2).y);
+-            if (request.hasPreferredSource)
+-                addFrame(request.preferredSource, 0u, 0u);
+-            for (const GSFrameReg &frame : request.contextFrames)
+-                addFrame(frame, 0u, 0u);
++            // Only the buffers the display may read must be drawn: wait for those pages and copy them; the
++            // band workers go on with the rest.
++            const std::bitset<512> pages = PresentationPages(request);
+             WaitForFbPagesUnlocked(pages);
+             snapshot.resize(m_vramSize);
+             for (uint32_t page = 0; page < 512u; ++page)
+@@ -4163,6 +4149,23 @@ PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
+     return snapshotBackend.PresentFromLocalMemory(request);
+ }
+ 
++std::bitset<512> GSCpuBackend::PresentationPages(const GSPresentationRequest &request)
++{
++    std::bitset<512> pages;
++    auto addFrame = [&](const GSFrameReg &frame, uint32_t originX, uint32_t originY)
++    {
++        markRect(pages, frame.fbp * 32u, frame.fbw, frame.psm, 0u, 0u, std::min<uint32_t>(originX + kHostFrameWidth, 2047u),
++                 std::min<uint32_t>(originY + kHostFrameHeight, 2047u));
++    };
++    addFrame(decodeDisplayFrame(request.dispfb1), decodeDisplayReadOrigin(request.dispfb1).x, decodeDisplayReadOrigin(request.dispfb1).y);
++    addFrame(decodeDisplayFrame(request.dispfb2), decodeDisplayReadOrigin(request.dispfb2).x, decodeDisplayReadOrigin(request.dispfb2).y);
++    if (request.hasPreferredSource)
++        addFrame(request.preferredSource, 0u, 0u);
++    for (const GSFrameReg &frame : request.contextFrames)
++        addFrame(frame, 0u, 0u);
++    return pages;
++}
++
+ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationRequest &request)
+ {
+     PresentationFrame result{};
+diff --git a/ps2xRuntime/src/lib/gs/gs_gpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_gpu_backend.cpp
+index e462048..7885816 100644
+--- a/ps2xRuntime/src/lib/gs/gs_gpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_gpu_backend.cpp
+@@ -1,11 +1,19 @@
+ #include "runtime/gs/gs_gpu_backend.h"
+ 
+ #include "runtime/gs/gs_swizzle.h"
++#include "runtime/gs/ps2_gs_common.h"
+ #include "runtime/gs/ps2_gs_memory.h"
+ 
+ #include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <cstdlib>
+ #include <cstring>
+ 
++#include "gs_gpu_shaders.inc"
++
++using namespace GSInternal;
++
+ namespace
+ {
+     // Layouts with their own GSSwizzle tables, in the order they are stored on the GPU.
+@@ -13,6 +21,12 @@ namespace
+     constexpr uint32_t kHeaderWords = 8u;
+     constexpr uint32_t kRowWords = 128u;
+     constexpr uint32_t kColumns = 2048u;
++    constexpr uint32_t kPrimWords = 64u;
++    constexpr uint32_t kTileShift = 4u; // 16x16 pixels
++    constexpr uint32_t kTilesPerRow = 2048u >> kTileShift;
++    constexpr uint32_t kMaxBatchPrimitives = 65536u;
++    constexpr uint32_t kVramWords = 1u << 20u;
++    constexpr uint32_t kPageWords = 2048u;
+ 
+     int layoutIndex(uint32_t psm)
+     {
+@@ -30,7 +44,7 @@ namespace
+         }
+     }
+ 
+-    // How a format's pixels are written: 1 32-bit, 2 24-bit, 3 16-bit, 4 8-bit, 5 4-bit, 6 8H, 7 4HL, 8 4HH.
++    // Upload write kinds: 1 32-bit, 2 24-bit, 3 16-bit, 4 8-bit, 5 4-bit, 6 8H, 7 4HL, 8 4HH.
+     uint32_t writeKind(uint32_t psm)
+     {
+         switch (psm)
+@@ -47,86 +61,250 @@ namespace
+         }
+     }
+ 
+-    // Shared GLSL: VRAM, the swizzle tables (GSSwizzle::AddressFast) and partial word writes.
+-    const char *const kCommonGlsl = R"(
+-layout(std430, binding = 0) buffer Vram { uint vram[]; };
+-layout(std430, binding = 1) readonly buffer Swizzle { uint sw[]; };
++    // Page size in pixels of a format (8 KiB pages), as GSCpuBackend's pageSizeOf.
++    void pageSizeOf(uint32_t psm, uint32_t &width, uint32_t &height)
++    {
++        switch (psm)
++        {
++        case GS_PSM_T4: width = 128u; height = 128u; return;
++        case GS_PSM_T8: width = 128u; height = 64u; return;
++        case GS_PSM_CT16: case GS_PSM_CT16S: case GS_PSM_Z16: case GS_PSM_Z16S: width = 64u; height = 64u; return;
++        default: width = 64u; height = 32u; return;
++        }
++    }
+ 
+-// GSSwizzle::AddressFast for the layout whose tables start at word `tables`.
+-uint swAddress(uint tables, uint base, uint rowStride, uint x, uint y)
+-{
+-    uint pageHShift = sw[tables + 1u];
+-    uint pageHMask = sw[tables + 2u];
+-    uint periodMask = sw[tables + 3u];
+-    uint inPage = y & pageHMask;
+-    return base + (y >> pageHShift) * rowStride + sw[tables + 8u + inPage] +
+-           sw[tables + 8u + 128u + (inPage & periodMask) * 2048u + (x & 2047u)];
+-}
++    // GSCpuBackend's markRect.
++    void markRect(std::bitset<512> &pages, uint32_t bp, uint32_t bw, uint32_t psm, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1)
++    {
++        uint32_t pageWidth = 64u, pageHeight = 32u;
++        pageSizeOf(psm, pageWidth, pageHeight);
++        const uint32_t perRow = std::max<uint32_t>((std::max<uint32_t>(bw, 1u) * 64u + pageWidth - 1u) / pageWidth, 1u);
++        const uint32_t first = bp >> 5u;
++        const uint32_t spill = (bp & 31u) != 0u ? 1u : 0u;
++        const uint32_t col0 = x0 / pageWidth, col1 = std::max(x0, x1) / pageWidth;
++        const uint32_t row0 = y0 / pageHeight, row1 = std::max(y0, y1) / pageHeight;
++        for (uint32_t row = row0; row <= row1 && row - row0 < 512u; ++row)
++            for (uint32_t col = col0; col <= col1 + spill; ++col)
++                pages.set((first + row * perRow + col) & 511u);
++    }
+ 
+-// bits [shift, shift + width) of the byte at `byteAddress` (inside one word) = value; other threads may write
+-// the other bits of the word at the same time.
+-void writeBits(uint byteAddress, uint shift, uint width, uint value)
+-{
+-    uint word = byteAddress >> 2u;
+-    uint bitShift = (byteAddress & 3u) * 8u + shift;
+-    uint mask = (width == 32u ? 0xFFFFFFFFu : ((1u << width) - 1u)) << bitShift;
+-    atomicAnd(vram[word], ~mask);
+-    atomicOr(vram[word], (value << bitShift) & mask);
+-}
+-)";
++    // GSCpuBackend::PrimitiveReadPages (whole texture: the default without PS2X_GS_UV_READS).
++    // Pages of the texels a primitive can sample (GSCpuBackend::PrimitiveReadPages with PS2X_GS_UV_READS=1) and
++    // that texel rectangle. `tight`: a UV sprite without filtering samples texels int(U) for U between its two
++    // vertex coordinates (no margin needed); otherwise one texel of margin covers bilinear taps and rounding.
++    struct TexRect
++    {
++        uint32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
++    };
++    std::bitset<512> textureReadPages(const GSPrimitiveBatch &batch, bool tight, TexRect &rect)
++    {
++        std::bitset<512> pages;
++        const GSDrawState &state = batch.state;
++        const GSTex0Reg &tex = state.context.tex0;
++        const int width = std::max<int>(state.textureWidth, 1), height = std::max<int>(state.textureHeight, 1);
++        const uint32_t count = std::min<uint32_t>(batch.vertexCount, 3u);
++        float u0 = 0.0f, u1 = 0.0f, v0 = 0.0f, v1 = 0.0f;
++        bool full = false;
++        for (uint32_t i = 0; i < count; ++i)
++        {
++            const GSVertex &vertex = batch.vertices[i];
++            float u, v;
++            if (state.prim.fst)
++            {
++                u = static_cast<float>(vertex.u) / 16.0f;
++                v = static_cast<float>(vertex.v) / 16.0f;
++            }
++            else
++            {
++                if (!(vertex.q > 0.0f) || !std::isfinite(vertex.s / vertex.q) || !std::isfinite(vertex.t / vertex.q))
++                {
++                    full = true;
++                    break;
++                }
++                u = vertex.s / vertex.q * static_cast<float>(width);
++                v = vertex.t / vertex.q * static_cast<float>(height);
++            }
++            if (i == 0u)
++            {
++                u0 = u1 = u;
++                v0 = v1 = v;
++            }
++            else
++            {
++                u0 = std::min(u0, u);
++                u1 = std::max(u1, u);
++                v0 = std::min(v0, v);
++                v1 = std::max(v1, v);
++            }
++        }
++        const uint64_t clamp = state.context.clamp;
++        const double margin = tight ? 0.0 : 1.0;
++        auto axis = [&](float lo, float hi, int size, uint32_t mode, uint32_t minField, uint32_t maxField, int &first, int &last)
++        {
++            if (tight)
++            {
++                // The fixed-point coordinate is clamped to [0, 0xFFFF] before int(U / 16).
++                lo = std::clamp(lo, 0.0f, 4095.0f);
++                hi = std::clamp(hi, 0.0f, 4095.0f);
++            }
++            const double flo = std::floor(static_cast<double>(lo)) - margin, fhi = std::ceil(static_cast<double>(hi)) + margin;
++            if (full || !(flo > -1e6 && fhi < 1e6))
++            {
++                first = 0;
++                last = mode == 3u ? 1023 : size - 1;
++                return;
++            }
++            int a = static_cast<int>(flo), b = static_cast<int>(fhi);
++            switch (mode)
++            {
++            case 1u:
++                first = std::clamp(a, 0, size - 1);
++                last = std::clamp(b, 0, size - 1);
++                return;
++            case 2u:
++                // min(max(c, MINU), MAXU) does not decrease with c.
++                first = std::min(std::max(a, static_cast<int>(minField)), static_cast<int>(maxField));
++                last = std::min(std::max(b, static_cast<int>(minField)), static_cast<int>(maxField));
++                return;
++            case 3u:
++                // (c & MSK) | FIX for every c of the range (shuffles sample short ranges).
++                if (b - a < 4096)
++                {
++                    first = 1023;
++                    last = 0;
++                    for (int c = a; c <= b; ++c)
++                    {
++                        const int wrapped = static_cast<int>((static_cast<uint32_t>(c) & minField) | maxField);
++                        first = std::min(first, wrapped);
++                        last = std::max(last, wrapped);
++                    }
++                    return;
++                }
++                first = 0;
++                last = std::max(size - 1, static_cast<int>(minField | maxField));
++                return;
++            default:
++                if (b - a + 1 >= size)
++                {
++                    first = 0;
++                    last = size - 1;
++                    return;
++                }
++                a = ((a % size) + size) % size;
++                b = ((b % size) + size) % size;
++                first = a <= b ? a : 0;
++                last = a <= b ? b : size - 1;
++                return;
++            }
++        };
++        int x0, x1, y0, y1;
++        axis(u0, u1, width, static_cast<uint32_t>(clamp & 3u), static_cast<uint32_t>((clamp >> 4u) & 0x3FFu),
++             static_cast<uint32_t>((clamp >> 14u) & 0x3FFu), x0, x1);
++        axis(v0, v1, height, static_cast<uint32_t>((clamp >> 2u) & 3u), static_cast<uint32_t>((clamp >> 24u) & 0x3FFu),
++             static_cast<uint32_t>((clamp >> 34u) & 0x3FFu), y0, y1);
++        static const bool wholeTexture = []
++        {
++            const char *env = std::getenv("PS2X_GS_GPU_WHOLE_TEXTURE");
++            return env && env[0] == '1';
++        }();
++        if (wholeTexture)
++        {
++            x0 = 0;
++            y0 = 0;
++            x1 = std::max(x1, width - 1);
++            y1 = std::max(y1, height - 1);
++        }
++        rect.x0 = static_cast<uint32_t>(std::max(x0, 0));
++        rect.y0 = static_cast<uint32_t>(std::max(y0, 0));
++        rect.x1 = static_cast<uint32_t>(std::max(x1, 0));
++        rect.y1 = static_cast<uint32_t>(std::max(y1, 0));
++        markRect(pages, tex.tbp0, tex.tbw, tex.psm, rect.x0, rect.y0, rect.x1, rect.y1);
++        return pages;
++    }
++
++    // Block (256 bytes) size in pixels of a format.
++    void blockSizeOf(uint32_t psm, uint32_t &width, uint32_t &height)
++    {
++        switch (psm)
++        {
++        case GS_PSM_T4: width = 32u; height = 16u; return;
++        case GS_PSM_T8: width = 16u; height = 16u; return;
++        case GS_PSM_CT16: case GS_PSM_CT16S: case GS_PSM_Z16: case GS_PSM_Z16S: width = 16u; height = 8u; return;
++        default: width = 8u; height = 8u; return;
++        }
++    }
++
++    // Calls `column(index)` for the columns of VRAM (64 bytes: a quarter of a block, its full width and a quarter
++    // of its height) under the pixel rectangle [x0, x1] x [y0, y1] of a buffer at block `bp`, width `bw` (64
++    // pixels); stops early when it returns true. Returns whether it did (true for an unknown format).
++    template <typename Fn>
++    bool forEachColumn(uint32_t bp, uint32_t bw, uint32_t psm, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1, Fn &&column)
++    {
++        const GSSwizzle::Format *format = GSSwizzle::Get(psm);
++        if (!format)
++            return true;
++        uint32_t width = 8u, height = 8u;
++        blockSizeOf(psm, width, height);
++        // A block's 4 columns are its quarters from the top, stored one after the other: one address per block.
++        const uint32_t columnHeight = height / 4u;
++        const uint32_t base = GSSwizzle::Base(*format, bp);
++        const uint32_t rowStride = GSSwizzle::RowStride(*format, bw);
++        for (uint32_t y = y0 & ~(height - 1u); y <= y1; y += height)
++        {
++            const uint32_t first = y0 > y ? (y0 - y) / columnHeight : 0u;
++            const uint32_t last = std::min<uint32_t>(3u, (y1 - y) / columnHeight);
++            for (uint32_t x = x0 & ~(width - 1u); x <= x1; x += width)
++            {
++                const uint32_t block = GSSwizzle::AddressFast(*format, base, rowStride, x, y) / format->pixelsPerBlock;
++                for (uint32_t k = first; k <= last; ++k)
++                    if (column((block * 4u + k) & 65535u))
++                        return true;
++            }
++        }
++        return false;
++    }
+ 
+-    // GSCpuBackend::UploadImageUnlocked for `count` pixels from `first` (one thread per pixel).
+-    const char *const kUploadGlsl = R"(
+-layout(local_size_x = 256) in;
+-layout(std430, binding = 2) readonly buffer Data { uint data[]; };
+-uniform uint tables;
+-uniform uint base;
+-uniform uint rowStride;
+-uniform uint kind;
+-uniform uint dsax;
+-uniform uint dsay;
+-uniform uint rrw;
+-uniform uint first;
+-uniform uint count;
++    // Adds the time until it goes out of scope to *total (nothing when null).
++    struct ScopedMs
++    {
++        double *total;
++        std::chrono::steady_clock::time_point start;
++        explicit ScopedMs(double *t) : total(t), start(t ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
++        ~ScopedMs()
++        {
++            if (total)
++                *total += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
++        }
++    };
+ 
+-uint dataByte(uint i) { return (data[i >> 2u] >> ((i & 3u) * 8u)) & 0xFFu; }
++    uint32_t floatBits(float value)
++    {
++        uint32_t bits = 0;
++        std::memcpy(&bits, &value, sizeof(bits));
++        return bits;
++    }
+ 
+-void main()
+-{
+-    uint k = gl_GlobalInvocationID.x;
+-    if (k >= count)
+-        return;
+-    uint g = first + k;
+-    uint x = dsax + g % rrw;
+-    uint y = dsay + g / rrw;
+-    uint pixel = swAddress(tables, base, rowStride, x, y);
+-    if (kind == 1u)
+-    {
+-        vram[pixel & 0xFFFFFu] = dataByte(4u * k) | (dataByte(4u * k + 1u) << 8u) | (dataByte(4u * k + 2u) << 16u) |
+-                                 (dataByte(4u * k + 3u) << 24u);
+-    }
+-    else if (kind == 2u)
+-    {
+-        uint value = dataByte(3u * k) | (dataByte(3u * k + 1u) << 8u) | (dataByte(3u * k + 2u) << 16u);
+-        uint word = pixel & 0xFFFFFu;
+-        vram[word] = (vram[word] & 0xFF000000u) | value;
+-    }
+-    else if (kind == 3u)
+-        writeBits((pixel * 2u) & 0x3FFFFEu, 0u, 16u, dataByte(2u * k) | (dataByte(2u * k + 1u) << 8u));
+-    else if (kind == 4u)
+-        writeBits(pixel & 0x3FFFFFu, 0u, 8u, dataByte(k));
+-    else if (kind == 6u)
+-        writeBits((pixel * 4u + 3u) & 0x3FFFFFu, 0u, 8u, dataByte(k));
+-    else
++    float fabsQ(float q)
+     {
+-        uint nibble = (dataByte(k >> 1u) >> ((k & 1u) * 4u)) & 0xFu;
+-        if (kind == 5u)
+-            writeBits((pixel >> 1u) & 0x3FFFFFu, (pixel & 1u) * 4u, 4u, nibble);
+-        else
+-            writeBits((pixel * 4u + 3u) & 0x3FFFFFu, kind == 8u ? 4u : 0u, 4u, nibble);
++        return (std::fabs(q) > 1.0e-8f) ? q : 1.0f;
++    }
++
++    // Sampler::texelKind of a texture format.
++    uint32_t texelKindOf(uint32_t psm)
++    {
++        switch (psm)
++        {
++        case GS_PSM_CT32: case GS_PSM_Z32: return 1u;
++        case GS_PSM_CT24: case GS_PSM_Z24: return 2u;
++        case GS_PSM_CT16: case GS_PSM_CT16S: case GS_PSM_Z16: case GS_PSM_Z16S: return 3u;
++        case GS_PSM_T8: return 4u;
++        case GS_PSM_T4: return 5u;
++        case GS_PSM_T8H: return 6u;
++        case GS_PSM_T4HL: return 7u;
++        case GS_PSM_T4HH: return 8u;
++        default: return 0u;
++        }
+     }
+-}
+-)";
+ }
+ 
+ std::unique_ptr<GSGpuBackend> GSGpuBackend::Create(std::string &error)
+@@ -136,6 +314,9 @@ std::unique_ptr<GSGpuBackend> GSGpuBackend::Create(std::string &error)
+     if (!backend->m_gpu)
+         return nullptr;
+     backend->m_gpu->MakeCurrent();
++    backend->m_owner = std::this_thread::get_id();
++    const char *timing = std::getenv("PS2X_GS_GPU_TIMING");
++    backend->m_timing = timing && timing[0] == '1';
+     if (!backend->Build(error))
+         return nullptr;
+     return backend;
+@@ -143,19 +324,39 @@ std::unique_ptr<GSGpuBackend> GSGpuBackend::Create(std::string &error)
+ 
+ GSGpuBackend::~GSGpuBackend()
+ {
+-    if (m_gpu)
++    if (!m_gpu)
++        return;
++    for (Readback &readback : m_readbacks)
+     {
+-        m_gpu->DeleteBuffer(m_vram);
+-        m_gpu->DeleteBuffer(m_swizzle);
+-        if (m_staging)
+-            m_gpu->DeleteBuffer(m_staging);
++        m_gpu->DeleteFence(readback.fence);
++        if (readback.buffer)
++            m_gpu->DeleteBuffer(readback.buffer);
+     }
++    for (uint32_t buffer : {m_vram, m_swizzle, m_staging, m_primBuffer, m_tileBuffer, m_listBuffer, m_pageMapBuffer, m_clutBuffer,
++                            m_uploadDataBuffer, m_uploadChunkBuffer, m_uploadGroupBuffer})
++        if (buffer)
++            m_gpu->DeleteBuffer(buffer);
++}
++
++void GSGpuBackend::DetachFromThread()
++{
++    m_gpu->ReleaseCurrent();
++}
++
++void GSGpuBackend::AttachToThread()
++{
++    MakeCurrent();
++}
++
++void GSGpuBackend::MakeCurrent()
++{
++    m_gpu->MakeCurrent();
++    m_owner = std::this_thread::get_id();
+ }
+ 
+ bool GSGpuBackend::Build(std::string &error)
+ {
+     GSMem::InitLookupTables();
+-    // Swizzle tables: per layout a header (shifts, masks, sizes), the row parts and the column parts.
+     std::vector<uint32_t> tables;
+     for (uint8_t psm : kLayouts)
+     {
+@@ -168,36 +369,685 @@ bool GSGpuBackend::Build(std::string &error)
+         tables.insert(tables.end(), f.col, f.col + static_cast<size_t>(f.period) * kColumns);
+     }
+     m_swizzle = m_gpu->CreateBuffer(tables.size() * 4u, tables.data());
+-    m_vram = m_gpu->CreateBuffer(GSMem::MEMORY_SIZE);
+-    m_uploadProgram = m_gpu->CreateProgram(std::string(kCommonGlsl) + kUploadGlsl, error);
+-    return m_uploadProgram != 0u;
++    // VRAM, then one 8 KiB snapshot slot per page.
++    m_vram = m_gpu->CreateBuffer(static_cast<size_t>(kVramWords) * 2u * 4u);
++    m_clutBuffer = m_gpu->CreateBuffer(static_cast<size_t>(kClutInstances) * 256u * 4u);
++    m_pageMapBuffer = m_gpu->CreateBuffer(512u * 4u);
++    const std::string common(kGpuCommonGlsl);
++    m_uploadProgram = m_gpu->CreateProgram(common + kGpuUploadGlsl, error);
++    if (!m_uploadProgram)
++        return false;
++    m_copyProgram = m_gpu->CreateProgram(common + kGpuCopyGlsl, error);
++    if (!m_copyProgram)
++        return false;
++    m_clutProgram = m_gpu->CreateProgram(common + kGpuClutGlsl, error);
++    if (!m_clutProgram)
++        return false;
++    // PS2X_GS_GPU_DEFINES=A,B: #define A and B in the drawing kernel (experiments).
++    std::string defines;
++    if (const char *env = std::getenv("PS2X_GS_GPU_DEFINES"))
++    {
++        std::string list = env;
++        for (size_t start = 0; start < list.size();)
++        {
++            const size_t end = std::min(list.find(',', start), list.size());
++            if (end > start)
++                defines += "#define " + list.substr(start, end - start) + "\n";
++            start = end + 1u;
++        }
++    }
++    m_rasterProgram = m_gpu->CreateProgram(defines + common + kGpuRasterGlsl, error);
++    if (!m_rasterProgram)
++        return false;
++    m_copyCountLocation = m_gpu->UniformLocation(m_copyProgram, "count");
++    static const char *const clutUniforms[13] = {"source", "target", "tables", "base", "rowStride", "cpsmKind", "firstEntry",
++                                                 "entryCount", "csm2", "cou", "cov", "destinationBase", "suffix"};
++    for (size_t i = 0; i < 13u; ++i)
++        m_clutLocations[i] = m_gpu->UniformLocation(m_clutProgram, clutUniforms[i]);
++    m_tileLists.resize(static_cast<size_t>(kTilesPerRow) * kTilesPerRow);
++    m_host.assign(GSMem::MEMORY_SIZE, 0u);
++    m_cpu = std::make_unique<GSCpuBackend>(false);
++    m_cpu->Initialize(m_host.data(), static_cast<uint32_t>(m_host.size()));
++    const std::vector<uint32_t> zeroClut(256u, 0u);
++    m_gpu->Upload(m_clutBuffer, 0, zeroClut.size() * 4u, zeroClut.data());
++    return true;
+ }
+ 
+ void GSGpuBackend::LoadVram(const uint8_t *vram, size_t bytes)
+ {
++    DrawBatch();
+     m_gpu->Upload(m_vram, 0, std::min<size_t>(bytes, GSMem::MEMORY_SIZE), vram);
+ }
+ 
+-void GSGpuBackend::ReadVram(std::vector<uint8_t> &out)
++void GSGpuBackend::ReadVramAll(std::vector<uint8_t> &out)
+ {
++    DrawBatch();
+     out.resize(GSMem::MEMORY_SIZE);
+     m_gpu->Barrier();
+     m_gpu->Download(m_vram, 0, out.size(), out.data());
+ }
+ 
++void GSGpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
++{
++    if (vram)
++        LoadVram(vram, vramSize);
++}
++
++void GSGpuBackend::Reset()
++{
++    DrawBatch();
++    m_clutCbp.fill(0u);
++    m_clutInstance = (m_clutInstance + 1u) % kClutInstances;
++    const std::vector<uint32_t> zeroClut(256u, 0u);
++    m_gpu->Upload(m_clutBuffer, static_cast<size_t>(m_clutInstance) * 1024u, 1024u, zeroClut.data());
++    m_uploadActive = false;
++}
++
++void GSGpuBackend::SetClutState(const GSCpuBackend::ClutState &state)
++{
++    DrawBatch();
++    m_clutCbp = state.cbp;
++    m_clutInstance = (m_clutInstance + 1u) % kClutInstances;
++    m_gpu->Upload(m_clutBuffer, static_cast<size_t>(m_clutInstance) * 1024u, 1024u, state.clut.data());
++}
++
++template <typename Op>
++void GSGpuBackend::Fallback(bool writesVram, Op &&op)
++{
++    // The CPU backend works on a host copy of VRAM and of the current CLUT.
++    ++m_stats.fallbacks;
++    DrawBatch();
++    m_gpu->Barrier();
++    m_gpu->Download(m_vram, 0, GSMem::MEMORY_SIZE, m_host.data());
++    GSCpuBackend::ClutState clut;
++    m_gpu->Download(m_clutBuffer, static_cast<size_t>(m_clutInstance) * 1024u, 1024u, clut.clut.data());
++    clut.cbp = m_clutCbp;
++    m_cpu->SetClutState(clut);
++    op();
++    m_cpu->Flush();
++    if (writesVram)
++        m_gpu->Upload(m_vram, 0, GSMem::MEMORY_SIZE, m_host.data());
++}
++
++void GSGpuBackend::Submit(const GSPrimitiveBatch &batch)
++{
++    ScopedMs timer(m_timing ? &m_stats.submitMs : nullptr);
++    const GSDrawState &state = batch.state;
++    const GSContext &ctx = state.context;
++    const auto type = state.prim.type;
++    const bool triangle = type == GS_PRIM_TRIANGLE || type == GS_PRIM_TRISTRIP || type == GS_PRIM_TRIFAN;
++    const bool sprite = type == GS_PRIM_SPRITE;
++    const int fbLayout = layoutIndex(ctx.frame.psm);
++    const int zLayout = layoutIndex(ctx.zbuf.psm);
++    const bool fbSupported = ctx.frame.psm == GS_PSM_CT32 || ctx.frame.psm == GS_PSM_CT24 || ctx.frame.psm == GS_PSM_CT16 ||
++                             ctx.frame.psm == GS_PSM_CT16S;
++    const bool zSupported = ctx.zbuf.psm == GS_PSM_Z32 || ctx.zbuf.psm == GS_PSM_Z24 || ctx.zbuf.psm == GS_PSM_Z16 ||
++                            ctx.zbuf.psm == GS_PSM_Z16S;
++    const bool texSupported = !state.prim.tme || texelKindOf(ctx.tex0.psm) != 0u;
++    if (!(triangle || sprite) || batch.vertexCount == 0u || !fbSupported || !zSupported || !texSupported || fbLayout < 0 ||
++        zLayout < 0)
++    {
++        Fallback(true, [&]()
++                 { m_cpu->Submit(batch); });
++        return;
++    }
++
++    // The record: the per-primitive part of DrawSprite / DrawTriangle, BuildPixelPipe and BuildSampler.
++    uint32_t r[kPrimWords] = {};
++    int boxX0 = 0, boxY0 = 0, boxX1 = 0, boxY1 = 0;
++    const int ofx = ctx.xyoffset.ofx >> 4;
++    const int ofy = ctx.xyoffset.ofy >> 4;
++    if (sprite)
++    {
++        const GSVertex &v0 = batch.vertices[0];
++        const GSVertex &v1 = batch.vertices[1];
++        int x0 = static_cast<int>(v0.x) - ofx;
++        int y0 = static_cast<int>(v0.y) - ofy;
++        int x1 = static_cast<int>(v1.x) - ofx;
++        int y1 = static_cast<int>(v1.y) - ofy;
++        if (x0 > x1)
++            std::swap(x0, x1);
++        if (y0 > y1)
++            std::swap(y0, y1);
++        const int unclippedX0 = x0, unclippedY0 = y0;
++        const int spanX = std::max(1, x1 - x0);
++        const int spanY = std::max(1, y1 - y0);
++        const int unclippedX1 = unclippedX0 + spanX - 1;
++        const int unclippedY1 = unclippedY0 + spanY - 1;
++        if (unclippedX1 < ctx.scissor.x0 || unclippedX0 > ctx.scissor.x1 || unclippedY1 < ctx.scissor.y0 || unclippedY0 > ctx.scissor.y1)
++            return;
++        boxX0 = clampInt(unclippedX0, ctx.scissor.x0, ctx.scissor.x1);
++        boxY0 = clampInt(unclippedY0, ctx.scissor.y0, ctx.scissor.y1);
++        boxX1 = clampInt(unclippedX1, ctx.scissor.x0, ctx.scissor.x1);
++        boxY1 = clampInt(unclippedY1, ctx.scissor.y0, ctx.scissor.y1);
++        float u0f = 0.0f, v0f = 0.0f, u1f = 0.0f, v1f = 0.0f;
++        if (state.prim.tme)
++        {
++            const int texW = state.textureWidth, texH = state.textureHeight;
++            if (state.prim.fst)
++            {
++                u0f = static_cast<float>(v0.u >> 4);
++                v0f = static_cast<float>(v0.v >> 4);
++                u1f = static_cast<float>(v1.u >> 4);
++                v1f = static_cast<float>(v1.v >> 4);
++            }
++            else
++            {
++                const float q0 = fabsQ(v0.q);
++                const float q1 = fabsQ(v1.q);
++                u0f = (v0.s / q0) * static_cast<float>(texW);
++                v0f = (v0.t / q0) * static_cast<float>(texH);
++                u1f = (v1.s / q1) * static_cast<float>(texW);
++                v1f = (v1.t / q1) * static_cast<float>(texH);
++            }
++        }
++        float spriteW = static_cast<float>(spanX), spriteH = static_cast<float>(spanY);
++        if (spriteW < 1.0f)
++            spriteW = 1.0f;
++        if (spriteH < 1.0f)
++            spriteH = 1.0f;
++        r[0] = 1u;
++        r[32] = static_cast<uint32_t>(unclippedX0);
++        r[33] = static_cast<uint32_t>(unclippedY0);
++        r[34] = floatBits(spriteW);
++        r[35] = floatBits(spriteH);
++        r[36] = floatBits(u0f);
++        r[37] = floatBits(v0f);
++        r[38] = floatBits(u1f);
++        r[39] = floatBits(v1f);
++        r[40] = static_cast<uint32_t>(v1.z);
++        r[41] = static_cast<uint32_t>(v1.r) | (static_cast<uint32_t>(v1.g) << 8u) | (static_cast<uint32_t>(v1.b) << 16u) |
++                (static_cast<uint32_t>(v1.a) << 24u);
++        r[42] = v1.fog;
++    }
++    else
++    {
++        const GSVertex &v0 = batch.vertices[0];
++        const GSVertex &v1 = batch.vertices[1];
++        const GSVertex &v2 = batch.vertices[2];
++        const float fx0 = v0.x - static_cast<float>(ofx), fy0 = v0.y - static_cast<float>(ofy);
++        const float fx1 = v1.x - static_cast<float>(ofx), fy1 = v1.y - static_cast<float>(ofy);
++        const float fx2 = v2.x - static_cast<float>(ofx), fy2 = v2.y - static_cast<float>(ofy);
++        int minX = static_cast<int>(std::floor(std::min({fx0, fx1, fx2})));
++        int maxX = static_cast<int>(std::ceil(std::max({fx0, fx1, fx2})));
++        int minY = static_cast<int>(std::floor(std::min({fy0, fy1, fy2})));
++        int maxY = static_cast<int>(std::ceil(std::max({fy0, fy1, fy2})));
++        boxX0 = clampInt(minX, ctx.scissor.x0, ctx.scissor.x1);
++        boxX1 = clampInt(maxX, ctx.scissor.x0, ctx.scissor.x1);
++        boxY0 = clampInt(minY, ctx.scissor.y0, ctx.scissor.y1);
++        boxY1 = clampInt(maxY, ctx.scissor.y0, ctx.scissor.y1);
++        const float denom = (fy1 - fy2) * (fx0 - fx2) + (fx2 - fx1) * (fy0 - fy2);
++        if (std::fabs(denom) < 0.001f)
++            return;
++        const float winding = (denom < 0.0f) ? -1.0f : 1.0f;
++        const float invAbsDenom = 1.0f / std::fabs(denom);
++        r[0] = 2u;
++        const float coords[6] = {fx0, fy0, fx1, fy1, fx2, fy2};
++        for (uint32_t i = 0; i < 6u; ++i)
++            r[32 + i] = floatBits(coords[i]);
++        r[38] = floatBits(winding);
++        r[39] = floatBits(invAbsDenom);
++        const GSVertex *vertices[3] = {&v0, &v1, &v2};
++        for (uint32_t i = 0; i < 3u; ++i)
++        {
++            const GSVertex &v = *vertices[i];
++            uint64_t zBits = 0;
++            std::memcpy(&zBits, &v.z, sizeof(zBits));
++            r[40 + 2 * i] = static_cast<uint32_t>(zBits);
++            r[41 + 2 * i] = static_cast<uint32_t>(zBits >> 32u);
++            r[46 + i] = static_cast<uint32_t>(v.r) | (static_cast<uint32_t>(v.g) << 8u) | (static_cast<uint32_t>(v.b) << 16u) |
++                        (static_cast<uint32_t>(v.a) << 24u);
++            r[50 + 3 * i] = floatBits(v.s);
++            r[51 + 3 * i] = floatBits(v.t);
++            r[52 + 3 * i] = floatBits(v.q);
++            r[59 + i] = static_cast<uint32_t>(v.u) | (static_cast<uint32_t>(v.v) << 16u);
++        }
++        r[49] = static_cast<uint32_t>(v0.fog) | (static_cast<uint32_t>(v1.fog) << 8u) | (static_cast<uint32_t>(v2.fog) << 16u);
++    }
++    if (boxX0 > boxX1 || boxY0 > boxY1)
++        return;
++
++    // Pixel pipeline (BuildPixelPipe).
++    const uint32_t fpsm = ctx.frame.psm;
++    const bool dateRead = ((ctx.test >> 14) & 0x1u) != 0u && (fpsm == GS_PSM_CT32 || fpsm == GS_PSM_CT16 || fpsm == GS_PSM_CT16S);
++    r[0] |= (state.prim.iip ? 1u << 2u : 0u) | (state.prim.tme ? 1u << 3u : 0u) | (state.prim.fst ? 1u << 4u : 0u) |
++            (state.prim.fge ? 1u << 5u : 0u) | (state.prim.abe ? 1u << 6u : 0u) | (state.pabe ? 1u << 7u : 0u) |
++            (((ctx.fba & 0x1ull) != 0ull && fpsm != GS_PSM_CT24) ? 1u << 8u : 0u) | (state.linearFilter ? 1u << 9u : 0u) |
++            (ctx.zbuf.zmask ? 1u << 10u : 0u) | (dateRead ? 1u << 11u : 0u) | ((ctx.test & 0x1u) != 0u ? 1u << 13u : 0u) |
++            (bitsPerPixel(static_cast<uint8_t>(fpsm)) == 16u ? 1u << 14u : 0u) | (fpsm == GS_PSM_CT24 ? 1u << 15u : 0u);
++    r[1] = static_cast<uint32_t>(boxX0) | (static_cast<uint32_t>(boxY0) << 16u);
++    r[2] = static_cast<uint32_t>(boxX1) | (static_cast<uint32_t>(boxY1) << 16u);
++    r[3] = static_cast<uint32_t>(ctx.scissor.x0) | (static_cast<uint32_t>(ctx.scissor.y0) << 16u);
++    r[4] = static_cast<uint32_t>(ctx.scissor.x1) | (static_cast<uint32_t>(ctx.scissor.y1) << 16u);
++    const uint32_t fbw = std::max<uint32_t>(ctx.frame.fbw, 1u);
++    const GSSwizzle::Format &fbFormat = *GSSwizzle::Get(fpsm);
++    r[5] = m_layoutOffset[static_cast<size_t>(fbLayout)];
++    r[6] = GSSwizzle::Base(fbFormat, framePageBaseToBlock(ctx.frame.fbp));
++    r[7] = GSSwizzle::RowStride(fbFormat, fbw);
++    r[8] = ctx.frame.fbmsk;
++    const uint32_t fbKind = fpsm == GS_PSM_CT32 ? 1u : (fpsm == GS_PSM_CT24 ? 2u : 3u);
++    r[9] = fbKind | (fpsm << 8u);
++    const GSSwizzle::Format &zFormat = *GSSwizzle::Get(ctx.zbuf.psm);
++    r[10] = m_layoutOffset[static_cast<size_t>(zLayout)];
++    r[11] = GSSwizzle::Base(zFormat, framePageBaseToBlock(ctx.zbuf.zbp));
++    r[12] = GSSwizzle::RowStride(zFormat, fbw);
++    const uint32_t zKind = ctx.zbuf.psm == GS_PSM_Z32 ? 1u : (ctx.zbuf.psm == GS_PSM_Z24 ? 2u : 3u);
++    const uint32_t ztest = static_cast<uint32_t>((ctx.test >> 17) & 3u);
++    r[13] = zKind | (ztest << 8u);
++    r[14] = static_cast<uint32_t>(ctx.test);
++    r[15] = static_cast<uint32_t>(ctx.alpha & 3u) | (static_cast<uint32_t>((ctx.alpha >> 2) & 3u) << 2u) |
++            (static_cast<uint32_t>((ctx.alpha >> 4) & 3u) << 4u) | (static_cast<uint32_t>((ctx.alpha >> 6) & 3u) << 6u) |
++            (static_cast<uint32_t>((ctx.alpha >> 32) & 0xFFu) << 8u);
++    r[16] = static_cast<uint32_t>(state.fogR) | (static_cast<uint32_t>(state.fogG) << 8u) | (static_cast<uint32_t>(state.fogB) << 16u);
++
++    // Sampler (BuildSampler).
++    std::bitset<512> reads;
++    TexRect texRect;
++    if (state.prim.tme)
++    {
++        const GSTex0Reg &tex = ctx.tex0;
++        const int texLayout = layoutIndex(tex.psm);
++        const GSSwizzle::Format &texFormat = *GSSwizzle::Get(tex.psm);
++        r[17] = m_layoutOffset[static_cast<size_t>(texLayout)];
++        r[18] = GSSwizzle::Base(texFormat, tex.tbp0);
++        r[19] = GSSwizzle::RowStride(texFormat, tex.tbw);
++        uint32_t sampleKind = 0u;
++        switch (tex.psm)
++        {
++        case GS_PSM_CT32: case GS_PSM_Z32: case GS_PSM_CT24: case GS_PSM_Z24: sampleKind = 1u; break;
++        case GS_PSM_CT16: case GS_PSM_CT16S: case GS_PSM_Z16: case GS_PSM_Z16S: sampleKind = 2u; break;
++        default: sampleKind = 3u; break;
++        }
++        const uint64_t clamp = ctx.clamp;
++        r[20] = texelKindOf(tex.psm) | (sampleKind << 8u) | (static_cast<uint32_t>(clamp & 0x3u) << 16u) |
++                (static_cast<uint32_t>((clamp >> 2) & 0x3u) << 18u) | (static_cast<uint32_t>(tex.tfx & 3u) << 12u) |
++                (static_cast<uint32_t>(tex.tcc & 1u) << 14u) | (static_cast<uint32_t>(tex.psm) << 24u);
++        r[21] = static_cast<uint32_t>(state.textureWidth) | (static_cast<uint32_t>(state.textureHeight) << 16u);
++        r[22] = static_cast<uint32_t>((clamp >> 4) & 0x3FFu) | (static_cast<uint32_t>((clamp >> 14) & 0x3FFu) << 16u);
++        r[23] = static_cast<uint32_t>((clamp >> 24) & 0x3FFu) | (static_cast<uint32_t>((clamp >> 34) & 0x3FFu) << 16u);
++        r[24] = static_cast<uint32_t>(state.texa.ta0) | (static_cast<uint32_t>(state.texa.ta1) << 8u) |
++                (state.texa.aem ? 1u << 16u : 0u);
++        r[25] = m_clutInstance;
++        r[26] = static_cast<uint32_t>(tex.cpsm) | (static_cast<uint32_t>(tex.csm) << 8u) | (static_cast<uint32_t>(tex.csa) << 16u);
++        r[27] = floatBits(static_cast<float>(state.textureWidth));
++        r[28] = floatBits(static_cast<float>(state.textureHeight));
++        reads = textureReadPages(batch, sprite && state.prim.fst && !state.linearFilter, texRect);
++    }
++
++    // Pages it draws (MarkPendingWritesUnlocked): the box with a pixel of margin, frame and Z buffer.
++    std::bitset<512> writes;
++    const bool zUsed = !ctx.zbuf.zmask || ztest >= 2u;
++    std::vector<PageUse> &uses = m_pageUses;
++    uses.clear();
++    {
++        const GSVertex *vs = batch.vertices.data();
++        const uint32_t count = std::min<uint32_t>(batch.vertexCount, 3u);
++        float minX = vs[0].x, maxX = minX, minY = vs[0].y, maxY = minY;
++        for (uint32_t i = 1; i < count; ++i)
++        {
++            minX = std::min(minX, vs[i].x);
++            maxX = std::max(maxX, vs[i].x);
++            minY = std::min(minY, vs[i].y);
++            maxY = std::max(maxY, vs[i].y);
++        }
++        const int x0 = std::max<int>(static_cast<int>(std::floor(minX)) - ofx - 1, ctx.scissor.x0);
++        const int x1 = std::min<int>(static_cast<int>(std::ceil(maxX)) - ofx + 1, ctx.scissor.x1);
++        const int y0 = std::max<int>(static_cast<int>(std::floor(minY)) - ofy - 1, ctx.scissor.y0);
++        const int y1 = std::min<int>(static_cast<int>(std::ceil(maxY)) - ofy + 1, ctx.scissor.y1);
++        auto mark = [&](uint32_t basePage, uint32_t psm)
++        {
++            const uint32_t pageHeight = (psm & 0x2u) ? 64u : 32u;
++            uint32_t family = 0u;
++            switch (psm)
++            {
++            case GS_PSM_CT16: family = 1u; break;
++            case GS_PSM_CT16S: family = 2u; break;
++            case GS_PSM_Z32: case GS_PSM_Z24: family = 3u; break;
++            case GS_PSM_Z16: family = 4u; break;
++            case GS_PSM_Z16S: family = 5u; break;
++            default: family = 0u; break;
++            }
++            const uint32_t layout = (basePage & 0x1FFu) | ((fbw & 0x3Fu) << 9u) | (family << 15u) | 0x80000000u;
++            if (x0 > x1 || y0 > y1)
++                return;
++            for (uint32_t row = static_cast<uint32_t>(y0) / pageHeight; row <= static_cast<uint32_t>(y1) / pageHeight; ++row)
++                for (uint32_t col = static_cast<uint32_t>(x0) / 64u; col <= static_cast<uint32_t>(x1) / 64u; ++col)
++                {
++                    const uint32_t page = (basePage + row * fbw + col) & 511u;
++                    writes.set(page);
++                    uses.push_back({page, layout});
++                }
++        };
++        mark(ctx.frame.fbp, fpsm);
++        if (zUsed)
++            mark(ctx.zbuf.zbp, ctx.zbuf.psm);
++    }
++
++    // A primitive starts a new batch when it samples a page the batch draws into (read after write) or draws a
++    // page the batch draws with another layout (pixels of other threads).
++    int reason = m_primCount >= kMaxBatchPrimitives ? kEndFull : -1;
++    if (reason < 0 && (reads & m_batchWrites).any())
++    {
++        // Same pages: the texels it samples may still be in blocks the batch does not draw.
++        UpdateWriteBlocks();
++        const GSTex0Reg &tex = ctx.tex0;
++        if (forEachColumn(tex.tbp0, tex.tbw, tex.psm, texRect.x0, texRect.y0, texRect.x1, texRect.y1,
++                         [&](uint32_t column) { return m_batchWriteBlocks.test(column); }))
++            reason = kEndReadAfterWrite;
++        else
++            ++m_stats.sharedPages;
++    }
++    for (const PageUse &use : uses)
++        if (reason < 0 && m_batchWrites.test(use.page) && m_pageLayout[use.page] != use.layout)
++            reason = kEndLayout;
++    static int rawLog = []
++    {
++        const char *env = std::getenv("PS2X_GS_GPU_RAW_LOG");
++        return env ? std::atoi(env) : 0;
++    }();
++    if (reason == kEndReadAfterWrite && rawLog > 0)
++    {
++        --rawLog;
++        const std::bitset<512> both = reads & m_batchWrites;
++        int page = -1;
++        for (int i = 0; i < 512 && page < 0; ++i)
++            if (both.test(static_cast<size_t>(i)))
++                page = i;
++        std::fprintf(stderr, "[gpu-raw] prims %u page %d (%zu pages) type %u fb %u/%u/psm%u z %u/psm%u tex %u/%u/psm%u %ux%u fst %u "
++                             "uv (%u,%u)-(%u,%u) xy (%.0f,%.0f)-(%.0f,%.0f)\n",
++                     m_primCount, page, both.count(), static_cast<unsigned>(type), ctx.frame.fbp, ctx.frame.fbw, fpsm,
++                     ctx.zbuf.zbp, ctx.zbuf.psm, ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm, state.textureWidth,
++                     state.textureHeight, state.prim.fst ? 1u : 0u, batch.vertices[0].u >> 4, batch.vertices[0].v >> 4,
++                     batch.vertices[1].u >> 4, batch.vertices[1].v >> 4, batch.vertices[0].x - ofx, batch.vertices[0].y - ofy,
++                     batch.vertices[1].x - ofx, batch.vertices[1].y - ofy);
++    }
++    if (reason >= 0)
++        DrawBatch(reason);
++    for (const PageUse &use : uses)
++        m_pageLayout[use.page] = use.layout;
++    m_batchWrites |= writes;
++    // The pixels it draws (blocks are computed when a later primitive samples one of these pages).
++    auto addWriteRect = [&](uint32_t bp, uint32_t psm)
++    {
++        const WriteRect rect{bp, fbw, psm, static_cast<uint32_t>(boxX0), static_cast<uint32_t>(boxY0),
++                             static_cast<uint32_t>(boxX1), static_cast<uint32_t>(boxY1)};
++        for (size_t i = m_writeRects.size(), seen = 0; i > m_writeRectsDone && seen < 2u; --i, ++seen)
++        {
++            const WriteRect &last = m_writeRects[i - 1u];
++            if (last.bp == rect.bp && last.bw == rect.bw && last.psm == rect.psm && last.x0 <= rect.x0 && last.y0 <= rect.y0 &&
++                last.x1 >= rect.x1 && last.y1 >= rect.y1)
++                return;
++        }
++        m_writeRects.push_back(rect);
++    };
++    // A fully masked frame buffer gets its own value back, a Z buffer under ZMSK is only read.
++    if (ctx.frame.fbmsk != 0xFFFFFFFFu)
++        addWriteRect(framePageBaseToBlock(ctx.frame.fbp), fpsm);
++    if (!ctx.zbuf.zmask)
++        addWriteRect(framePageBaseToBlock(ctx.zbuf.zbp), ctx.zbuf.psm);
++    m_batchReads |= reads;
++
++    // Record and tiles.
++    const uint32_t index = m_primCount++;
++    m_prims.insert(m_prims.end(), r, r + kPrimWords);
++    for (uint32_t ty = static_cast<uint32_t>(boxY0) >> kTileShift; ty <= static_cast<uint32_t>(boxY1) >> kTileShift; ++ty)
++        for (uint32_t tx = static_cast<uint32_t>(boxX0) >> kTileShift; tx <= static_cast<uint32_t>(boxX1) >> kTileShift; ++tx)
++        {
++            std::vector<uint32_t> &tileList = m_tileLists[ty * kTilesPerRow + tx];
++            if (tileList.empty())
++                m_usedTiles.push_back(ty * kTilesPerRow + tx);
++            tileList.push_back(index);
++        }
++    ++m_stats.primitives;
++}
++
++void GSGpuBackend::UpdateWriteBlocks()
++{
++    for (; m_writeRectsDone < m_writeRects.size(); ++m_writeRectsDone)
++    {
++        const WriteRect &rect = m_writeRects[m_writeRectsDone];
++        forEachColumn(rect.bp, rect.bw, rect.psm, rect.x0, rect.y0, rect.x1, rect.y1, [&](uint32_t block)
++                     {
++                         m_batchWriteBlocks.set(block);
++                         return false;
++                     });
++    }
++}
++
++void GSGpuBackend::DrawBatch(int reason)
++{
++    // Uploads queued before the batch's primitives were submitted go first (they touch nothing it uses).
++    FlushUploads();
++    if (m_primCount == 0u)
++        return;
++    ScopedMs timer(m_timing ? &m_stats.drawMs : nullptr);
++    ++m_stats.batches;
++    ++m_stats.ended[reason & 7];
++    // Texture pages the batch samples and draws into: copied first, so every primitive samples them as they
++    // were before the batch (a primitive that samples a page drawn earlier in the batch started a new one).
++    std::array<uint32_t, 512> pageMap;
++    std::vector<uint32_t> copies;
++    const std::bitset<512> snapshot = m_batchReads & m_batchWrites;
++    for (uint32_t page = 0; page < 512u; ++page)
++    {
++        pageMap[page] = page * kPageWords;
++        if (snapshot.test(page))
++        {
++            pageMap[page] = kVramWords + page * kPageWords;
++            copies.push_back(page);
++            copies.push_back(pageMap[page]);
++        }
++    }
++    m_gpu->Upload(m_pageMapBuffer, 0, sizeof(pageMap), pageMap.data());
++    if (!copies.empty())
++    {
++        m_stats.snapshotPages += copies.size() / 2u;
++        const size_t bytes = copies.size() * 4u;
++        if (bytes > m_stagingSize)
++        {
++            if (m_staging)
++                m_gpu->DeleteBuffer(m_staging);
++            m_stagingSize = std::max<size_t>(bytes, 64u * 1024u);
++            m_staging = m_gpu->CreateBuffer(m_stagingSize);
++        }
++        m_gpu->Upload(m_staging, 0, bytes, copies.data());
++        m_gpu->UseProgram(m_copyProgram);
++        m_gpu->SetUniformAt(m_copyCountLocation, static_cast<uint32_t>(copies.size() / 2u));
++        m_gpu->BindStorage(0, m_vram);
++        m_gpu->BindStorage(2, m_staging);
++        m_gpu->Dispatch(static_cast<uint32_t>(copies.size() / 2u));
++        m_gpu->Barrier();
++    }
++
++    // Tiles: origin, first list entry, count.
++    std::vector<uint32_t> tiles;
++    std::vector<uint32_t> lists;
++    tiles.reserve(m_usedTiles.size() * 3u);
++    for (uint32_t tile : m_usedTiles)
++    {
++        std::vector<uint32_t> &tileList = m_tileLists[tile];
++        tiles.push_back((tile % kTilesPerRow) | ((tile / kTilesPerRow) << 16u));
++        tiles.push_back(static_cast<uint32_t>(lists.size()));
++        tiles.push_back(static_cast<uint32_t>(tileList.size()));
++        lists.insert(lists.end(), tileList.begin(), tileList.end());
++        tileList.clear();
++    }
++    auto ensure = [&](uint32_t &buffer, size_t &capacity, size_t bytes)
++    {
++        if (bytes <= capacity)
++            return;
++        if (buffer)
++            m_gpu->DeleteBuffer(buffer);
++        capacity = std::max<size_t>(bytes * 2u, 1u << 20u);
++        buffer = m_gpu->CreateBuffer(capacity);
++    };
++    ensure(m_primBuffer, m_primCapacity, m_prims.size() * 4u);
++    ensure(m_tileBuffer, m_tileCapacity, tiles.size() * 4u);
++    ensure(m_listBuffer, m_listCapacity, lists.size() * 4u);
++    m_gpu->Upload(m_primBuffer, 0, m_prims.size() * 4u, m_prims.data());
++    m_gpu->Upload(m_tileBuffer, 0, tiles.size() * 4u, tiles.data());
++    m_gpu->Upload(m_listBuffer, 0, lists.size() * 4u, lists.data());
++    m_gpu->UseProgram(m_rasterProgram);
++    m_gpu->BindStorage(0, m_vram);
++    m_gpu->BindStorage(1, m_swizzle);
++    m_gpu->BindStorage(2, m_primBuffer);
++    m_gpu->BindStorage(3, m_tileBuffer);
++    m_gpu->BindStorage(4, m_listBuffer);
++    m_gpu->BindStorage(5, m_pageMapBuffer);
++    m_gpu->BindStorage(6, m_clutBuffer);
++    if (m_timing)
++        m_gpu->BeginTimer();
++    for (size_t first = 0; first < m_usedTiles.size(); first += 65535u)
++    {
++        // Dispatch at most 65535 tiles at a time: the tile index is the workgroup index, offset through the
++        // tile buffer binding.
++        const uint32_t groups = static_cast<uint32_t>(std::min<size_t>(65535u, m_usedTiles.size() - first));
++        if (first != 0u)
++        {
++            std::vector<uint32_t> rest(tiles.begin() + static_cast<std::ptrdiff_t>(first * 3u), tiles.end());
++            m_gpu->Upload(m_tileBuffer, 0, rest.size() * 4u, rest.data());
++        }
++        m_gpu->Dispatch(groups);
++    }
++    m_gpu->Barrier();
++    if (m_timing)
++        m_stats.gpuWaitMs += m_gpu->EndTimer();
++    m_stats.tiles += m_usedTiles.size();
++
++    m_prims.clear();
++    m_primCount = 0u;
++    m_usedTiles.clear();
++    m_batchWrites.reset();
++    m_batchReads.reset();
++    m_writeRects.clear();
++    m_writeRectsDone = 0u;
++    m_batchWriteBlocks.reset();
++    m_pageLayout.fill(0u);
++    m_clutInstancesInBatch = 0u;
++}
++
++void GSGpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
++{
++    const bool fourBit = tex0.psm == GS_PSM_T4 || tex0.psm == GS_PSM_T4HL || tex0.psm == GS_PSM_T4HH;
++    const bool eightBit = tex0.psm == GS_PSM_T8 || tex0.psm == GS_PSM_T8H;
++    if (!fourBit && !eightBit)
++        return;
++    switch (tex0.cld)
++    {
++    case 1u: break;
++    case 2u: m_clutCbp[0] = tex0.cbp; break;
++    case 3u: m_clutCbp[1] = tex0.cbp; break;
++    case 4u:
++        if (m_clutCbp[0] == tex0.cbp)
++            return;
++        m_clutCbp[0] = tex0.cbp;
++        break;
++    case 5u:
++        if (m_clutCbp[1] == tex0.cbp)
++            return;
++        m_clutCbp[1] = tex0.cbp;
++        break;
++    default:
++        return;
++    }
++    const bool sixteenBit = tex0.cpsm == GS_PSM_CT16 || tex0.cpsm == GS_PSM_CT16S;
++    const bool thirtyTwoBit = tex0.cpsm == GS_PSM_CT32 || tex0.cpsm == GS_PSM_CT24;
++    if (!sixteenBit && !thirtyTwoBit)
++        return;
++
++    // Source pages: a batch that draws into them goes first (read after write).
++    const uint32_t firstPage = tex0.cbp >> 5u;
++    const uint32_t lastPage = tex0.csm != 0u ? firstPage + 1u + (static_cast<uint32_t>(texclut.cov) / 32u + 1u) * std::max<uint32_t>(texclut.cbw, 1u)
++                                             : (tex0.cbp + 3u) >> 5u;
++    std::bitset<512> pages;
++    for (uint32_t page = firstPage; page <= lastPage; ++page)
++        pages.set(page & 511u);
++    if ((pages & m_batchWrites).any() || m_clutInstancesInBatch + 1u >= kClutInstances)
++        DrawBatch(kEndClut);
++    else if ((pages & m_uploadPages).any())
++        FlushUploads();
++
++    const uint32_t source = m_clutInstance;
++    m_clutInstance = (m_clutInstance + 1u) % kClutInstances;
++    ++m_clutInstancesInBatch;
++    ++m_stats.clutLoads;
++    const uint32_t entryCount = fourBit ? 16u : 256u;
++    const uint32_t csaMask = sixteenBit ? 0x1Fu : 0x0Fu;
++    const uint32_t destinationBase = (static_cast<uint32_t>(tex0.csa) & csaMask) << 4u;
++    const bool suffix = tex0.csm == 0u && thirtyTwoBit && !fourBit;
++    const uint32_t width = tex0.csm != 0u ? std::max<uint32_t>(texclut.cbw, 1u) : 1u;
++    const GSSwizzle::Format &format = *GSSwizzle::Get(tex0.cpsm);
++    const uint32_t values[13] = {source,
++                                 m_clutInstance,
++                                 m_layoutOffset[static_cast<size_t>(layoutIndex(tex0.cpsm))],
++                                 GSSwizzle::Base(format, tex0.cbp),
++                                 GSSwizzle::RowStride(format, width),
++                                 sixteenBit ? 3u : (tex0.cpsm == GS_PSM_CT24 ? 2u : 1u),
++                                 suffix ? destinationBase : 0u,
++                                 entryCount,
++                                 tex0.csm != 0u ? 1u : 0u,
++                                 static_cast<uint32_t>(texclut.cou),
++                                 static_cast<uint32_t>(texclut.cov),
++                                 destinationBase,
++                                 suffix ? 1u : 0u};
++    m_gpu->UseProgram(m_clutProgram);
++    for (size_t i = 0; i < 13u; ++i)
++        m_gpu->SetUniformAt(m_clutLocations[i], values[i]);
++    m_gpu->BindStorage(0, m_vram);
++    m_gpu->BindStorage(1, m_swizzle);
++    m_gpu->BindStorage(2, m_clutBuffer);
++    m_gpu->Dispatch(1u);
++    m_gpu->Barrier();
++}
++
+ void GSGpuBackend::BeginTransfer(const GSTransferCommand &command)
+ {
++    if (command.direction == 1u)
++    {
++        // Local to host: GSCpuBackend reads it from a host copy; ConsumeLocalToHostBytes hands it out.
++        m_uploadActive = false;
++        Fallback(false, [&]()
++                 { m_cpu->BeginTransfer(command); });
++        return;
++    }
++    if (command.direction == 2u)
++    {
++        m_uploadActive = false;
++        Fallback(true, [&]()
++                 { m_cpu->BeginTransfer(command); });
++        return;
++    }
+     m_transfer = command;
+     m_copied = 0u;
+     m_total = static_cast<uint32_t>(command.trxreg.rrw) * static_cast<uint32_t>(command.trxreg.rrh);
+-    m_active = command.direction == 0u && m_total != 0u;
++    m_uploadActive = command.direction == 0u && m_total != 0u;
++    m_transferPages.reset();
++    if (m_uploadActive)
++    {
++        const uint32_t dx = command.trxpos.dsax, dy = command.trxpos.dsay;
++        markRect(m_transferPages, command.bitbltbuf.dbp, command.bitbltbuf.dbw, command.bitbltbuf.dpsm, dx, dy,
++                 dx + std::max<uint32_t>(command.trxreg.rrw, 1u) - 1u, dy + std::max<uint32_t>(command.trxreg.rrh, 1u) - 1u);
++        // Queued chunks of earlier transfers that write the same pages go first.
++        if ((m_transferPages & m_uploadPages).any())
++            FlushUploads();
++    }
+ }
+ 
+ void GSGpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+ {
+-    // The pixels this chunk carries, as UploadImageUnlocked consumes them (an incomplete last pixel is dropped).
+-    if (!m_active || !data || sizeBytes == 0u)
++    if (!m_uploadActive || !data || sizeBytes == 0u)
+         return;
++    // Ahead of the pending batch unless the batch uses the destination.
++    if ((m_transferPages & m_batchWrites).any())
++        DrawBatch(kEndUploadWrite);
++    else if ((m_transferPages & m_batchReads).any())
++        DrawBatch(kEndUploadRead);
++    QueueUpload(data, sizeBytes);
++}
++
++void GSGpuBackend::QueueUpload(const uint8_t *data, uint32_t sizeBytes)
++{
++    ScopedMs timer(m_timing ? &m_stats.uploadMs : nullptr);
+     const uint32_t psm = m_transfer.bitbltbuf.dpsm;
+     const uint32_t kind = writeKind(psm);
+     const int layout = layoutIndex(psm);
+@@ -216,34 +1066,209 @@ void GSGpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+     }
+     if (count != 0u)
+     {
+-        const size_t bytes = (static_cast<size_t>(sizeBytes) + 3u) & ~size_t{3u};
+-        if (bytes > m_stagingSize)
+-        {
+-            if (m_staging)
+-                m_gpu->DeleteBuffer(m_staging);
+-            m_stagingSize = std::max<size_t>(bytes, 64u * 1024u);
+-            m_staging = m_gpu->CreateBuffer(m_stagingSize);
+-        }
+-        m_gpu->Upload(m_staging, 0, sizeBytes, data);
++        ++m_stats.uploads;
++        const uint32_t groups = (count + 255u) / 256u;
++        if (m_uploadGroups.size() / 2u + groups > 65535u || m_uploadData.size() + sizeBytes > (64u << 20u))
++            FlushUploads();
+         const GSSwizzle::Format &format = *GSSwizzle::Get(kLayouts[layout]);
+         const uint32_t dbw = std::max<uint32_t>(m_transfer.bitbltbuf.dbw, 1u);
+-        m_gpu->UseProgram(m_uploadProgram);
+-        m_gpu->SetUniform(m_uploadProgram, "tables", m_layoutOffset[static_cast<size_t>(layout)]);
+-        m_gpu->SetUniform(m_uploadProgram, "base", GSSwizzle::Base(format, m_transfer.bitbltbuf.dbp));
+-        m_gpu->SetUniform(m_uploadProgram, "rowStride", GSSwizzle::RowStride(format, dbw));
+-        m_gpu->SetUniform(m_uploadProgram, "kind", kind);
+-        m_gpu->SetUniform(m_uploadProgram, "dsax", static_cast<uint32_t>(m_transfer.trxpos.dsax));
+-        m_gpu->SetUniform(m_uploadProgram, "dsay", static_cast<uint32_t>(m_transfer.trxpos.dsay));
+-        m_gpu->SetUniform(m_uploadProgram, "rrw", static_cast<uint32_t>(m_transfer.trxreg.rrw));
+-        m_gpu->SetUniform(m_uploadProgram, "first", m_copied);
+-        m_gpu->SetUniform(m_uploadProgram, "count", count);
+-        m_gpu->BindStorage(0, m_vram);
+-        m_gpu->BindStorage(1, m_swizzle);
+-        m_gpu->BindStorage(2, m_staging);
+-        m_gpu->Dispatch((count + 255u) / 256u);
+-        m_gpu->Barrier();
++        const uint32_t chunk = static_cast<uint32_t>(m_uploadChunks.size() / 10u);
++        const uint32_t dataOffset = static_cast<uint32_t>(m_uploadData.size());
++        const uint32_t descriptor[10] = {m_layoutOffset[static_cast<size_t>(layout)],
++                                         GSSwizzle::Base(format, m_transfer.bitbltbuf.dbp),
++                                         GSSwizzle::RowStride(format, dbw),
++                                         kind,
++                                         static_cast<uint32_t>(m_transfer.trxpos.dsax),
++                                         static_cast<uint32_t>(m_transfer.trxpos.dsay),
++                                         static_cast<uint32_t>(m_transfer.trxreg.rrw),
++                                         m_copied,
++                                         count,
++                                         dataOffset};
++        m_uploadChunks.insert(m_uploadChunks.end(), descriptor, descriptor + 10);
++        m_uploadData.resize(dataOffset + ((static_cast<size_t>(sizeBytes) + 3u) & ~size_t{3u}), 0u);
++        std::memcpy(m_uploadData.data() + dataOffset, data, sizeBytes);
++        for (uint32_t g = 0; g < groups; ++g)
++        {
++            m_uploadGroups.push_back(chunk);
++            m_uploadGroups.push_back(g * 256u);
++        }
++        m_uploadPages |= m_transferPages;
+     }
+     m_copied += count;
+     if (m_copied >= m_total)
+-        m_active = false;
++        m_uploadActive = false;
++}
++
++void GSGpuBackend::FlushUploads()
++{
++    if (m_uploadChunks.empty())
++        return;
++    ScopedMs timer(m_timing ? &m_stats.uploadMs : nullptr);
++    auto ensure = [&](uint32_t &buffer, size_t &capacity, size_t bytes)
++    {
++        if (bytes <= capacity)
++            return;
++        if (buffer)
++            m_gpu->DeleteBuffer(buffer);
++        capacity = std::max<size_t>(bytes * 2u, 1u << 20u);
++        buffer = m_gpu->CreateBuffer(capacity);
++    };
++    ensure(m_uploadDataBuffer, m_uploadDataCapacity, m_uploadData.size());
++    ensure(m_uploadChunkBuffer, m_uploadChunkCapacity, m_uploadChunks.size() * 4u);
++    ensure(m_uploadGroupBuffer, m_uploadGroupCapacity, m_uploadGroups.size() * 4u);
++    m_gpu->Upload(m_uploadDataBuffer, 0, m_uploadData.size(), m_uploadData.data());
++    m_gpu->Upload(m_uploadChunkBuffer, 0, m_uploadChunks.size() * 4u, m_uploadChunks.data());
++    m_gpu->Upload(m_uploadGroupBuffer, 0, m_uploadGroups.size() * 4u, m_uploadGroups.data());
++    m_gpu->UseProgram(m_uploadProgram);
++    m_gpu->BindStorage(0, m_vram);
++    m_gpu->BindStorage(1, m_swizzle);
++    m_gpu->BindStorage(2, m_uploadDataBuffer);
++    m_gpu->BindStorage(3, m_uploadChunkBuffer);
++    m_gpu->BindStorage(4, m_uploadGroupBuffer);
++    if (m_timing)
++        m_gpu->BeginTimer();
++    m_gpu->Dispatch(static_cast<uint32_t>(m_uploadGroups.size() / 2u));
++    m_gpu->Barrier();
++    if (m_timing)
++        m_stats.uploadGpuMs += m_gpu->EndTimer();
++    ++m_stats.uploadDispatches;
++    m_uploadData.clear();
++    m_uploadChunks.clear();
++    m_uploadGroups.clear();
++    m_uploadPages.reset();
++}
++
++void GSGpuBackend::Flush()
++{
++    DrawBatch(kEndSync);
++}
++
++void GSGpuBackend::Sync(GSSyncReason)
++{
++    DrawBatch(kEndSync);
++}
++
++PresentationFrame GSGpuBackend::Present(const GSPresentationRequest &request)
++{
++    // The CPU presentation reads a host copy of VRAM (only the displayed pages could be read back; the whole
++    // VRAM for now).
++    DrawBatch(kEndSync);
++    static const bool skip = []
++    {
++        const char *env = std::getenv("PS2X_GS_GPU_NO_PRESENT");
++        return env && env[0] == '1';
++    }();
++    if (skip)
++        return {};
++    if (m_synchronousPresent)
++    {
++        m_gpu->Barrier();
++        m_gpu->Download(m_vram, 0, GSMem::MEMORY_SIZE, m_host.data());
++        return m_cpu->Present(request);
++    }
++    // Copy the displayed pages to a readback buffer behind everything queued; the frame is made from them
++    // once the copy is done (usually by the next presentation).
++    CollectReadbacks(false);
++    Readback &slot = m_readbacks[m_readbackNext];
++    if (slot.fence)
++        CollectReadbacks(true);
++    if (!slot.buffer)
++        slot.buffer = m_gpu->CreateReadbackBuffer(GSMem::MEMORY_SIZE);
++    slot.request = request;
++    slot.pages = GSCpuBackend::PresentationPages(request);
++    for (uint32_t page = 0; page < 512u;)
++    {
++        if (!slot.pages.test(page))
++        {
++            ++page;
++            continue;
++        }
++        uint32_t end = page + 1u;
++        while (end < 512u && slot.pages.test(end))
++            ++end;
++        m_gpu->CopyBuffer(m_vram, static_cast<size_t>(page) * 8192u, slot.buffer, static_cast<size_t>(page) * 8192u,
++                          static_cast<size_t>(end - page) * 8192u);
++        page = end;
++    }
++    slot.fence = m_gpu->Fence();
++    m_readbackNext = (m_readbackNext + 1u) % static_cast<uint32_t>(m_readbacks.size());
++    return m_lastFrame;
++}
++
++void GSGpuBackend::CollectReadbacks(bool wait)
++{
++    // Oldest first: the slot after the last one used.
++    for (uint32_t i = 0; i < m_readbacks.size(); ++i)
++    {
++        Readback &slot = m_readbacks[(m_readbackNext + i) % m_readbacks.size()];
++        if (!slot.fence)
++            continue;
++        if (!m_gpu->WaitFence(slot.fence, wait ? ~0ull : 0ull))
++            return;
++        m_gpu->DeleteFence(slot.fence);
++        slot.fence = nullptr;
++        for (uint32_t page = 0; page < 512u;)
++        {
++            if (!slot.pages.test(page))
++            {
++                ++page;
++                continue;
++            }
++            uint32_t end = page + 1u;
++            while (end < 512u && slot.pages.test(end))
++                ++end;
++            m_gpu->ReadBuffer(slot.buffer, static_cast<size_t>(page) * 8192u, static_cast<size_t>(end - page) * 8192u,
++                              m_host.data() + static_cast<size_t>(page) * 8192u);
++            page = end;
++        }
++        m_lastFrame = m_cpu->Present(slot.request);
++    }
++}
++
++bool GSGpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
++{
++    bool result = false;
++    Fallback(true, [&]()
++             { result = m_cpu->ClearFramebuffer(context, rgba); });
++    return result;
++}
++
++uint32_t GSGpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
++{
++    return m_cpu->ConsumeLocalToHostBytes(dst, maxBytes);
++}
++
++uint32_t GSGpuBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
++{
++    GSGpuBackend *self = const_cast<GSGpuBackend *>(this);
++    uint32_t value = 0u;
++    self->Fallback(false, [&]()
++                   { value = self->m_cpu->ReadVram(psm, base, bw, x, y); });
++    return value;
++}
++
++void GSGpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
++{
++    Fallback(true, [&]()
++             { m_cpu->WriteVram(psm, base, bw, x, y, value); });
++}
++
++void GSGpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
++{
++    const_cast<GSGpuBackend *>(this)->ReadVramAll(out);
++}
++
++GSTransferSnapshot GSGpuBackend::GetTransferSnapshot() const
++{
++    GSTransferSnapshot snapshot = m_cpu->GetTransferSnapshot();
++    if (m_uploadActive)
++    {
++        const uint32_t rrw = std::max<uint32_t>(m_transfer.trxreg.rrw, 1u);
++        snapshot.direction = 0u;
++        snapshot.totalPixels = m_total;
++        snapshot.copiedPixels = m_copied;
++        snapshot.x = m_transfer.trxpos.dsax + m_copied % rrw;
++        snapshot.y = m_transfer.trxpos.dsay + m_copied / rrw;
++    }
++    return snapshot;
+ }
+diff --git a/ps2xRuntime/src/lib/gs/gs_gpu_context.cpp b/ps2xRuntime/src/lib/gs/gs_gpu_context.cpp
+index 8e656ee..d05eb35 100644
+--- a/ps2xRuntime/src/lib/gs/gs_gpu_context.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_gpu_context.cpp
+@@ -27,6 +27,16 @@ namespace
+     constexpr GLenum GL_VERSION = 0x1F02;
+     constexpr GLbitfield GL_SHADER_STORAGE_BARRIER_BIT = 0x00002000;
+     constexpr GLbitfield GL_BUFFER_UPDATE_BARRIER_BIT = 0x00000200;
++    constexpr GLenum GL_TIME_ELAPSED = 0x88BF;
++    constexpr GLenum GL_STREAM_READ = 0x88E1;
++    constexpr GLenum GL_COPY_READ_BUFFER = 0x8F36;
++    constexpr GLenum GL_COPY_WRITE_BUFFER = 0x8F37;
++    constexpr GLenum GL_SYNC_GPU_COMMANDS_COMPLETE = 0x9117;
++    constexpr GLbitfield GL_SYNC_FLUSH_COMMANDS_BIT = 0x00000001;
++    constexpr GLenum GL_ALREADY_SIGNALED = 0x911A;
++    constexpr GLenum GL_CONDITION_SATISFIED = 0x911C;
++    using GLsync = struct __GLsync *;
++    constexpr GLenum GL_QUERY_RESULT = 0x8866;
+ }
+ 
+ #define GS_GL_FUNCTIONS(X)                                                                          \
+@@ -55,6 +65,15 @@ namespace
+     X(void, DispatchCompute, (GLuint x, GLuint y, GLuint z))                                        \
+     X(void, MemoryBarrier, (GLbitfield barriers))                                                   \
+     X(void, Finish, (void))                                                                         \
++    X(void, GenQueries, (GLsizei n, GLuint * ids))                                                  \
++    X(void, BeginQuery, (GLenum target, GLuint id))                                                 \
++    X(void, EndQuery, (GLenum target))                                                              \
++    X(void, GetQueryObjectui64v, (GLuint id, GLenum pname, unsigned long long *params))            \
++    X(void, CopyBufferSubData, (GLenum readTarget, GLenum writeTarget, GLintptr readOffset, GLintptr writeOffset, GLsizeiptr size)) \
++    X(GLsync, FenceSync, (GLenum condition, GLbitfield flags))                                      \
++    X(GLenum, ClientWaitSync, (GLsync sync, GLbitfield flags, unsigned long long timeout))         \
++    X(void, DeleteSync, (GLsync sync))                                                              \
++    X(void, Flush, (void))                                                                          \
+     X(const GLubyte *, GetString, (GLenum name))
+ 
+ struct GSGpuContext::Functions
+@@ -120,12 +139,15 @@ GSGpuContext::~GSGpuContext()
+ 
+ void GSGpuContext::MakeCurrent()
+ {
++    GLFWwindow *current = glfwGetCurrentContext();
++    m_previous = current == m_window ? nullptr : current;
+     glfwMakeContextCurrent(static_cast<GLFWwindow *>(m_window));
+ }
+ 
+ void GSGpuContext::ReleaseCurrent()
+ {
+-    glfwMakeContextCurrent(nullptr);
++    glfwMakeContextCurrent(static_cast<GLFWwindow *>(m_previous));
++    m_previous = nullptr;
+ }
+ 
+ uint32_t GSGpuContext::CreateBuffer(size_t bytes, const void *data)
+@@ -137,6 +159,49 @@ uint32_t GSGpuContext::CreateBuffer(size_t bytes, const void *data)
+     return buffer;
+ }
+ 
++uint32_t GSGpuContext::CreateReadbackBuffer(size_t bytes)
++{
++    GLuint buffer = 0;
++    m_gl->GenBuffers(1, &buffer);
++    m_gl->BindBuffer(GL_COPY_WRITE_BUFFER, buffer);
++    m_gl->BufferData(GL_COPY_WRITE_BUFFER, static_cast<GLsizeiptr>(bytes), nullptr, GL_STREAM_READ);
++    return buffer;
++}
++
++void GSGpuContext::CopyBuffer(uint32_t source, size_t sourceOffset, uint32_t target, size_t targetOffset, size_t bytes)
++{
++    m_gl->MemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
++    m_gl->BindBuffer(GL_COPY_READ_BUFFER, source);
++    m_gl->BindBuffer(GL_COPY_WRITE_BUFFER, target);
++    m_gl->CopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, static_cast<GLintptr>(sourceOffset),
++                            static_cast<GLintptr>(targetOffset), static_cast<GLsizeiptr>(bytes));
++}
++
++void GSGpuContext::ReadBuffer(uint32_t buffer, size_t offset, size_t bytes, void *data)
++{
++    m_gl->BindBuffer(GL_COPY_READ_BUFFER, buffer);
++    m_gl->GetBufferSubData(GL_COPY_READ_BUFFER, static_cast<GLintptr>(offset), static_cast<GLsizeiptr>(bytes), data);
++}
++
++void *GSGpuContext::Fence()
++{
++    void *fence = m_gl->FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
++    m_gl->Flush();
++    return fence;
++}
++
++bool GSGpuContext::WaitFence(void *fence, uint64_t timeoutNs)
++{
++    const GLenum result = m_gl->ClientWaitSync(static_cast<GLsync>(fence), GL_SYNC_FLUSH_COMMANDS_BIT, timeoutNs);
++    return result == GL_ALREADY_SIGNALED || result == GL_CONDITION_SATISFIED;
++}
++
++void GSGpuContext::DeleteFence(void *fence)
++{
++    if (fence)
++        m_gl->DeleteSync(static_cast<GLsync>(fence));
++}
++
+ void GSGpuContext::DeleteBuffer(uint32_t buffer)
+ {
+     const GLuint id = buffer;
+@@ -207,6 +272,16 @@ void GSGpuContext::SetUniform(uint32_t program, const char *name, uint32_t value
+     m_gl->Uniform1ui(m_gl->GetUniformLocation(program, name), value);
+ }
+ 
++int32_t GSGpuContext::UniformLocation(uint32_t program, const char *name)
++{
++    return m_gl->GetUniformLocation(program, name);
++}
++
++void GSGpuContext::SetUniformAt(int32_t location, uint32_t value)
++{
++    m_gl->Uniform1ui(location, value);
++}
++
+ void GSGpuContext::SetUniform(uint32_t program, const char *name, int32_t value)
+ {
+     m_gl->Uniform1i(m_gl->GetUniformLocation(program, name), value);
+@@ -226,3 +301,18 @@ void GSGpuContext::Finish()
+ {
+     m_gl->Finish();
+ }
++
++void GSGpuContext::BeginTimer()
++{
++    if (!m_timerQuery)
++        m_gl->GenQueries(1, &m_timerQuery);
++    m_gl->BeginQuery(GL_TIME_ELAPSED, m_timerQuery);
++}
++
++double GSGpuContext::EndTimer()
++{
++    m_gl->EndQuery(GL_TIME_ELAPSED);
++    unsigned long long ns = 0;
++    m_gl->GetQueryObjectui64v(m_timerQuery, GL_QUERY_RESULT, &ns);
++    return static_cast<double>(ns) / 1.0e6;
++}
+diff --git a/ps2xRuntime/src/lib/gs/gs_gpu_shaders.inc b/ps2xRuntime/src/lib/gs/gs_gpu_shaders.inc
+new file mode 100644
+index 0000000..079605a
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_gpu_shaders.inc
+@@ -0,0 +1,762 @@
++// GLSL sources of GSGpuBackend (included by gs_gpu_backend.cpp). Every function here is a translation of the
++// GSCpuBackend code named in its comment, with the same operations in the same order: `precise` keeps float
++// expressions unfused, divisions that the CPU does per pixel are correctly rounded (divRN), Z is interpolated
++// in double, and float-to-int conversions behave like x86's truncating ones.
++
++// ---- shared by every kernel --------------------------------------------------------------------------------
++static const char *const kGpuCommonGlsl = R"GLSL(
++layout(std430, binding = 0) buffer Vram { uint vram[]; };
++layout(std430, binding = 1) readonly buffer Swizzle { uint sw[]; };
++
++// GSSwizzle::AddressFast for the layout whose tables start at word `tables`.
++uint swAddress(uint tables, uint base, uint rowStride, uint x, uint y)
++{
++    uint pageHShift = sw[tables + 1u];
++    uint pageHMask = sw[tables + 2u];
++    uint periodMask = sw[tables + 3u];
++    uint inPage = y & pageHMask;
++    return base + (y >> pageHShift) * rowStride + sw[tables + 8u + inPage] +
++           sw[tables + 8u + 128u + (inPage & periodMask) * 2048u + (x & 2047u)];
++}
++
++// bits [shift, shift + width) of the byte at `byteAddress` = value; other threads may write the other bits
++// of the same word at the same time.
++void writeBits(uint byteAddress, uint shift, uint width, uint value)
++{
++    uint word = byteAddress >> 2u;
++    uint bitShift = (byteAddress & 3u) * 8u + shift;
++    uint mask = (width == 32u ? 0xFFFFFFFFu : ((1u << width) - 1u)) << bitShift;
++    atomicAnd(vram[word], ~mask);
++    atomicOr(vram[word], (value << bitShift) & mask);
++}
++)GLSL";
++
++// ---- host-to-local transfers (UploadImageUnlocked) ----------------------------------------------------------
++// Every chunk queued since the last dispatch at once: one workgroup per 256 pixels of a chunk. Chunks of one
++// dispatch never write the same pages, unless they are consecutive chunks of one transfer (other pixels).
++static const char *const kGpuUploadGlsl = R"GLSL(
++layout(local_size_x = 256) in;
++layout(std430, binding = 2) readonly buffer Data { uint data[]; };
++layout(std430, binding = 3) readonly buffer Chunks { uint chunk[]; }; // UPLOAD_CHUNK_WORDS per chunk
++layout(std430, binding = 4) readonly buffer Groups { uint group[]; };  // per workgroup: chunk, first pixel
++const uint UPLOAD_CHUNK_WORDS = 10u;
++
++uint dataOffset;
++uint dataByte(uint i) { i += dataOffset; return (data[i >> 2u] >> ((i & 3u) * 8u)) & 0xFFu; }
++
++void main()
++{
++    uint at = group[2u * gl_WorkGroupID.x] * UPLOAD_CHUNK_WORDS;
++    uint k = group[2u * gl_WorkGroupID.x + 1u] + gl_LocalInvocationID.x;
++    uint tables = chunk[at], base = chunk[at + 1u], rowStride = chunk[at + 2u], kind = chunk[at + 3u];
++    uint dsax = chunk[at + 4u], dsay = chunk[at + 5u], rrw = chunk[at + 6u], first = chunk[at + 7u], count = chunk[at + 8u];
++    dataOffset = chunk[at + 9u];
++    if (k >= count)
++        return;
++    uint g = first + k;
++    uint x = dsax + g % rrw;
++    uint y = dsay + g / rrw;
++    uint pixel = swAddress(tables, base, rowStride, x, y);
++    if (kind == 1u)
++    {
++        vram[pixel & 0xFFFFFu] = dataByte(4u * k) | (dataByte(4u * k + 1u) << 8u) | (dataByte(4u * k + 2u) << 16u) |
++                                 (dataByte(4u * k + 3u) << 24u);
++    }
++    else if (kind == 2u)
++    {
++        uint value = dataByte(3u * k) | (dataByte(3u * k + 1u) << 8u) | (dataByte(3u * k + 2u) << 16u);
++        uint word = pixel & 0xFFFFFu;
++        vram[word] = (vram[word] & 0xFF000000u) | value;
++    }
++    else if (kind == 3u)
++        writeBits((pixel * 2u) & 0x3FFFFEu, 0u, 16u, dataByte(2u * k) | (dataByte(2u * k + 1u) << 8u));
++    else if (kind == 4u)
++        writeBits(pixel & 0x3FFFFFu, 0u, 8u, dataByte(k));
++    else if (kind == 6u)
++        writeBits((pixel * 4u + 3u) & 0x3FFFFFu, 0u, 8u, dataByte(k));
++    else
++    {
++        uint nibble = (dataByte(k >> 1u) >> ((k & 1u) * 4u)) & 0xFu;
++        if (kind == 5u)
++            writeBits((pixel >> 1u) & 0x3FFFFFu, (pixel & 1u) * 4u, 4u, nibble);
++        else
++            writeBits((pixel * 4u + 3u) & 0x3FFFFFu, kind == 8u ? 4u : 0u, 4u, nibble);
++    }
++}
++)GLSL";
++
++// ---- texture page snapshots: pages[i] of VRAM copied to the snapshot area -----------------------------------
++static const char *const kGpuCopyGlsl = R"GLSL(
++layout(local_size_x = 256) in;
++layout(std430, binding = 2) readonly buffer Pages { uint pages[]; }; // pairs: source page, destination word
++uniform uint count;
++void main()
++{
++    uint i = gl_WorkGroupID.x;
++    if (i >= count)
++        return;
++    uint source = pages[2u * i] * 2048u;
++    uint target = pages[2u * i + 1u];
++    for (uint w = gl_LocalInvocationID.x; w < 2048u; w += 256u)
++        vram[target + w] = vram[source + w];
++}
++)GLSL";
++
++// ---- CLUT loads (LoadClutUnlocked): instance `target` = instance `source` with the loaded entries -----------
++static const char *const kGpuClutGlsl = R"GLSL(
++layout(local_size_x = 256) in;
++layout(std430, binding = 2) buffer Cluts { uint clut[]; };
++uniform uint source;
++uniform uint target;
++uniform uint tables;      // layout of CPSM
++uniform uint base;        // GSSwizzle::Base(CBP)
++uniform uint rowStride;   // GSSwizzle::RowStride(width)
++uniform uint cpsmKind;    // 1 32-bit, 2 24-bit, 3 16-bit
++uniform uint firstEntry;
++uniform uint entryCount;
++uniform uint csm2;
++uniform uint cou;
++uniform uint cov;
++uniform uint destinationBase;
++uniform uint suffix;      // loadCsm1Suffix
++shared uint entries[512];
++
++uint swizzleCsm1(uint index) { return (index & ~0x18u) | ((index & 0x08u) << 1u) | ((index & 0x10u) >> 1u); }
++
++void main()
++{
++    uint t = gl_LocalInvocationID.x;
++    uint word = clut[source * 256u + t];
++    entries[2u * t] = word & 0xFFFFu;
++    entries[2u * t + 1u] = word >> 16u;
++    barrier();
++    uint entry = firstEntry + t;
++    if (entry < entryCount)
++    {
++        uint sx, sy;
++        if (csm2 == 0u)
++        {
++            uint sourceIndex = swizzleCsm1(entry);
++            sx = sourceIndex & 0x0Fu;
++            sy = sourceIndex >> 4u;
++        }
++        else
++        {
++            sx = (cou << 4u) + entry;
++            sy = cov;
++        }
++        uint pixel = swAddress(tables, base, rowStride, sx, sy);
++        uint raw;
++        if (cpsmKind == 3u)
++        {
++            uint byteAddress = (pixel * 2u) & 0x3FFFFEu;
++            raw = (vram[byteAddress >> 2u] >> ((byteAddress & 2u) * 8u)) & 0xFFFFu;
++        }
++        else
++        {
++            raw = vram[pixel & 0xFFFFFu];
++            if (cpsmKind == 2u)
++                raw &= 0x00FFFFFFu;
++        }
++        uint destination = (suffix != 0u ? entry : destinationBase + entry) & (cpsmKind == 3u ? 0x1FFu : 0x0FFu);
++        if (cpsmKind == 3u)
++            entries[destination] = raw;
++        else
++        {
++            entries[destination] = raw & 0xFFFFu;
++            entries[destination + 256u] = raw >> 16u;
++        }
++    }
++    barrier();
++    clut[target * 256u + t] = entries[2u * t] | (entries[2u * t + 1u] << 16u);
++}
++)GLSL";
++
++// ---- triangles and sprites ---------------------------------------------------------------------------------
++static const char *const kGpuRasterGlsl = R"GLSL(
++layout(local_size_x = 16, local_size_y = 16) in;
++layout(std430, binding = 2) readonly buffer Prims { uint prim[]; };
++layout(std430, binding = 3) readonly buffer Tiles { uint tileInfo[]; }; // origin, first, count
++layout(std430, binding = 4) readonly buffer Lists { uint list[]; };
++layout(std430, binding = 5) readonly buffer PageMap { uint pageMap[]; }; // word offset of each texture page
++layout(std430, binding = 6) readonly buffer Cluts { uint clut[]; };
++
++const uint PRIM_WORDS = 64u;
++
++// x86 cvttss2si: out of range or NaN gives 0x80000000.
++int toInt(precise float f)
++{
++    if (isnan(f) || f < -2147483648.0 || f >= 2147483648.0)
++        return int(0x80000000u);
++    return int(f);
++}
++int clampU8(int v) { return clamp(v, 0, 255); }
++
++// a / b rounded to nearest (GLSL's division is approximate).
++float divRN(float a, float b)
++{
++    if (b == 0.0 || isinf(b) || isnan(b) || isinf(a) || isnan(a) || a == 0.0)
++        return a / b;
++    precise float r = 1.0 / b;
++    precise float q = a * r;
++    precise float e = fma(-q, b, a);
++    precise float q1 = fma(e, r, q);
++    precise float e1 = fma(-q1, b, a);
++    precise float q2 = fma(e1, r, q1);
++    // q2 is within an ulp: pick whichever neighbour leaves the smallest residual.
++    precise float up = uintBitsToFloat(floatBitsToUint(q2) + 1u);
++    precise float down = uintBitsToFloat(floatBitsToUint(q2) - 1u);
++    precise float rq = abs(fma(-q2, b, a));
++    precise float ru = abs(fma(-up, b, a));
++    precise float rd = abs(fma(-down, b, a));
++    if (ru < rq)
++        return up;
++    if (rd < rq)
++        return down;
++    return q2;
++}
++
++float fl(uint p, uint i) { return uintBitsToFloat(prim[p + i]); }
++uint field(uint v, uint shift, uint bits) { return (v >> shift) & ((1u << bits) - 1u); }
++
++// ---- pixel pipeline (writePixelFast) ----
++uint fbAddress(uint p, int x, int y) { return swAddress(prim[p + 5u], prim[p + 6u], prim[p + 7u], uint(x), uint(y)); }
++uint zAddress(uint p, int x, int y) { return swAddress(prim[p + 10u], prim[p + 11u], prim[p + 12u], uint(x), uint(y)); }
++
++uint readFb(uint p, int x, int y)
++{
++    uint kind = prim[p + 9u] & 0xFFu;
++    uint pixel = fbAddress(p, x, y);
++    if (kind == 3u)
++    {
++        uint byteAddress = (pixel * 2u) & 0x3FFFFEu;
++        return (vram[byteAddress >> 2u] >> ((byteAddress & 2u) * 8u)) & 0xFFFFu;
++    }
++    uint value = vram[pixel & 0xFFFFFu];
++    return kind == 2u ? (value & 0x00FFFFFFu) : value;
++}
++void writeFb(uint p, int x, int y, uint value)
++{
++    uint kind = prim[p + 9u] & 0xFFu;
++    uint pixel = fbAddress(p, x, y);
++    if (kind == 1u)
++        vram[pixel & 0xFFFFFu] = value;
++    else if (kind == 2u)
++    {
++        uint word = pixel & 0xFFFFFu;
++        vram[word] = (vram[word] & 0xFF000000u) | (value & 0x00FFFFFFu);
++    }
++    else
++        writeBits((pixel * 2u) & 0x3FFFFEu, 0u, 16u, value & 0xFFFFu);
++}
++uint readZ(uint p, int x, int y)
++{
++    uint kind = prim[p + 13u] & 0xFFu;
++    uint pixel = zAddress(p, x, y);
++    if (kind == 3u)
++    {
++        uint byteAddress = (pixel * 2u) & 0x3FFFFEu;
++        return (vram[byteAddress >> 2u] >> ((byteAddress & 2u) * 8u)) & 0xFFFFu;
++    }
++    uint value = vram[pixel & 0xFFFFFu];
++    return kind == 2u ? (value & 0x00FFFFFFu) : value;
++}
++void writeZ(uint p, int x, int y, uint value)
++{
++    uint kind = prim[p + 13u] & 0xFFu;
++    uint pixel = zAddress(p, x, y);
++    if (kind == 1u)
++        vram[pixel & 0xFFFFFu] = value;
++    else if (kind == 2u)
++    {
++        uint word = pixel & 0xFFFFFu;
++        vram[word] = (vram[word] & 0xFF000000u) | (value & 0x00FFFFFFu);
++    }
++    else
++        writeBits((pixel * 2u) & 0x3FFFFEu, 0u, 16u, value & 0xFFFFu);
++}
++bool zTest(uint p, int x, int y, uint z)
++{
++    uint method = (prim[p + 13u] >> 8u) & 3u;
++    if (method == 0u)
++        return false;
++    if (method == 1u)
++        return true;
++    uint current = readZ(p, x, y);
++    return method == 2u ? z >= current : z > current;
++}
++uint rgba5551To8888(uint c)
++{
++    return (((c >> 0u) & 0x1Fu) << 3u) | ((((c >> 5u) & 0x1Fu) << 3u) << 8u) | ((((c >> 10u) & 0x1Fu) << 3u) << 16u) |
++           ((((c >> 15u) & 0x01u) << 7u) << 24u);
++}
++uint rgba8888To5551(uint c)
++{
++    return (((c >> 0u) & 0xFFu) >> 3u) | ((((c >> 8u) & 0xFFu) >> 3u) << 5u) | ((((c >> 16u) & 0xFFu) >> 3u) << 10u) |
++           ((((c >> 24u) & 0xFFu) >> 7u) << 15u);
++}
++bool alphaPasses(uint test, uint a)
++{
++    if ((test & 1u) == 0u)
++        return true;
++    uint atst = (test >> 1u) & 7u;
++    uint aref = (test >> 4u) & 0xFFu;
++    switch (atst)
++    {
++    case 0u: return false;
++    case 1u: return true;
++    case 2u: return a < aref;
++    case 3u: return a <= aref;
++    case 4u: return a == aref;
++    case 5u: return a >= aref;
++    case 6u: return a > aref;
++    default: return a != aref;
++    }
++}
++
++const uint FLAG_IIP = 1u << 2u, FLAG_TME = 1u << 3u, FLAG_FST = 1u << 4u, FLAG_FGE = 1u << 5u, FLAG_ABE = 1u << 6u,
++           FLAG_PABE = 1u << 7u, FLAG_FBA = 1u << 8u, FLAG_LINEAR = 1u << 9u, FLAG_ZMASK = 1u << 10u,
++           FLAG_DATE = 1u << 11u, FLAG_ALPHATEST = 1u << 13u, FLAG_FB16 = 1u << 14u, FLAG_FB24 = 1u << 15u;
++
++// writePixelFast after zTest (the depth test only discards, so it runs first).
++void writePixel(uint p, int x, int y, uint z, uint r, uint g, uint b, uint a, uint fog)
++{
++    uint flags = prim[p];
++    uint fpsm = (prim[p + 9u] >> 8u) & 0x3Fu;
++    if ((flags & FLAG_FGE) != 0u)
++    {
++        uint fogColor = prim[p + 16u];
++        uint inverseFog = 255u - fog;
++        r = (((fog * r) >> 8u) + ((inverseFog * (fogColor & 0xFFu)) >> 8u)) & 0xFFu;
++        g = (((fog * g) >> 8u) + ((inverseFog * ((fogColor >> 8u) & 0xFFu)) >> 8u)) & 0xFFu;
++        b = (((fog * b) >> 8u) + ((inverseFog * ((fogColor >> 16u) & 0xFFu)) >> 8u)) & 0xFFu;
++    }
++    uint test = prim[p + 14u];
++    bool writeRgb = true, writeAlpha = true, writeDepth = true;
++    if ((flags & FLAG_ALPHATEST) != 0u && !alphaPasses(test, a))
++    {
++        uint afail = (test >> 12u) & 3u;
++        if (afail == 1u) { writeRgb = true; writeAlpha = true; writeDepth = false; }
++        else if (afail == 2u) { writeRgb = false; writeAlpha = false; writeDepth = true; }
++        else if (afail == 3u) { writeRgb = true; writeAlpha = fpsm != 0u; writeDepth = false; }
++        else { writeRgb = false; writeAlpha = false; writeDepth = false; }
++    }
++    bool writesFb = writeRgb || writeAlpha;
++    if (!writesFb && !writeDepth)
++        return;
++    uint fbmsk = prim[p + 8u];
++    bool abe = (flags & FLAG_ABE) != 0u;
++    bool preserveDestinationAlpha = writeRgb && !writeAlpha && fpsm == 0u;
++    bool dateRead = (flags & FLAG_DATE) != 0u;
++    bool frmw = dateRead || (writesFb && (fbmsk != 0u || abe || preserveDestinationAlpha));
++    uint raw = 0u, fbrgba = 0u;
++    if (frmw)
++    {
++        raw = readFb(p, x, y);
++        fbrgba = raw;
++        if ((flags & FLAG_FB16) != 0u)
++            fbrgba = rgba5551To8888(raw & 0xFFFFu);
++        else if ((flags & FLAG_FB24) != 0u)
++            fbrgba |= 0x80000000u;
++    }
++    if (dateRead)
++    {
++        bool datm = ((test >> 15u) & 1u) != 0u;
++        bool pass = true;
++        if (fpsm == 0u)
++            pass = (((raw >> 31u) & 1u) != 0u) == datm;
++        else if (fpsm == 2u || fpsm == 10u)
++            pass = (((raw >> 15u) & 1u) != 0u) == datm;
++        if (!pass)
++            return;
++    }
++    if (writesFb)
++    {
++        if (abe && !((flags & FLAG_PABE) != 0u && (a & 0x80u) == 0u))
++        {
++            uint alphaReg = prim[p + 15u];
++            uint asel = alphaReg & 3u, bsel = (alphaReg >> 2u) & 3u, csel = (alphaReg >> 4u) & 3u, dsel = (alphaReg >> 6u) & 3u;
++            int fix = int((alphaReg >> 8u) & 0xFFu);
++            int cs[3] = int[3](int(r), int(g), int(b));
++            int cd[3] = int[3](int(fbrgba & 0xFFu), int((fbrgba >> 8u) & 0xFFu), int((fbrgba >> 16u) & 0xFFu));
++            int da = int((fbrgba >> 24u) & 0xFFu);
++            int cAlpha = csel == 0u ? int(a) : (csel == 1u ? da : fix);
++            uint outc[3];
++            for (int c = 0; c < 3; ++c)
++            {
++                int A = asel == 0u ? cs[c] : (asel == 1u ? cd[c] : 0);
++                int B = bsel == 0u ? cs[c] : (bsel == 1u ? cd[c] : 0);
++                int D = dsel == 0u ? cs[c] : (dsel == 1u ? cd[c] : 0);
++                outc[c] = uint(clampU8(((A - B) * cAlpha >> 7) + D));
++            }
++            r = outc[0];
++            g = outc[1];
++            b = outc[2];
++        }
++        if (writeAlpha && (flags & FLAG_FBA) != 0u)
++            a = a | 0x80u;
++        uint pixel = r | (g << 8u) | (b << 16u) | (a << 24u);
++        if (fbmsk != 0u)
++            pixel = (pixel & ~fbmsk) | (fbrgba & fbmsk);
++        if (preserveDestinationAlpha)
++            pixel = (pixel & 0x00FFFFFFu) | (fbrgba & 0xFF000000u);
++        if ((flags & FLAG_FB16) != 0u)
++            pixel = rgba8888To5551(pixel);
++        writeFb(p, x, y, pixel);
++    }
++    if (writeDepth && (flags & FLAG_ZMASK) == 0u)
++        writeZ(p, x, y, z);
++}
++
++// ---- texture sampling (Sampler) ----
++uint texWord(uint byteAddress) { uint word = byteAddress >> 2u; return vram[pageMap[word >> 11u] + (word & 2047u)]; }
++
++// Sampler::readTexelK
++uint readTexel(uint p, uint u, uint v)
++{
++    uint texKind = prim[p + 20u];
++    uint kind = texKind & 0xFFu;
++    uint pixel = swAddress(prim[p + 17u], prim[p + 18u], prim[p + 19u], u, v);
++    if (kind == 1u || kind == 2u)
++    {
++        uint value = texWord((pixel << 2u) & 0x3FFFFCu);
++        return kind == 2u ? (value & 0x00FFFFFFu) : value;
++    }
++    if (kind == 3u)
++    {
++        uint byteAddress = (pixel << 1u) & 0x3FFFFEu;
++        return (texWord(byteAddress) >> ((byteAddress & 2u) * 8u)) & 0xFFFFu;
++    }
++    if (kind == 4u)
++    {
++        uint byteAddress = pixel & 0x3FFFFFu;
++        return (texWord(byteAddress) >> ((byteAddress & 3u) * 8u)) & 0xFFu;
++    }
++    if (kind == 5u)
++    {
++        uint byteAddress = (pixel >> 1u) & 0x3FFFFFu;
++        return (texWord(byteAddress) >> ((byteAddress & 3u) * 8u + (pixel & 1u) * 4u)) & 0x0Fu;
++    }
++    uint byteAddress = ((pixel << 2u) + 3u) & 0x3FFFFFu;
++    uint byteValue = (texWord(byteAddress) >> ((byteAddress & 3u) * 8u)) & 0xFFu;
++    if (kind == 6u)
++        return byteValue;
++    return kind == 7u ? (byteValue & 0x0Fu) : ((byteValue >> 4u) & 0x0Fu);
++}
++
++// applyTexa
++uint applyTexa(uint texa, uint psm, uint texel)
++{
++    if (psm == 0u)
++        return texel;
++    uint r = texel & 0xFFu, g = (texel >> 8u) & 0xFFu, b = (texel >> 16u) & 0xFFu;
++    bool rgbZero = r == 0u && g == 0u && b == 0u;
++    uint a = (texel >> 24u) & 0xFFu;
++    uint ta0 = texa & 0xFFu, ta1 = (texa >> 8u) & 0xFFu;
++    bool aem = ((texa >> 16u) & 1u) != 0u;
++    if (psm == 1u)
++        a = (aem && rgbZero) ? 0u : ta0;
++    else if (psm == 2u || psm == 10u)
++    {
++        if ((a & 0x80u) != 0u)
++            a = ta1;
++        else
++            a = (aem && rgbZero) ? 0u : ta0;
++    }
++    return (texel & 0x00FFFFFFu) | (a << 24u);
++}
++
++uint clutEntry(uint p, uint index) { uint at = (prim[p + 25u] & 0xFFFu) * 512u + index; return (clut[at >> 1u] >> ((at & 1u) * 16u)) & 0xFFFFu; }
++
++// Sampler::clutLookup
++uint clutLookup(uint p, uint index)
++{
++    uint mode = prim[p + 26u];
++    uint cpsm = mode & 0xFFu, csm = (mode >> 8u) & 0xFFu, csa = (mode >> 16u) & 0xFFu;
++    uint psm = (prim[p + 20u] >> 24u) & 0xFFu;
++    bool fourBit = psm == 20u || psm == 36u || psm == 44u;
++    bool eightBit = psm == 19u || psm == 27u;
++    bool sixteenBit = cpsm == 2u || cpsm == 10u;
++    uint csaMask = sixteenBit ? 0x1Fu : 0x0Fu;
++    uint clutBase = (csa & csaMask) << 4u;
++    uint sourceIndex = fourBit ? (index & 0x0Fu) : index;
++    uint clutIndex = (clutBase + sourceIndex) & (sixteenBit ? 0x1FFu : 0x0FFu);
++    if (!sixteenBit && csm == 0u && eightBit)
++    {
++        uint block = min((sourceIndex & 0xF0u) + clutBase, 240u);
++        clutIndex = block + (sourceIndex & 0x0Fu);
++    }
++    uint texa = prim[p + 24u];
++    if (cpsm == 0u)
++        return applyTexa(texa, cpsm, clutEntry(p, clutIndex) | (clutEntry(p, clutIndex + 256u) << 16u));
++    if (cpsm == 1u)
++        return applyTexa(texa, cpsm, (clutEntry(p, clutIndex) | (clutEntry(p, clutIndex + 256u) << 16u)) & 0x00FFFFFFu);
++    if (sixteenBit)
++        return applyTexa(texa, cpsm, rgba5551To8888(clutEntry(p, clutIndex)));
++    return 0xFFFF00FFu;
++}
++
++// wrapTextureCoordinate
++int wrapCoordinate(int coordinate, int size, uint mode, int regionMin, int regionMax)
++{
++    switch (mode & 3u)
++    {
++    case 0u: return int(uint(coordinate) & uint(size - 1));
++    case 1u: return clamp(coordinate, 0, size - 1);
++    case 2u: return min(max(coordinate, regionMin), regionMax);
++    default: return int((uint(coordinate) & uint(regionMin)) | uint(regionMax));
++    }
++}
++
++// Sampler::pointK
++uint pointSample(uint p, int u, int v)
++{
++    uint wh = prim[p + 21u];
++    uint texKind = prim[p + 20u];
++    uint ru = prim[p + 22u], rv = prim[p + 23u];
++    u = wrapCoordinate(u, int(wh & 0xFFFFu), (texKind >> 16u) & 3u, int(ru & 0xFFFFu), int(ru >> 16u));
++    v = wrapCoordinate(v, int(wh >> 16u), (texKind >> 18u) & 3u, int(rv & 0xFFFFu), int(rv >> 16u));
++    uint raw = readTexel(p, uint(u), uint(v));
++    uint sampleKind = (texKind >> 8u) & 0xFu;
++    uint psm = (texKind >> 24u) & 0xFFu;
++    if (sampleKind == 3u)
++        return clutLookup(p, raw & 0xFFu);
++    if (sampleKind == 1u)
++        return applyTexa(prim[p + 24u], psm, raw);
++    if (sampleKind == 2u)
++        return applyTexa(prim[p + 24u], psm, rgba5551To8888(raw & 0xFFFFu));
++    return 0xFFFF00FFu;
++}
++
++uint lerp2(uint a, uint b, uint w) { return (((a * (256u - w)) + (b * w) + 0x00800080u) >> 8u) & 0x00FF00FFu; }
++
++// Sampler::sampleK
++uint sampleTexture(uint p, float s, float t, float q, uint u16, uint v16)
++{
++    precise float texUf, texVf;
++    if ((prim[p] & FLAG_FST) != 0u)
++    {
++        texUf = float(u16) / 16.0;
++        texVf = float(v16) / 16.0;
++    }
++    else
++    {
++        float fabsQ = abs(q) > 1.0e-8 ? q : 1.0;
++        precise float invQ = divRN(1.0, fabsQ);
++        texUf = s * invQ * fl(p, 27u);
++        texVf = t * invQ * fl(p, 28u);
++    }
++    if ((prim[p] & FLAG_LINEAR) == 0u)
++        return pointSample(p, toInt(texUf), toInt(texVf));
++    precise float sampleU = texUf - 0.5;
++    precise float sampleV = texVf - 0.5;
++    int u0 = toInt(floor(sampleU));
++    int v0 = toInt(floor(sampleV));
++    precise float fx = sampleU - float(u0);
++    precise float fy = sampleV - float(v0);
++    uint wx = uint(fx * 256.0 + 0.5);
++    uint wy = uint(fy * 256.0 + 0.5);
++    uint c00 = pointSample(p, u0, v0);
++    uint c10 = wx != 0u ? pointSample(p, u0 + 1, v0) : 0u;
++    uint c01 = wy != 0u ? pointSample(p, u0, v0 + 1) : 0u;
++    uint c11 = (wx != 0u && wy != 0u) ? pointSample(p, u0 + 1, v0 + 1) : 0u;
++    if (wx == 0u && wy == 0u)
++        return c00;
++    const uint mask = 0x00FF00FFu;
++    uint topRb = lerp2(c00 & mask, c10 & mask, wx);
++    uint topGa = lerp2((c00 >> 8u) & mask, (c10 >> 8u) & mask, wx);
++    uint bottomRb = lerp2(c01 & mask, c11 & mask, wx);
++    uint bottomGa = lerp2((c01 >> 8u) & mask, (c11 >> 8u) & mask, wx);
++    return lerp2(topRb, bottomRb, wy) | (lerp2(topGa, bottomGa, wy) << 8u);
++}
++
++// combineTexture: returns RGBA
++uint combineTexture(uint p, uint vr, uint vg, uint vb, uint va, uint texel)
++{
++    uint texKind = prim[p + 20u];
++    uint tfx = (texKind >> 12u) & 3u;
++    bool tcc = ((texKind >> 14u) & 1u) != 0u;
++    uint tr = texel & 0xFFu, tg = (texel >> 8u) & 0xFFu, tb = (texel >> 16u) & 0xFFu, ta = (texel >> 24u) & 0xFFu;
++    uint r = tr, g = tg, b = tb, a = tcc ? ta : va;
++    if (tfx == 0u)
++    {
++        r = uint(clampU8(int((tr * vr) >> 7u)));
++        g = uint(clampU8(int((tg * vg) >> 7u)));
++        b = uint(clampU8(int((tb * vb) >> 7u)));
++        a = tcc ? uint(clampU8(int((ta * va) >> 7u))) : va;
++    }
++    else if (tfx == 2u || tfx == 3u)
++    {
++        r = uint(clampU8(int(((tr * vr) >> 7u) + va)));
++        g = uint(clampU8(int(((tg * vg) >> 7u) + va)));
++        b = uint(clampU8(int(((tb * vb) >> 7u) + va)));
++        a = tcc ? (tfx == 2u ? uint(clampU8(int(ta + va))) : ta) : va;
++    }
++    return r | (g << 8u) | (b << 16u) | (a << 24u);
++}
++
++// ---- DrawSprite (one pixel) ----
++void shadeSprite(uint p, int x, int y)
++{
++    uint z1 = prim[p + 40u];
++    if (!zTest(p, x, y, z1))
++        return;
++    uint color = prim[p + 41u];
++    uint r = color & 0xFFu, g = (color >> 8u) & 0xFFu, b = (color >> 16u) & 0xFFu, a = color >> 24u;
++    uint fog = prim[p + 42u];
++    if ((prim[p] & FLAG_TME) != 0u)
++    {
++        int unclippedX0 = int(prim[p + 32u]);
++        int unclippedY0 = int(prim[p + 33u]);
++        precise float tx = divRN(float(x - unclippedX0) + 0.5, fl(p, 34u));
++        precise float texUf = fl(p, 36u) + (fl(p, 38u) - fl(p, 36u)) * tx;
++        precise float ty = divRN(float(y - unclippedY0) + 0.5, fl(p, 35u));
++        precise float texVf = fl(p, 37u) + (fl(p, 39u) - fl(p, 37u)) * ty;
++        uint texel;
++        if ((prim[p] & FLAG_FST) != 0u)
++        {
++            int fixedU = toInt((texUf * 16.0) + 0.5);
++            int fixedV = toInt((texVf * 16.0) + 0.5);
++            texel = sampleTexture(p, 0.0, 0.0, 1.0, uint(clamp(fixedU, 0, 0xFFFF)), uint(clamp(fixedV, 0, 0xFFFF)));
++        }
++        else
++        {
++            uint wh = prim[p + 21u];
++            texel = sampleTexture(p, divRN(texUf, float(int(wh & 0xFFFFu))), divRN(texVf, float(int(wh >> 16u))), 1.0, 0u, 0u);
++        }
++        uint c = combineTexture(p, r, g, b, a, texel);
++        r = c & 0xFFu;
++        g = (c >> 8u) & 0xFFu;
++        b = (c >> 16u) & 0xFFu;
++        a = c >> 24u;
++    }
++    writePixel(p, x, y, z1, r, g, b, a, fog);
++}
++
++// ---- DrawTriangle (one pixel) ----
++void shadeTriangle(uint p, int x, int y)
++{
++    precise float fx0 = fl(p, 32u), fy0 = fl(p, 33u), fx1 = fl(p, 34u), fy1 = fl(p, 35u), fx2 = fl(p, 36u), fy2 = fl(p, 37u);
++    precise float winding = fl(p, 38u), invAbsDenom = fl(p, 39u);
++    precise float px = float(x) + 0.5;
++    precise float py = float(y) + 0.5;
++    const float kEdgeEpsilon = 1.0e-4;
++    precise float w0 = (((fy1 - fy2) * (px - fx2) + (fx2 - fx1) * (py - fy2)) * winding) * invAbsDenom;
++    precise float w1 = (((fy2 - fy0) * (px - fx2) + (fx0 - fx2) * (py - fy2)) * winding) * invAbsDenom;
++    precise float w2 = 1.0 - w0 - w1;
++    if (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon)
++        return;
++    // DrawTriangleK's rowSpan: the pixels of the row it visits at all (after the weight test: a pixel is drawn
++    // when it passes both, and this one is dearer).
++#ifndef NO_ROWSPAN
++    {
++        int minX = int(prim[p + 1u] & 0xFFFFu), maxX = int(prim[p + 2u] & 0xFFFFu);
++        precise float w0Slope = ((fy1 - fy2) * winding) * invAbsDenom;
++        precise float w1Slope = ((fy2 - fy0) * winding) * invAbsDenom;
++        precise float w2Slope = -w0Slope - w1Slope;
++        precise float w0Offset = (((fy1 - fy2) * -fx2 + (fx2 - fx1) * (py - fy2)) * winding) * invAbsDenom;
++        precise float w1Offset = (((fy2 - fy0) * -fx2 + (fx0 - fx2) * (py - fy2)) * winding) * invAbsDenom;
++        precise float w2Offset = 1.0 - w0Offset - w1Offset;
++        precise float lo = float(minX) - 1.0;
++        precise float hi = float(maxX) + 2.0;
++        float slopes[3] = float[3](w0Slope, w1Slope, w2Slope);
++        float offsets[3] = float[3](w0Offset, w1Offset, w2Offset);
++        for (int i = 0; i < 3; ++i)
++        {
++            if (abs(slopes[i]) < 1.0e-5)
++                continue;
++            precise float crossing = divRN(-kEdgeEpsilon - offsets[i], slopes[i]);
++            if (slopes[i] > 0.0)
++                lo = (lo < crossing) ? crossing : lo;
++            else
++                hi = (crossing < hi) ? crossing : hi;
++        }
++        lo = (float(maxX) + 2.0 < lo) ? float(maxX) + 2.0 : lo;
++        hi = (hi < float(minX) - 1.0) ? float(minX) - 1.0 : hi;
++        int firstX = max(minX, toInt(floor(lo - 0.5)) - 2);
++        int lastX = min(maxX, toInt(ceil(hi - 0.5)) + 2);
++        if (x < firstX || x > lastX)
++            return;
++    }
++#endif
++    precise double z0 = packDouble2x32(uvec2(prim[p + 40u], prim[p + 41u]));
++    precise double z1 = packDouble2x32(uvec2(prim[p + 42u], prim[p + 43u]));
++    precise double z2 = packDouble2x32(uvec2(prim[p + 44u], prim[p + 45u]));
++    precise double zd = z0 * double(w0) + z1 * double(w1) + z2 * double(w2);
++    precise double zr = zd + 0.5;
++    // (u32)(double): truncation through a 64-bit integer, keeping the low 32 bits.
++    precise double zt = trunc(zr);
++    precise double zm = zt - floor(zt * (1.0 / 4294967296.0)) * 4294967296.0;
++    uint zValue = uint(zm);
++    if (!zTest(p, x, y, zValue))
++        return;
++    uint flags = prim[p];
++    uint c0 = prim[p + 46u], c1 = prim[p + 47u], c2 = prim[p + 48u];
++    uint r, g, b, a;
++    if ((flags & FLAG_IIP) != 0u)
++    {
++        precise float rs = float(c0 & 0xFFu) * w0 + float(c1 & 0xFFu) * w1 + float(c2 & 0xFFu) * w2;
++        precise float gs = float((c0 >> 8u) & 0xFFu) * w0 + float((c1 >> 8u) & 0xFFu) * w1 + float((c2 >> 8u) & 0xFFu) * w2;
++        precise float bs = float((c0 >> 16u) & 0xFFu) * w0 + float((c1 >> 16u) & 0xFFu) * w1 + float((c2 >> 16u) & 0xFFu) * w2;
++        precise float as = float(c0 >> 24u) * w0 + float(c1 >> 24u) * w1 + float(c2 >> 24u) * w2;
++        r = uint(clampU8(toInt(rs)));
++        g = uint(clampU8(toInt(gs)));
++        b = uint(clampU8(toInt(bs)));
++        a = uint(clampU8(toInt(as)));
++    }
++    else
++    {
++        r = c2 & 0xFFu;
++        g = (c2 >> 8u) & 0xFFu;
++        b = (c2 >> 16u) & 0xFFu;
++        a = c2 >> 24u;
++    }
++    if ((flags & FLAG_TME) != 0u)
++    {
++        uint texel;
++        if ((flags & FLAG_FST) != 0u)
++        {
++            uint uv0 = prim[p + 59u], uv1 = prim[p + 60u], uv2 = prim[p + 61u];
++            precise float us = float(uv0 & 0xFFFFu) * w0 + float(uv1 & 0xFFFFu) * w1 + float(uv2 & 0xFFFFu) * w2;
++            precise float vs = float(uv0 >> 16u) * w0 + float(uv1 >> 16u) * w1 + float(uv2 >> 16u) * w2;
++            texel = sampleTexture(p, 0.0, 0.0, 1.0, uint(toInt(us)) & 0xFFFFu, uint(toInt(vs)) & 0xFFFFu);
++        }
++        else
++        {
++            precise float is = fl(p, 50u) * w0 + fl(p, 53u) * w1 + fl(p, 56u) * w2;
++            precise float it = fl(p, 51u) * w0 + fl(p, 54u) * w1 + fl(p, 57u) * w2;
++            precise float iq = fl(p, 52u) * w0 + fl(p, 55u) * w1 + fl(p, 58u) * w2;
++            texel = sampleTexture(p, is, it, iq, 0u, 0u);
++        }
++        uint c = combineTexture(p, r, g, b, a, texel);
++        r = c & 0xFFu;
++        g = (c >> 8u) & 0xFFu;
++        b = (c >> 16u) & 0xFFu;
++        a = c >> 24u;
++    }
++    uint fogs = prim[p + 49u];
++    precise float fogSum = float(fogs & 0xFFu) * w0 + float((fogs >> 8u) & 0xFFu) * w1 + float((fogs >> 16u) & 0xFFu) * w2;
++    writePixel(p, x, y, zValue, r, g, b, a, uint(clampU8(toInt(fogSum))));
++}
++
++void main()
++{
++    uint t = gl_WorkGroupID.x;
++    uint origin = tileInfo[3u * t];
++    uint first = tileInfo[3u * t + 1u];
++    uint count = tileInfo[3u * t + 2u];
++    int x = int((origin & 0xFFFFu) * 16u + gl_LocalInvocationID.x);
++    int y = int((origin >> 16u) * 16u + gl_LocalInvocationID.y);
++    for (uint i = 0u; i < count; ++i)
++    {
++        uint p = list[first + i] * PRIM_WORDS;
++        uint b0 = prim[p + 1u], b1 = prim[p + 2u];
++        if (x < int(b0 & 0xFFFFu) || y < int(b0 >> 16u) || x > int(b1 & 0xFFFFu) || y > int(b1 >> 16u))
++            continue;
++        if ((prim[p] & 3u) == 1u)
++            shadeSprite(p, x, y);
++        else
++            shadeTriangle(p, x, y);
++    }
++}
++)GLSL";

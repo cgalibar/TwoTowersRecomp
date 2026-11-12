@@ -6,6 +6,8 @@
 //   ttr_gs_bench <capture> --dump-vram <file>     write VRAM after the replay
 //   ttr_gs_bench <capture> --gpu-uploads         host-to-local transfers only, on the CPU and the GPU: same VRAM?
 //   ttr_gs_bench <capture> --gpu-selftest        OpenGL compute context: VRAM through the GPU and back
+//   ttr_gs_bench <capture> --gpu                 replay on the GS on the GPU (GSGpuBackend); with --check-hashes
+//                                                 it is compared with a reference made by the CPU backend
 //   ttr_gs_bench --selftest                      check the row/column swizzle tables against GSMem
 //   ttr_gs_bench --compare-vram <a> <b>           differing bytes and pages of two VRAM dumps
 //   ttr_gs_bench <capture> --png <prefix>         write every presented frame as <prefix><n>.png
@@ -239,6 +241,7 @@ namespace
         bool listPresents = false;
         bool gpuSelfTest = false;
         bool gpuUploads = false;
+        bool gpu = false;
         uint64_t maxPresents = 0;
         std::string checkHashesPath;
         uint64_t dumpAt = ~0ull;
@@ -307,6 +310,8 @@ int main(int argc, char **argv)
             options.gpuUploads = true;
         else if (arg == "--gpu-selftest")
             options.gpuSelfTest = true;
+        else if (arg == "--gpu")
+            options.gpu = true;
         else if (arg == "--list-presents")
             options.listPresents = true;
         else if (!options.capture && arg[0] != '-')
@@ -392,7 +397,7 @@ int main(int argc, char **argv)
         const auto start = std::chrono::steady_clock::now();
         GSCapture::Replay(capture, &uploads, hooks);
         std::vector<uint8_t> gpuVram;
-        gpu->ReadVram(gpuVram);
+        gpu->ReadVramAll(gpuVram);
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         cpu.Flush();
         size_t differing = 0, first = SIZE_MAX;
@@ -584,9 +589,40 @@ void main()
     for (int run = 0; run < options.repeat; ++run)
     {
         vram = capture.vram;
-        auto backend = std::make_unique<GSCpuBackend>();
-        backend->Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
-        backend->SetClutState(capture.clut);
+        std::unique_ptr<GSRasterBackend> backend;
+        GSGpuBackend *gpu = nullptr;
+        if (options.gpu)
+        {
+            std::unique_ptr<GSGpuBackend> created = GSGpuBackend::Create(error);
+            if (!created)
+            {
+                std::printf("no GPU backend: %s\n", error.c_str());
+                return 1;
+            }
+            if (run == 0)
+                std::printf("GPU: %s\n", created->Context().Renderer().c_str());
+            created->LoadVram(capture.vram.data(), capture.vram.size());
+            // Hashes include the presented frame: it must be this presentation's.
+            created->SetSynchronousPresent(!options.hashesPath.empty() || !options.pngPrefix.empty() ||
+                                           options.dumpAt != ~0ull);
+            created->SetClutState(capture.clut);
+            gpu = created.get();
+            backend = std::move(created);
+        }
+        else
+        {
+            auto cpu = std::make_unique<GSCpuBackend>();
+            cpu->Initialize(vram.data(), static_cast<uint32_t>(vram.size()));
+            cpu->SetClutState(capture.clut);
+            backend = std::move(cpu);
+        }
+        // VRAM after everything submitted so far (the GPU's is read back).
+        auto currentVram = [&]()
+        {
+            backend->Flush();
+            if (gpu)
+                gpu->ReadVramAll(vram);
+        };
         hashes.clear();
         flips = 0;
         // The game draws into a back buffer and copies it to the displayed one: a presentation shows a new
@@ -609,7 +645,7 @@ void main()
             displayFbp = static_cast<uint32_t>(request.dispfb1 & 0x1FFu);
             if (!options.hashesPath.empty() || presentIndex == options.dumpAt)
             {
-                backend->Flush();
+                currentVram();
                 // VRAM after everything submitted so far, and the frame the backend presented.
                 uint64_t hash = hashBytes(vram.data(), vram.size());
                 if (frame && *frame)
@@ -643,13 +679,33 @@ void main()
         const double cpuStart = processCpuMs();
         const auto start = std::chrono::steady_clock::now();
         counts = GSCapture::Replay(capture, backend.get(), hooks);
-        backend->Flush();
+        currentVram();
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         const double cpu = processCpuMs() - cpuStart;
         best = std::min(best, ms);
         // CPU time of every thread (spinning included): how much work the replay costs, whatever the waits.
         std::printf("run %d: %.1f ms, CPU %.1f ms (%.1f ms per game frame)\n", run + 1, ms, cpu,
                     cpu / static_cast<double>(std::max<uint64_t>(flips, 1u)));
+        if (gpu)
+        {
+            const GSGpuBackend::Stats &s = gpu->GetStats();
+            std::printf("GPU: %llu batches, %llu primitives, %llu tiles, %llu uploads, %llu CLUT loads, %llu fallbacks, "
+                        "%llu snapshot pages\n",
+                        static_cast<unsigned long long>(s.batches), static_cast<unsigned long long>(s.primitives),
+                        static_cast<unsigned long long>(s.tiles), static_cast<unsigned long long>(s.uploads),
+                        static_cast<unsigned long long>(s.clutLoads), static_cast<unsigned long long>(s.fallbacks),
+                        static_cast<unsigned long long>(s.snapshotPages));
+            std::printf("  primitives sampling pages but not blocks the batch draws: %llu\n", static_cast<unsigned long long>(s.sharedPages));
+            if (s.submitMs > 0.0)
+                std::printf("  CPU: submit %.1f ms (batches %.1f ms of it), uploads %.1f ms; waiting for the GPU %.1f ms "
+                            "(after uploads %.1f ms)\n",
+                            s.submitMs, s.drawMs, s.uploadMs, s.gpuWaitMs, s.uploadGpuMs);
+            static const char *const names[8] = {"other", "read after write", "layout", "full", "CLUT", "upload over read",
+                                                   "upload over write", "flush/sync"};
+            for (int i = 0; i < 8; ++i)
+                if (s.ended[i])
+                    std::printf("  ended by %s: %llu\n", names[i], static_cast<unsigned long long>(s.ended[i]));
+        }
     }
 
     const double frames = static_cast<double>(std::max<uint64_t>(flips, 1u));
