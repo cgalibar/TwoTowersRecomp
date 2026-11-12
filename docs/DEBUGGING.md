@@ -50,7 +50,16 @@ runtime están desactivados por defecto (`-DTTR_VERBOSE_RUNTIME_LOGS=ON` los act
 | `PS2X_GS_GPU_DEFINES=A,B` | GS en la GPU: `#define A` y `#define B` en el *kernel* de dibujo (experimentos; `NO_ROWSPAN` quita la réplica del recorte por filas de los triángulos) |
 | `PS2X_GS_GPU_RAW_LOG=<n>` | GS en la GPU: escribe las `<n>` primeras primitivas que cortan un lote por leer columnas que el lote ya dibujó (`[gpu-raw]`: framebuffer, Z, textura, UV y XY) |
 | `PS2X_GS_GPU_NO_PRESENT=1` | GS en la GPU: `Present` no lee la imagen (para medir el resto en el banco) |
-| `TTR_UNCAP_FPS=1` | Quita el tope de 25 fps que el juego pone en partida (`ClDisplay::CapTo30FPS(1)` desde `ClGameModePlay::enter`); fase E del plan |
+| `TTR_VBLANK_HZ=<hz>` | VBlank del port (60 por defecto; `0` = el del modo de vídeo, 50 PAL). El reloj HBLANK sigue en PAL, así que la velocidad del juego no cambia. Mientras hay un vídeo, 50 Hz |
+| `TTR_GAME_FRAME_CAP=1` | Mantiene el tope del juego en partida (`ClDisplay::CapTo30FPS(1)`: un frame cada 2 VBlanks); por defecto el port lo quita |
+| `PS2X_GS_GPU_EXACT=1` | Kernel de dibujo exacto (el que `ttr_gs_bench --check-hashes` compara con el GS por software); por defecto el rápido del port |
+| `PS2X_VU_FAST_MATH=0` | VU1 con los recortes exactos de PS2 en cada FMAC (lo que `ttr_vu_bench` compara con el intérprete); por defecto sin ellos |
+| `PS2X_VU_JIT_LINKS=0`, `PS2X_VU_JIT_LOOPS=0`, `PS2X_VU_INLINE_DIV=0`, `PS2X_VU_JIT_CACHE=0`, `PS2X_VU_FLAGS_LOCAL=1` | Desactivan partes del compilador de VU1 (para aislar fallos) |
+| `PS2X_GIF_ASYNC=0` | Los paquetes GIF de VIF1 se procesan en el hilo VIF1 (sin hilo GIF) |
+| `PS2X_VIF_UNPACK_CHECK=1` | Compara cada UNPACK de la ruta rápida con la general (`[vif-unpack]` si difieren) |
+| `PS2X_PIPE_STATS=1` | Una vez por segundo, cuántas veces se llenó la cola GIF y el anillo del GS |
+| `PS2X_GS_PRESENT_LOG=1` | Registros de presentación (PMODE, DISPFB, DISPLAY...) cada 50 presentaciones |
+| `PS2X_VU_IMAGE_LOG=1`, `PS2X_VU_PC_PROFILE=1`, `PS2X_VU_JIT_DUMP=<pc hex>` | Banco de VU1: banderas por imagen, pares más ejecutados (bucle sin compilar), volcado del bloque compilado en `vu_block.s` |
 | `PS2X_GS_CAPTURE=<fichero>[,<vblank>[,<n>]]` | Graba todo lo que recibe el GS por software desde la primera presentación en o tras `<vblank>` (4000) durante `<n>` presentaciones (100), con la VRAM y la CLUT de partida, para `ttr_gs_bench`. Una captura de la batalla ocupa ~1,7 GB: guardarla en `out/gs_captures/` (fuera de git) |
 | `PS2X_GS_SPIN=<n>` | Pausas que giran los hilos de rasterizado y del GS antes de dormir (4096) |
 | `PS2X_GS_UV_READS=1` | Cuenta como leídas solo las páginas bajo las coordenadas de textura de cada primitiva, no la textura entera |

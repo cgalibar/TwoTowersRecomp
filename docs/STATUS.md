@@ -28,7 +28,7 @@ Ryzen 5 3600X con la build `Release`. Ver *Rendimiento*.
 | Menú de pausa de la misión, opciones, confirmación de "Salir a Menú" | ✅ |
 | Sonido: mezcla del SPU2 al host (raylib, 48 kHz) | ✅ (falta escucharlo con calma: AutoDMA, efectos, reverb) |
 | Velocidad del juego | ✅ tiempo real (reloj del EE anclado al del PC, parche `0013`) |
-| Fotogramas por segundo con personajes | ✅ batalla ~24 fps de media, casi siempre en el tope de 25 que el propio juego pone en partida (GS en la GPU); objetivo 60 en curso |
+| Fotogramas por segundo con personajes | ⚠️ port de PC: batalla ~52 fps de media (44-60), cinemática ~42, menús 60 (VBlank a 60 Hz, sin el tope de 25 del juego); objetivo 60 en curso ([PLAN_60FPS.md](PLAN_60FPS.md), 6.4) |
 | Menú principal y nueva partida desde cero | pendiente |
 
 ## Problemas resueltos

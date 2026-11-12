@@ -207,6 +207,14 @@ namespace ttr::sles51256
             const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
             std::cout << "[ttr:frame] vblank=" << vblanks << " t=" << static_cast<int>(seconds) << "s" << rates << ' ' << name
                       << (saved ? "" : " (no frame)")
+                      << " clock=" << [&]
+                         {
+                             // ClClock's running total of game seconds (gp-0x769C), to check the game's speed.
+                             const uint32_t bits = ram32(rdram, kGp - 0x769Cu);
+                             float value;
+                             std::memcpy(&value, &bits, sizeof(value));
+                             return value;
+                         }()
                       << " game.mode=" << ram32(rdram, kTheGame) << std::hex
                       << " game.current=0x" << current
                       << " vtbl=0x" << (current ? ram32(rdram, current) : 0u)
@@ -299,10 +307,31 @@ namespace ttr::sles51256
                       << " draws=" << kinds[2] << " transfers=" << kinds[3] << " presents=" << kinds[4] << std::endl;
         }
 
+        void paceVBlank(const uint8_t *rdram, PS2Runtime *runtime);
+
+        // VBlank handler when nothing is traced: only the PC port's VBlank rate.
+        void portVBlank(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            paceVBlank(rdram, runtime);
+            VBlankInterruptHandler__Fi_0x106290(rdram, ctx, runtime);
+        }
+
         void traceVBlank(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
         {
-            static uint32_t vblank = 0;
-            ttr::debug::applyPadScript(++vblank);
+            paceVBlank(rdram, runtime);
+            // Pad scripts and frame dumps count PAL VBlanks (1/50 s) whatever the VBlank rate is, so the same
+            // script works at 60 Hz: each VBlank adds 50/rate ticks.
+            static uint32_t tick = 0;
+            static uint32_t remainder = 0;
+            const uint32_t rate = std::max(1u, runtime->eeScheduler().vblankRateHz());
+            const uint32_t previous = tick;
+            remainder += 50u;
+            while (remainder >= rate)
+            {
+                remainder -= rate;
+                ++tick;
+            }
+            ttr::debug::applyPadScript(tick);
             dumpGsHistoryIfDue(runtime);
             static uint32_t count = 0;
             static uint32_t pendingCount = 0;
@@ -315,7 +344,8 @@ namespace ttr::sles51256
             VBlankInterruptHandler__Fi_0x106290(rdram, ctx, runtime);
             if (log && pending)
                 logDmaState(rdram, runtime, "vblank<", ctx);
-            dumpFrameIfDue(rdram, runtime);
+            for (uint32_t t = previous + 1u; t <= tick; ++t)
+                dumpFrameIfDue(rdram, runtime);
         }
 
         void traceDmaTimeout(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -506,8 +536,8 @@ namespace ttr::sles51256
             playModal__5ClFMVFPCcibP15ClSubtitleAsset_0x26a7a0(rdram, ctx, runtime);
         }
 
-        // Phase E (docs/PLAN_60FPS.md): ClGameModePlay::enter turns on ClDisplay::CapTo30FPS, so gameplay draws at
-        // most every second VBlank (25 fps in PAL). TTR_UNCAP_FPS=1 keeps that cap off.
+        // ClGameModePlay::enter turns on ClDisplay::CapTo30FPS, so gameplay draws at most every second VBlank (25
+        // fps in PAL, also on the console). The PC port keeps that cap off unless TTR_GAME_FRAME_CAP=1.
         void hackNoFrameCap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
         {
             SET_GPR_U32(ctx, 4, 0u);
@@ -602,6 +632,27 @@ namespace ttr::sles51256
         constexpr uint32_t kFmvStreamBuffer = 0x0054C180u;  // ClFMVStreamBuffer {base, size, read, write, used}
         constexpr uint32_t kFmvSoundBuffer = 0x0054C200u;   // ClFMVSoundBuffer, same layout
         constexpr uint32_t kFmvMpegBuffer = 0x0054C280u;    // ClFMVStreamBuffer of "MPCh" chunks
+
+        // PC port: 60 VBlanks per second instead of PAL's 50, so the game can draw 60 frames per second. The game
+        // times itself with timer 0 on the HBLANK clock, which stays at the PAL rate, so its speed does not
+        // change. Movies are paced by VBlanks (one picture every second VBlank): at 60 Hz the picture runs ahead
+        // of the sound and the movie stops early, so while one plays the VBlank goes back to 50 Hz.
+        // TTR_VBLANK_HZ=<hz> picks another rate; 0 keeps the rate of the video mode the game asks for.
+        uint32_t g_portVBlankHz = 0;
+
+        void paceVBlank(const uint8_t *rdram, PS2Runtime *runtime)
+        {
+            if (g_portVBlankHz == 0u)
+                return;
+            const bool movie = rdram[kFmvFlags & 0x01FFFFFFu] != 0u;
+            const uint32_t rate = movie ? 50u : g_portVBlankHz;
+            static uint32_t current = 0;
+            if (rate == current)
+                return;
+            current = rate;
+            runtime->eeScheduler().setVBlankRateOverride(rate);
+            std::cout << "[ttr] VBlank " << rate << " Hz" << (movie ? " (movie)" : "") << std::endl;
+        }
 
         void logFmvBuffer(const uint8_t *rdram, const char *label, uint32_t buffer)
         {
@@ -1039,10 +1090,11 @@ namespace ttr::sles51256
             runtime.replaceFunction(0x00254350u, &hackSkipShadowVolumes);
             std::cout << "[ttr] hack: no character shadow volumes" << std::endl;
         }
-        if (const char *uncap = std::getenv("TTR_UNCAP_FPS"); uncap && uncap[0] == '1')
+        if (const char *cap = std::getenv("TTR_GAME_FRAME_CAP"); !(cap && cap[0] == '1'))
         {
             runtime.replaceFunction(0x0017CB30u, &hackNoFrameCap);
-            std::cout << "[ttr] gameplay not capped to half the VBlank rate" << std::endl;
+            std::cout << "[ttr] gameplay not capped to half the VBlank rate (TTR_GAME_FRAME_CAP=1 keeps the cap)"
+                      << std::endl;
         }
         if (const char *hack = std::getenv("TTR_HACK_SKIPPABLE_FMV"); hack && hack[0] == '1')
         {
@@ -1115,10 +1167,20 @@ namespace ttr::sles51256
             runtime.replaceFunction(0x0026B150u, &traceFmvDraw);
             std::cout << "[ttr] FMV tracing enabled" << std::endl;
         }
+        {
+            const char *env = std::getenv("TTR_VBLANK_HZ");
+            g_portVBlankHz = env ? static_cast<uint32_t>(std::strtoul(env, nullptr, 10)) : 60u;
+            if (g_portVBlankHz != 0u)
+                runtime.eeScheduler().setVBlankRateOverride(g_portVBlankHz);
+        }
         if (traceEnabled("dma") || frameDumpConfig().enabled || std::getenv("TTR_GS_DUMP") ||
             ttr::debug::padScriptEnabled())
         {
             runtime.replaceFunction(0x00106290u, &traceVBlank);
+        }
+        else if (g_portVBlankHz != 0u)
+        {
+            runtime.replaceFunction(0x00106290u, &portVBlank);
         }
         if (frameDumpConfig().enabled)
         {

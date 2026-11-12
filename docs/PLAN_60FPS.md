@@ -820,10 +820,11 @@ fase B, ms por frame del banco con 9 hilos.
 | D1 Búferes DMA | pendiente | | |
 | D2 VU0 sin copias | pendiente | | |
 | D3 Medir EE en Release | pendiente | | |
-| E1 VBlank a 60 Hz | pendiente | | |
+| E1 VBlank a 60 Hz | hecho (ver 6.4) | VBlank 60 Hz, sin tope de 25, vídeos a 50 Hz; velocidad del juego igual | — (juego) |
 | E2 Latencia y regularidad | pendiente | | |
 | F1 Cierre | pendiente | | |
 | G0-G7 GS en la GPU | G0-G6 hechos, G7 en curso (ver 6.3) | 100 presentaciones idénticas; banco 47 ms/frame; batalla 24,1 fps (tope del juego 25) | `0018`, `0019` |
+| P Port de PC a 60 fps | en curso (ver 6.4) | batalla ~52 fps de media (44-60), cinemática ~42, menús 60 | `0020` |
 
 ### 6.1 Notas de lo hecho (2026-11-11)
 
@@ -1040,6 +1041,54 @@ y compara las dos VRAM. Cuando la GPU haga todas las órdenes (G5), la comparaci
   - Herramientas: `PS2X_GS_GPU_TIMING=1` (tiempos de CPU y de GPU con consultas `GL_TIME_ELAPSED`),
     `PS2X_GS_GPU_DEFINES=NO_ROWSPAN` (defines en el *kernel* de dibujo), `PS2X_GS_GPU_RAW_LOG=<n>` (las primeras
     `<n>` primitivas que cortan un lote por lectura tras escritura), `PS2X_GS_GPU_NO_PRESENT=1`.
+
+### 6.4 Fase P: port de PC a 60 fps (2026-11-12)
+
+El usuario dejó de pedir la imagen exacta de PS2: el objetivo es un port de PC a 60 fps y, después, mejoras de
+resolución. Lo exacto sigue disponible y comprobable (`PS2X_GS_GPU_EXACT=1`, `PS2X_VU_FAST_MATH=0`).
+
+**Ritmo (juego, `game/sles_51256_trace.cpp`).** VBlank a 60 Hz (`EeScheduler::setVBlankRateOverride`,
+`TTR_VBLANK_HZ`; el reloj HBLANK sigue en PAL, así que `ClClock` mide tiempo real: el reloj del juego avanza 1:1
+con el del sistema a 50 y a 60 Hz). Sin el tope de 25 fps de partida (`TTR_GAME_FRAME_CAP=1` lo mantiene). Los
+vídeos van al ritmo del VBlank (un cuadro cada dos): a 60 Hz se adelantaban al sonido y se cortaban, así que
+mientras `ClFMV::smIsPlaying` (`0x3821D0`) está activo el VBlank vuelve a 50 Hz. Guiones de mando y volcados de
+frames cuentan en 1/50 s, sea cual sea el VBlank.
+
+**Resultado:** batalla 28 (sin tope) → **~52 fps de media** (44-60), cinemática con motor 15-20 → ~42, menús 60,
+vídeos 25. Los límites ahora: hilo VIF1 (VU1) y hilo del GS (preparar primitivas), los dos cerca del 100 %.
+
+**Hecho (parche `0020`):**
+- Presentación en la GPU: `GSCpuBackend::PlanPresentation` decide fuentes y mezcla sin leer píxeles y un kernel
+  monta la imagen (idéntica bit a bit); solo se leen 1,3 MB por frame.
+- Hilo GIF (`ps2x::GifWorker`, anillos sin bloqueo de un productor y un consumidor): el análisis de paquetes GIF
+  y la entrada al GS salen del hilo VIF1. XGKICK con una sola copia directa a un búfer del hilo GIF.
+- Anillo de órdenes del GS compacto: un primitivo son sus vértices; el estado va en `SetState` solo al cambiar.
+- Búferes de cadenas DMA reutilizados entre el EE y VIF1 (antes se reservaban, se llenaban de ceros y se liberaban
+  varios MB por frame). `m_xgkick` ya no se borra (64 KiB) en cada ejecución de VU1.
+- `vifUnpack`: ruta rápida sin máscara ni ciclos de relleno, y copia de una vez para V4-32 contiguo
+  (`PS2X_VIF_UNPACK_CHECK=1` la compara con la general).
+- Compilador de VU1 (`ttr_vu_bench`: 8,8 → **3,7 ns/par**; exacto con `PS2X_VU_FAST_MATH=0`, 0 de 3 000
+  ejecuciones distintas y los mismos ciclos): vida global de las banderas MAC, sin bits de estado si nadie los lee,
+  sin recortes de registros ya recortados, aritmética rápida por defecto (solo cambian desnormalizados → 0),
+  caché de registros VF en xmm, desplazamientos de 1 byte, rutas de espera fuera de línea, llamadas `call rel32`
+  (búfer junto al módulo), bloques enlazados (`PS2X_VU_JIT_LINKS=0` los quita) y bucles cerrados dentro del código,
+  ITOF/FTOI y DIV en línea, `commit` sin orden cuando el estado no se lee.
+- GS en la GPU: kernel de dibujo rápido por defecto (sin réplica del recorte por filas, Z en float salvo Z32,
+  división nativa, FMA), triángulos fuera del scissor descartados antes de lote (-18 % de primitivas, exacto),
+  caché de las palabras del registro que dependen del estado, `Submit` partido en `Prepare`/`Commit`.
+
+**Probado sin ganancia (no repetir tal cual):** VU1 en su propio hilo solapando el VIF (`PS2X_VU1_THREAD=1`,
+peor); ejecutar programas de VU1 en paralelo (70 % lee memoria escrita por el anterior, `ttr_vu_bench --deps`);
+preparar primitivas en el hilo GIF o en un hilo propio (`PS2X_GS_PREPARE=1`, peor: mueve ~640 bytes por primitiva
+entre núcleos); registros en un búfer mapeado persistente (`PS2X_GS_GPU_MAPPED=1`, la GPU los lee por PCIe: 18 fps);
+fijar hilos a un CCX (`PS2X_PIPELINE_CPUS`); VBlank a 120 Hz con el tope del juego (igual en batalla).
+
+**Siguiente:**
+1. VU1: el bucle de 30 pares en `0x25E8-0x26D0` de la imagen `0778eb0888ecc877` hace el 64 % de los pares de la
+   batalla (`ttr_vu_bench <cap> --entries`, `PS2X_VU_PC_PROFILE=1`). Compilarlo con la temporización resuelta al
+   compilar (sin comprobaciones de espera, registros ni `commit` dentro de la vuelta) ahorraría ~1/3 de su coste.
+2. Hilo del GS: `Commit` (decisiones de lote, rectángulos escritos, teselas) y `DrawBatch` (subidas por lote).
+   Reparto por teselas en la GPU y menos trabajo por primitiva.
 
 ## 7. Riesgos y avisos
 

@@ -10,10 +10,12 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <tuple>
 #include <vector>
 
 namespace
@@ -112,6 +114,93 @@ int main(int argc, char **argv)
     // Separate code buffers per engine: each one keys its decoded cache by buffer and code hash.
     std::vector<uint8_t> fastCode(16384), refCode(16384);
 
+    // --deps: how much each run depends on the one before it (could consecutive runs execute in parallel?).
+    // R: the registers it starts with replaced by those the previous run started with; M: the bytes the previous
+    // run wrote (and VIF did not write again) replaced by what they held before it. Same = identical kicks and
+    // data memory at the end.
+    // --entries: pairs by code image and start PC.
+    if (argc > 2 && std::strcmp(argv[2], "--entries") == 0)
+    {
+        std::vector<std::tuple<uint64_t, uint64_t, uint32_t, uint32_t>> rows; // pairs, key, pc, runs
+        uint64_t all = 0;
+        for (Record &record : records)
+        {
+            std::memcpy(fastCode.data(), record.code.data(), record.code.size());
+            const Result r = runOne(fastVu, gs, record, fastCode, true);
+            const uint64_t pairs = r.pairs > 0 ? static_cast<uint64_t>(r.pairs) : 0u;
+            all += pairs;
+            bool found = false;
+            for (auto &row : rows)
+                if (std::get<1>(row) == record.codeKey && std::get<2>(row) == record.header.state.pc)
+                {
+                    std::get<0>(row) += pairs;
+                    ++std::get<3>(row);
+                    found = true;
+                }
+            if (!found)
+                rows.emplace_back(pairs, record.codeKey, record.header.state.pc, 1u);
+        }
+        std::sort(rows.begin(), rows.end(), [](const auto &a, const auto &b) { return std::get<0>(a) > std::get<0>(b); });
+        for (size_t i = 0; i < rows.size() && i < 25u; ++i)
+            std::printf("%5.1f%%  image %016llx pc 0x%04x runs %u pairs/run %.0f\n", 100.0 * static_cast<double>(std::get<0>(rows[i])) / static_cast<double>(all),
+                        static_cast<unsigned long long>(std::get<1>(rows[i])), std::get<2>(rows[i]), std::get<3>(rows[i]),
+                        static_cast<double>(std::get<0>(rows[i])) / std::get<3>(rows[i]));
+        return 0;
+    }
+    if (argc > 2 && std::strcmp(argv[2], "--deps") == 0)
+    {
+        size_t sameR = 0, sameM = 0, sameRM = 0, regsCarried = 0, resumed = 0, total = 0;
+        Result previous;
+        for (size_t i = 0; i < records.size(); ++i)
+        {
+            Record &record = records[i];
+            std::memcpy(fastCode.data(), record.code.data(), record.code.size());
+            const Result truth = runOne(fastVu, gs, record, fastCode, true);
+            if (i > 0)
+            {
+                const Record &before = records[i - 1];
+                ++total;
+                const VU1State &s = record.header.state;
+                if (same(s.vf, previous.state.vf, sizeof(s.vf)) && same(s.vi, previous.state.vi, sizeof(s.vi)))
+                    ++regsCarried;
+                if (s.pc == previous.state.pc)
+                    ++resumed;
+                auto variant = [&](bool regs, bool memory)
+                {
+                    Record copy = record;
+                    if (regs)
+                    {
+                        const VU1State &old = before.header.state;
+                        VU1State &st = copy.header.state;
+                        std::memcpy(st.vf[1], old.vf[1], sizeof(st.vf) - sizeof(st.vf[0]));
+                        std::memcpy(&st.vi[1], &old.vi[1], sizeof(st.vi) - sizeof(st.vi[0]));
+                        std::memcpy(st.acc, old.acc, sizeof(st.acc));
+                        st.q = old.q;
+                        st.p = old.p;
+                        st.i = old.i;
+                        st.r = old.r;
+                        st.mac = old.mac;
+                        st.clip = old.clip;
+                        st.status = old.status;
+                    }
+                    if (memory)
+                        for (size_t b = 0; b < copy.data.size() && b < previous.data.size(); ++b)
+                            if (previous.data[b] != before.data[b] && copy.data[b] == previous.data[b])
+                                copy.data[b] = before.data[b];
+                    const Result r = runOne(fastVu, gs, copy, fastCode, true);
+                    return r.kicks == truth.kicks && r.data == truth.data;
+                };
+                sameR += variant(true, false);
+                sameM += variant(false, true);
+                sameRM += variant(true, true);
+            }
+            previous = truth;
+        }
+        std::printf("deps: %zu pairs of runs; start regs = previous end regs %zu; same pc %zu; same with R %zu, M %zu, R+M %zu\n",
+                    total, regsCarried, resumed, sameR, sameM, sameRM);
+        return 0;
+    }
+
     // 1. correctness
     size_t mismatches = 0;
     uint64_t totalPairs = 0;
@@ -135,6 +224,39 @@ int main(int argc, char **argv)
                            (!fastVu.fastClipLive() || a.clip == b.clip);
         const bool dataSame = fast.data == ref.data;
         const bool kicksSame = fast.kicks == ref.kicks;
+        // PS2X_BENCH_KICK_DIFF=1: how the kicked packets differ (words that differ, largest relative change).
+        static const bool kickDiff = std::getenv("PS2X_BENCH_KICK_DIFF") != nullptr;
+        if (kickDiff && !kicksSame && fast.kicks.size() == ref.kicks.size())
+        {
+            size_t words = 0, total = 0;
+            double worst = 0.0;
+            uint32_t worstA = 0, worstB = 0;
+            for (size_t k = 0; k < fast.kicks.size(); ++k)
+            {
+                const auto &a = fast.kicks[k], &b = ref.kicks[k];
+                for (size_t w = 0; w + 4 <= std::min(a.size(), b.size()); w += 4)
+                {
+                    uint32_t x = 0, y = 0;
+                    std::memcpy(&x, a.data() + w, 4);
+                    std::memcpy(&y, b.data() + w, 4);
+                    ++total;
+                    if (x == y)
+                        continue;
+                    ++words;
+                    float fx = 0, fy = 0;
+                    std::memcpy(&fx, &x, 4);
+                    std::memcpy(&fy, &y, 4);
+                    const double rel = std::fabs(static_cast<double>(fx) - fy) / std::max(1e-30, std::fabs(static_cast<double>(fy)));
+                    if (rel > worst || worst == 0.0)
+                    {
+                        worst = rel;
+                        worstA = x;
+                        worstB = y;
+                    }
+                }
+            }
+            std::printf("record %zu: %zu of %zu kicked words differ, worst %08x vs %08x (rel %g)\n", i, words, total, worstA, worstB, worst);
+        }
         if (!(regs && flags && dataSame && kicksSame))
         {
             if (mismatches < 20)
