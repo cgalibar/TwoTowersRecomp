@@ -1083,6 +1083,18 @@ preparar primitivas en el hilo GIF o en un hilo propio (`PS2X_GS_PREPARE=1`, peo
 entre núcleos); registros en un búfer mapeado persistente (`PS2X_GS_GPU_MAPPED=1`, la GPU los lee por PCIe: 18 fps);
 fijar hilos a un CCX (`PS2X_PIPELINE_CPUS`); VBlank a 120 Hz con el tope del juego (igual en batalla).
 
+**Imagen del port (parche `0021`):**
+- Rayas desde el personaje (hacia la lava y al empezar el prólogo): los programas de VU1 del juego no recortan los
+  vértices que quedan delante de la cámara pero muy fuera de pantalla; los llevan a 0 o a 4095 (`MAX`/`MINI` antes
+  de `FTOI4`) y solo marcan con ADC los que quedan detrás (`CLIP` contra un límite en z y `FCAND 0x010410`, imagen
+  `e5e787ca61af48f1`). El triángulo se estira hasta ese punto. El intérprete y el compilador dan lo mismo que una
+  simulación del bucle, así que es lo que le llega al GS también en PS2. El port descarta los triángulos con un
+  vértice en 0 o 4095 (`GSIsClampedTriangle`): en las capturas solo cambian los píxeles de las rayas.
+- Dientes de sierra del HUD: el juego dibuja frames de 640x512 y los muestra entrelazados (`SMODE2` modo campo) con
+  el filtro antiparpadeo (circuito 2 = mismo búfer con `DBY` 1, `ALP` 0x81). Presentábamos en cada VBlank solo las
+  líneas de un campo, duplicadas: media resolución vertical. El port muestra todas las líneas y sin el filtro
+  (`GSPresentation()`; `PS2X_GS_PROGRESSIVE`, `PS2X_GS_DEFLICKER`).
+
 **Siguiente:**
 1. VU1: el bucle de 30 pares en `0x25E8-0x26D0` de la imagen `0778eb0888ecc877` hace el 64 % de los pares de la
    batalla (`ttr_vu_bench <cap> --entries`, `PS2X_VU_PC_PROFILE=1`). Compilarlo con la temporización resuelta al

@@ -1,0 +1,168 @@
+diff --git a/ps2xRuntime/include/runtime/gs/gs_types.h b/ps2xRuntime/include/runtime/gs/gs_types.h
+index 836a3ff..3fee874 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_types.h
++++ b/ps2xRuntime/include/runtime/gs/gs_types.h
+@@ -3,6 +3,7 @@
+ #include <cstddef>
+ #include <array>
+ #include <cstdint>
++#include <cstdlib>
+ #include <vector>
+ 
+ enum GSPrimType : uint8_t
+@@ -256,6 +257,55 @@ struct GSPrimitiveBatch
+     GSDrawState state{};
+ };
+ 
++// Port option: drop triangles with a vertex on the edge of the primitive coordinate space (X or Y exactly 0 or
++// 4095 and above). Games clamp vertices that project far off screen to those values, which bends the triangle
++// into a long streak across the screen. 0 = draw them (default), 1 = drop them. PS2X_GS_DROP_CLAMPED sets the
++// starting value (a game should leave it alone when the variable is set).
++inline int &GSDropClampedTriangles()
++{
++    static int mode = []
++    {
++        const char *value = std::getenv("PS2X_GS_DROP_CLAMPED");
++        return value ? std::atoi(value) : 0;
++    }();
++    return mode;
++}
++
++// Port presentation options (both off by default: the PS2 output).
++// Progressive: an interlaced field-mode display shows every line of the frame buffer on every VBlank instead of
++// the current field's lines doubled (PS2X_GS_PROGRESSIVE=0/1).
++// No deflicker: when circuit 2 shows the same buffer one line lower to be blended with circuit 1 (the PS2 flicker
++// filter for TVs), circuit 1 is shown alone (PS2X_GS_DEFLICKER=0 drops the filter, 1 keeps it).
++struct GSPresentOptions
++{
++    bool progressive = false;
++    bool noDeflicker = false;
++};
++
++inline GSPresentOptions &GSPresentation()
++{
++    static GSPresentOptions options = []
++    {
++        GSPresentOptions o;
++        if (const char *value = std::getenv("PS2X_GS_PROGRESSIVE"))
++            o.progressive = value[0] == '1';
++        if (const char *value = std::getenv("PS2X_GS_DEFLICKER"))
++            o.noDeflicker = value[0] == '0';
++        return o;
++    }();
++    return options;
++}
++
++inline bool GSIsClampedTriangle(const GSPrimitiveBatch &batch)
++{
++    if (batch.vertexCount != 3u)
++        return false;
++    for (const GSVertex &v : batch.vertices)
++        if (v.x == 0.0f || v.y == 0.0f || v.x >= 4095.0f || v.y >= 4095.0f)
++            return true;
++    return false;
++}
++
+ struct GSTransferCommand
+ {
+     GSBitBltBuf bitbltbuf{};
+diff --git a/ps2xRuntime/src/lib/gs/gs_capture.cpp b/ps2xRuntime/src/lib/gs/gs_capture.cpp
+index db5e166..ba30b19 100644
+--- a/ps2xRuntime/src/lib/gs/gs_capture.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_capture.cpp
+@@ -404,7 +404,7 @@ namespace GSCapture
+                 ++counts.submits;
+                 if (hooks.onSubmit)
+                     hooks.onSubmit(batch);
+-                if (backend)
++                if (backend && !(GSDropClampedTriangles() && GSIsClampedTriangle(batch)))
+                     backend->Submit(batch);
+                 break;
+             }
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index 4a5cf72..39dca09 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -858,6 +858,16 @@ namespace
+             static_cast<uint32_t>((dispfb64 >> 43) & 0x7FFu)};
+     }
+ 
++    // Both circuits show the same buffer, one line apart: the PS2 flicker filter (blends each line with the next).
++    bool isDeflickerPair(uint64_t dispfb1, uint64_t dispfb2)
++    {
++        constexpr uint64_t kLayout = 0xFFFFFull; // FBP, FBW, PSM
++        if ((dispfb1 & kLayout) != (dispfb2 & kLayout))
++            return false;
++        const GSDisplayReadOrigin a = decodeDisplayReadOrigin(dispfb1), b = decodeDisplayReadOrigin(dispfb2);
++        return a.x == b.x && (a.y + 1u == b.y || b.y + 1u == a.y);
++    }
++
+     bool hasDisplaySetup(uint64_t display64, const GSFrameReg &frame)
+     {
+         const uint32_t dw = static_cast<uint32_t>((display64 >> 32) & 0x0FFFu);
+@@ -4172,7 +4182,7 @@ bool GSCpuBackend::PlanPresentation(const GSPresentationRequest &request, Presen
+     plan = {};
+     const GSPmodeState pmode = decodePmode(request.pmode);
+     const GSSmode2State smode2 = decodeSMode2(request.smode2);
+-    plan.fieldMode = smode2.interlaced && !smode2.frameMode;
++    plan.fieldMode = smode2.interlaced && !smode2.frameMode && !GSPresentation().progressive;
+     plan.oddField = (request.vsyncTick & 1ull) != 0ull;
+     const GSFrameReg displayFrame1 = decodeDisplayFrame(request.dispfb1);
+     const GSFrameReg displayFrame2 = decodeDisplayFrame(request.dispfb2);
+@@ -4182,7 +4192,8 @@ bool GSCpuBackend::PlanPresentation(const GSPresentationRequest &request, Presen
+     decodeDisplaySize(request.display1, width1, height1);
+     decodeDisplaySize(request.display2, width2, height2);
+     const bool valid1 = pmode.enableCrt1 && hasDisplaySetup(request.display1, displayFrame1);
+-    const bool valid2 = pmode.enableCrt2 && hasDisplaySetup(request.display2, displayFrame2);
++    const bool valid2 = pmode.enableCrt2 && hasDisplaySetup(request.display2, displayFrame2) &&
++                        !(GSPresentation().noDeflicker && valid1 && isDeflickerPair(request.dispfb1, request.dispfb2));
+     if (!valid1 && !valid2)
+         return true;
+ 
+@@ -4268,7 +4279,7 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
+     PresentationFrame result{};
+     const GSPmodeState pmode = decodePmode(request.pmode);
+     const GSSmode2State smode2 = decodeSMode2(request.smode2);
+-    const bool fieldMode = smode2.interlaced && !smode2.frameMode;
++    const bool fieldMode = smode2.interlaced && !smode2.frameMode && !GSPresentation().progressive;
+     const bool oddField = (request.vsyncTick & 1ull) != 0ull;
+     const GSFrameReg displayFrame1 = decodeDisplayFrame(request.dispfb1);
+     const GSFrameReg displayFrame2 = decodeDisplayFrame(request.dispfb2);
+@@ -4278,7 +4289,8 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
+     decodeDisplaySize(request.display1, width1, height1);
+     decodeDisplaySize(request.display2, width2, height2);
+     const bool valid1 = pmode.enableCrt1 && hasDisplaySetup(request.display1, displayFrame1);
+-    const bool valid2 = pmode.enableCrt2 && hasDisplaySetup(request.display2, displayFrame2);
++    const bool valid2 = pmode.enableCrt2 && hasDisplaySetup(request.display2, displayFrame2) &&
++                        !(GSPresentation().noDeflicker && valid1 && isDeflickerPair(request.dispfb1, request.dispfb2));
+     if (!valid1 && !valid2)
+         return result;
+ 
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 73c08a1..1da38ed 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -7,6 +7,7 @@
+ #include <algorithm>
+ #include <cmath>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <iostream>
+ #include <sstream>
+@@ -1599,9 +1600,12 @@ void GS::vertexKick(bool drawing)
+     if (drawing && m_backend)
+     {
+         GSPrimitiveBatch batch = buildDrawBatch(needed);
+-        updatePreferredDisplaySourceForDraw(batch);
+-        m_backend->Submit(batch);
+-        recordDrawDebugEventUnlocked(needed);
++        if (!(GSDropClampedTriangles() && GSIsClampedTriangle(batch)))
++        {
++            updatePreferredDisplaySourceForDraw(batch);
++            m_backend->Submit(batch);
++            recordDrawDebugEventUnlocked(needed);
++        }
+     }
+ 
+     switch (m_prim.type)

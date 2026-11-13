@@ -17,6 +17,7 @@
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/gs/gs_types.h"
 #include "runtime/ps2_memory.h"
 
 #include <algorithm>
@@ -1096,6 +1097,18 @@ namespace ttr::sles51256
             std::cout << "[ttr] gameplay not capped to half the VBlank rate (TTR_GAME_FRAME_CAP=1 keeps the cap)"
                       << std::endl;
         }
+        // The VU1 programs clamp vertices that project far off screen to 0 or 4095 instead of clipping them, so
+        // their triangles turn into streaks from the character to that point (lava glow, terrain). The port
+        // drops those triangles; PS2X_GS_DROP_CLAMPED=0 draws them as the GS does.
+        if (!std::getenv("PS2X_GS_DROP_CLAMPED"))
+            GSDropClampedTriangles() = 1;
+        // The game draws full 640x512 frames and shows them interlaced (one field of lines per VBlank) through the
+        // PS2 flicker filter. The port shows every line on every VBlank, without the filter (PS2X_GS_PROGRESSIVE=0
+        // and PS2X_GS_DEFLICKER=1 bring each back).
+        if (!std::getenv("PS2X_GS_PROGRESSIVE"))
+            GSPresentation().progressive = true;
+        if (!std::getenv("PS2X_GS_DEFLICKER"))
+            GSPresentation().noDeflicker = true;
         if (const char *hack = std::getenv("TTR_HACK_SKIPPABLE_FMV"); hack && hack[0] == '1')
         {
             runtime.replaceFunction(0x0026A7A0u, &hackSkippableFmv);

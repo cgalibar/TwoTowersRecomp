@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <tuple>
 #include <vector>
 
@@ -145,6 +146,52 @@ int main(int argc, char **argv)
             std::printf("%5.1f%%  image %016llx pc 0x%04x runs %u pairs/run %.0f\n", 100.0 * static_cast<double>(std::get<0>(rows[i])) / static_cast<double>(all),
                         static_cast<unsigned long long>(std::get<1>(rows[i])), std::get<2>(rows[i]), std::get<3>(rows[i]),
                         static_cast<double>(std::get<0>(rows[i])) / std::get<3>(rows[i]));
+        return 0;
+    }
+    // --dump-code <record> <file>: the record's code image (for tools/vu_disasm.py) and its data memory (<file>.data).
+    if (argc > 4 && std::strcmp(argv[2], "--dump-code") == 0)
+    {
+        const Record &record = records.at(std::strtoull(argv[3], nullptr, 10));
+        const std::string path = argv[4];
+        FILE *out = std::fopen(path.c_str(), "wb");
+        FILE *data = std::fopen((path + ".data").c_str(), "wb");
+        if (!out || !data)
+            return 1;
+        std::fwrite(record.code.data(), 1, record.code.size(), out);
+        std::fwrite(record.data.data(), 1, record.data.size(), data);
+        std::fclose(out);
+        std::fclose(data);
+        std::printf("record %s: pc 0x%04x, %zu code bytes\n", argv[3], record.header.state.pc, record.code.size());
+        return 0;
+    }
+    // --find-xy <x> <y>: kicked qwords whose low 16 bits of words 0 and 1 are x and y (hex, 12.4 GS units), as
+    // the reference interpreter produces them: record, image, start PC, kick and the whole qword.
+    if (argc > 4 && std::strcmp(argv[2], "--find-xy") == 0)
+    {
+        const uint32_t wantX = static_cast<uint32_t>(std::strtoul(argv[3], nullptr, 16));
+        const uint32_t wantY = static_cast<uint32_t>(std::strtoul(argv[4], nullptr, 16));
+        size_t shown = 0;
+        for (size_t i = 0; i < records.size() && shown < 40u; ++i)
+        {
+            Record &record = records[i];
+            std::memcpy(refCode.data(), record.code.data(), record.code.size());
+            const Result r = runOne(refVu, gs, record, refCode, false);
+            for (size_t k = 0; k < r.kicks.size(); ++k)
+            {
+                const auto &kick = r.kicks[k];
+                for (size_t q = 0; q + 16u <= kick.size(); q += 16u)
+                {
+                    uint32_t w[4];
+                    std::memcpy(w, kick.data() + q, 16u);
+                    if ((w[0] & 0xFFFFu) != wantX || (w[1] & 0xFFFFu) != wantY)
+                        continue;
+                    std::printf("record %zu image %016llx pc 0x%04x kick %zu qword %zu: %08x %08x %08x %08x\n", i,
+                                static_cast<unsigned long long>(record.codeKey), record.header.state.pc, k, q / 16u, w[0], w[1],
+                                w[2], w[3]);
+                    ++shown;
+                }
+            }
+        }
         return 0;
     }
     if (argc > 2 && std::strcmp(argv[2], "--deps") == 0)

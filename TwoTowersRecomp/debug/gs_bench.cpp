@@ -16,6 +16,7 @@
 //   ttr_gs_bench <capture> --check-hashes <file>  write diff_<n>.vram at each presentation whose hash differs
 //   ttr_gs_bench <capture> --dump-at <n>          write at_<n>.vram at presentation n
 //   ttr_gs_bench <capture> --stats                pixels and primitives per class of GS state (no drawing)
+//   ttr_gs_bench <capture> --skinny <n>           long thin triangles (streaks) submitted before presentation n
 //
 // The raster threads follow PS2X_GS_THREADS as in the game (0 = everything on the calling thread, the
 // deterministic reference). TTR_PROFILE works as in the game.
@@ -246,6 +247,7 @@ namespace
         std::string checkHashesPath;
         uint64_t dumpAt = ~0ull;
         int touchingPage = -1;
+        int64_t skinnyPresent = -1;
         uint64_t fromPresent = 0;
     };
 
@@ -304,6 +306,8 @@ int main(int argc, char **argv)
             options.dumpAt = std::strtoull(argv[++i], nullptr, 10);
         else if (arg == "--touching" && i + 1 < argc)
             options.touchingPage = static_cast<int>(std::strtol(argv[++i], nullptr, 10));
+        else if (arg == "--skinny" && i + 1 < argc)
+            options.skinnyPresent = std::strtoll(argv[++i], nullptr, 10);
         else if (arg == "--from" && i + 1 < argc)
             options.fromPresent = std::strtoull(argv[++i], nullptr, 10);
         else if (arg == "--gpu-uploads")
@@ -467,6 +471,87 @@ void main()
         return same ? 0 : 1;
     }
 
+    if (options.skinnyPresent >= 0)
+    {
+        GSCapture::ReplayHooks hooks;
+        hooks.maxPresents = static_cast<uint64_t>(options.skinnyPresent) + 1u;
+        uint64_t present = 0, index = 0, inPresent = 0;
+        hooks.onPresent = [&](const GSPresentationRequest &, const PresentationFrame *) { ++present; inPresent = 0; };
+        hooks.onSubmit = [&](const GSPrimitiveBatch &batch)
+        {
+            ++index;
+            ++inPresent;
+            // TTR_BENCH_RECT=x0,y0,x1,y1: every primitive (sprites too) whose box meets that window rectangle instead.
+            static int rect[4] = {0, 0, -1, -1};
+            static const bool byRect = [] {
+                const char *r = std::getenv("TTR_BENCH_RECT");
+                return r && std::sscanf(r, "%d,%d,%d,%d", &rect[0], &rect[1], &rect[2], &rect[3]) == 4;
+            }();
+            if (present != static_cast<uint64_t>(options.skinnyPresent) || batch.vertexCount < (byRect ? 1u : 3u))
+                return;
+            const GSVertex *v = batch.vertices.data();
+            const GSContext &cx = batch.state.context;
+            if (byRect)
+            {
+                float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+                for (unsigned i = 0; i < batch.vertexCount; ++i)
+                {
+                    x0 = std::min(x0, v[i].x - cx.xyoffset.ofx / 16.0f);
+                    x1 = std::max(x1, v[i].x - cx.xyoffset.ofx / 16.0f);
+                    y0 = std::min(y0, v[i].y - cx.xyoffset.ofy / 16.0f);
+                    y1 = std::max(y1, v[i].y - cx.xyoffset.ofy / 16.0f);
+                }
+                if (x1 < rect[0] || x0 > rect[2] || y1 < rect[1] || y0 > rect[3])
+                    return;
+                const GSDrawState &st = batch.state;
+                std::printf("prim %llu type %u n %u tme %u fst %u abe %u tex %u/w%u/psm%u %ux%u tex1 %llx clamp %llx linear %u "
+                            "alpha %llx test %llx fb %u/%u/psm%u\n",
+                            static_cast<unsigned long long>(index), st.prim.type, batch.vertexCount, st.prim.tme, st.prim.fst,
+                            st.prim.abe, cx.tex0.tbp0, cx.tex0.tbw, cx.tex0.psm, st.textureWidth, st.textureHeight,
+                            static_cast<unsigned long long>(cx.tex1), static_cast<unsigned long long>(cx.clamp),
+                            st.linearFilter ? 1u : 0u, static_cast<unsigned long long>(cx.alpha),
+                            static_cast<unsigned long long>(cx.test), cx.frame.fbp, cx.frame.fbw, cx.frame.psm);
+                for (unsigned i = 0; i < batch.vertexCount; ++i)
+                    std::printf("   v%u x %.4f y %.4f z %.0f rgba %u %u %u %u stq %g %g %g uv %.4f %.4f\n", i,
+                                v[i].x - cx.xyoffset.ofx / 16.0f, v[i].y - cx.xyoffset.ofy / 16.0f, v[i].z, v[i].r, v[i].g,
+                                v[i].b, v[i].a, v[i].s, v[i].t, v[i].q, v[i].u / 16.0, v[i].v / 16.0);
+                return;
+            }
+            float longest = 0.0f;
+            for (int i = 0; i < 3; ++i)
+            {
+                const GSVertex &a = v[i], &b = v[(i + 1) % 3];
+                longest = std::max(longest, std::hypot(a.x - b.x, a.y - b.y));
+            }
+            const float area = 0.5f * std::fabs((v[1].x - v[0].x) * (v[2].y - v[0].y) - (v[2].x - v[0].x) * (v[1].y - v[0].y));
+            const float width = longest > 0.0f ? 2.0f * area / longest : 0.0f;
+            // TTR_BENCH_CLAMPED=1: triangles with a vertex on the edge of the primitive space (0 or 4095) instead.
+            static const bool clamped = std::getenv("TTR_BENCH_CLAMPED") != nullptr;
+            if (clamped)
+            {
+                bool edge = false;
+                for (int i = 0; i < 3; ++i)
+                    edge |= v[i].x == 0.0f || v[i].x >= 4095.0f || v[i].y == 0.0f || v[i].y >= 4095.0f;
+                if (!edge)
+                    return;
+            }
+            else if (longest < 120.0f || width > 4.0f || area == 0.0f)
+                return;
+            const GSDrawState &st = batch.state;
+            const GSContext &c = st.context;
+            std::printf("prim %llu (#%llu in present) type %u tme %u abe %u fst %u fb %u tex %u/psm%u alpha %llx test %llx len %.0f width %.2f\n",
+                        static_cast<unsigned long long>(index), static_cast<unsigned long long>(inPresent), st.prim.type,
+                        st.prim.tme, st.prim.abe, st.prim.fst, c.frame.fbp, c.tex0.tbp0, c.tex0.psm,
+                        static_cast<unsigned long long>(c.alpha), static_cast<unsigned long long>(c.test), longest, width);
+            for (int i = 0; i < 3; ++i)
+                std::printf("   v%d x %.4f y %.4f (raw %.4f %.4f) z %.0f rgba %u %u %u %u stq %g %g %g uv %u %u\n", i,
+                            v[i].x - (c.xyoffset.ofx >> 4), v[i].y - (c.xyoffset.ofy >> 4), v[i].x, v[i].y, v[i].z, v[i].r, v[i].g, v[i].b,
+                            v[i].a, v[i].s, v[i].t, v[i].q, v[i].u, v[i].v);
+        };
+        GSCapture::Replay(capture, nullptr, hooks);
+        return 0;
+    }
+
     if (options.touchingPage >= 0)
     {
         GSCapture::ReplayHooks hooks;
@@ -525,11 +610,14 @@ void main()
         hooks.onSubmit = [&](const GSPrimitiveBatch &) { ++submits; };
         hooks.onPresent = [&](const GSPresentationRequest &r, const PresentationFrame *)
         {
-            std::printf("vblank %llu prims %llu dispfb1 %llx dispfb2 %llx pmode %llx preferred %d fbp %u dest %u ctx fbp %u %u\n",
+            std::printf("vblank %llu prims %llu dispfb1 %llx dispfb2 %llx display1 %llx display2 %llx smode2 %llx pmode %llx "
+                        "preferred %d fbp %u dest %u ctx fbp %u %u\n",
                         static_cast<unsigned long long>(r.vsyncTick), static_cast<unsigned long long>(submits),
                         static_cast<unsigned long long>(r.dispfb1), static_cast<unsigned long long>(r.dispfb2),
-                        static_cast<unsigned long long>(r.pmode), r.hasPreferredSource ? 1 : 0, r.preferredSource.fbp,
-                        r.preferredDestFbp, r.contextFrames[0].fbp, r.contextFrames[1].fbp);
+                        static_cast<unsigned long long>(r.display1), static_cast<unsigned long long>(r.display2),
+                        static_cast<unsigned long long>(r.smode2), static_cast<unsigned long long>(r.pmode),
+                        r.hasPreferredSource ? 1 : 0, r.preferredSource.fbp, r.preferredDestFbp, r.contextFrames[0].fbp,
+                        r.contextFrames[1].fbp);
             submits = 0;
         };
         GSCapture::Replay(capture, nullptr, hooks);
